@@ -3,6 +3,10 @@
     PUT /v1/chunks/{sha256}   bearer token, `X-Roomlog-Meta` sidecar, body = .opus bytes
     GET /healthz              no auth
     GET /v1/whoami            bearer token → {"device_id": ...}
+    GET /v1/time              bearer token → {"utc_ns": ...}
+
+`kind: "raw"` segments (ADR 0005) take the same route and codes; they land under
+`archive/raw/` and in `raw_segments` instead of `chunks`.
 
 Status codes follow CONTRACT.md exactly; the edge's retry/fail decisions depend on them.
 """
@@ -129,6 +133,14 @@ class IngestHandler(BaseHTTPRequestHandler):
                 self._error(401, "missing or unknown token")
                 return
             self._send(200, {"device_id": device_id})
+            return
+        if self.path == "/v1/time":
+            # The clock reference for clients without an NTP flag (ADR 0006). Auth is
+            # required so the call doubles as a token check.
+            if self.app.device_for_token(self.headers.get("Authorization")) is None:
+                self._error(401, "missing or unknown token")
+                return
+            self._send(200, {"utc_ns": time.time_ns()})
             return
         self._error(404, "not found")
 

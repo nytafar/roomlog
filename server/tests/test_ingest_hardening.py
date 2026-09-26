@@ -60,10 +60,10 @@ def test_orphan_scan_skips_bad_sidecar_and_uses_one_query(tmp_path):
     # ingest still starts with the bad sidecars in place
     srv = make_server(cfg, tokens=TOKENS)
     srv.server_close()
-    # the index exists and the schema is at version 2
+    # the index exists and the schema is current
     idx = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
     assert "chunks_path" in idx
-    assert dbmod.user_version(conn) == 2
+    assert dbmod.user_version(conn) == dbmod.SCHEMA_VERSION
     conn.close()
 
 
@@ -94,14 +94,16 @@ def test_corrupt_orphan_is_skipped_and_good_retry_is_stored(tmp_path):
 
 
 def test_migration_from_v1_adds_index(tmp_path):
+    import sqlite3
     cfg = make_config(tmp_path)
-    conn = dbmod.connect(cfg.db_path)
-    conn.execute("DROP INDEX chunks_path")
-    conn.execute("PRAGMA user_version=1")
+    cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(cfg.db_path), isolation_level=None)
+    dbmod.migrate(conn, target=1)
+    assert dbmod.user_version(conn) == 1
     conn.close()
     conn = dbmod.connect(cfg.db_path)
     idx = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
-    assert "chunks_path" in idx and dbmod.user_version(conn) == 2
+    assert "chunks_path" in idx and dbmod.user_version(conn) == dbmod.SCHEMA_VERSION
     conn.close()
 
 

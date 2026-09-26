@@ -70,6 +70,12 @@ class Config:
     backends: list[BackendConfig] = field(default_factory=list)
     prom_file: Path | None = None
     healthchecks_url: str | None = None
+    # [segmenter]: raw segments → speech chunks on the server (ADR 0005)
+    raw_idle_s: float = 120.0
+    vad_backend: str = "silero"  # silero | energy (an RMS gate: tests, or runs without the model)
+    vad_threshold: float = 0.5
+    vad_neg_threshold: float = 0.35
+    vad_model_path: Path | None = None
 
     def __post_init__(self) -> None:
         self.config_dir = _expand(self.config_dir)
@@ -79,6 +85,9 @@ class Config:
         self.models_dir = _expand(self.models_dir or self.data_dir / "models")
         self.tokens_file = _expand(self.tokens_file or self.config_dir / "tokens.toml")
         self.prom_file = _expand(self.prom_file or self.data_dir / "roomlog.prom")
+        self.vad_model_path = _expand(self.vad_model_path or self.models_dir / "silero_vad.onnx")
+        if self.vad_backend not in ("silero", "energy"):
+            raise ValueError(f"segmenter.vad must be silero or energy, not {self.vad_backend!r}")
         if not self.backends:
             self.backends = [
                 BackendConfig(name="local", type="local", model="NbAiLab/nb-whisper-medium")
@@ -117,6 +126,7 @@ def config_from_dict(raw: dict[str, Any], config_dir: Path | None = None) -> Con
     worker = raw.get("worker", {})
     sessions = raw.get("sessions", {})
     health = raw.get("health", {})
+    segmenter = raw.get("segmenter", {})
     kwargs: dict[str, Any] = {}
     if config_dir is not None:
         kwargs["config_dir"] = config_dir
@@ -141,6 +151,16 @@ def config_from_dict(raw: dict[str, Any], config_dir: Path | None = None) -> Con
         kwargs["prom_file"] = health["prom_file"]
     if "healthchecks_url" in health:
         kwargs["healthchecks_url"] = health["healthchecks_url"] or None
+    if "raw_idle_s" in segmenter:
+        kwargs["raw_idle_s"] = float(segmenter["raw_idle_s"])
+    if "vad" in segmenter:
+        kwargs["vad_backend"] = str(segmenter["vad"])
+    if "threshold" in segmenter:
+        kwargs["vad_threshold"] = float(segmenter["threshold"])
+    if "neg_threshold" in segmenter:
+        kwargs["vad_neg_threshold"] = float(segmenter["neg_threshold"])
+    if "model_path" in segmenter:
+        kwargs["vad_model_path"] = segmenter["model_path"]
     kwargs["backends"] = [_backend_from(b) for b in raw.get("backends", [])]
     cfg = Config(**kwargs)
     # The bind address is pinned per host in service.env (§4.1).

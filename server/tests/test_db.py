@@ -132,3 +132,97 @@ def test_contract_examples_validate():
     schema = json.loads((CONTRACT_DIR / "sidecar.schema.json").read_text())
     from roomlog_server.sidecar import REQUIRED
     assert set(schema["required"]) == set(REQUIRED)
+
+
+def test_migration_v2_to_v3_keeps_rows(tmp_path):
+    """A v2 database with chunks, segments and sessions survives the v3 table rebuild."""
+    import sqlite3
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    dbmod.migrate(conn, target=2)
+    assert dbmod.user_version(conn) == 2
+    assert "kind" not in {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
+    cid = seed_chunk(conn)
+    sid = insert_segment(conn, cid, 0, "gammel rad")
+    conn.execute("INSERT INTO sessions (id, device_id, gap_s, start_utc_ms, end_utc_ms, n_chunks, n_segments) "
+                 "VALUES ('s1', 'oma', 300, 0, 1, 1, 1)")
+    conn.execute("UPDATE chunks SET session_id = 's1' WHERE id = ?", (cid,))
+    conn.close()
+
+    conn = dbmod.connect(path)
+    assert dbmod.user_version(conn) == 3
+    row = conn.execute("SELECT * FROM chunks WHERE id = ?", (cid,)).fetchone()
+    assert row["kind"] == "speech"
+    assert row["path"] == "2026/09/26/x.opus"
+    assert row["n_start"] is None and row["n_samples"] is None
+    assert row["session_id"] == "s1"
+    seg = conn.execute("SELECT * FROM segments WHERE id = ?", (sid,)).fetchone()
+    assert seg["chunk_id"] == cid and seg["text"] == "gammel rad"
+    assert conn.execute("SELECT count(*) FROM segments_fts WHERE segments_fts MATCH ?",
+                        (fts_query("gammel"),)).fetchone()[0] == 1
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"raw_segments", "raw_progress"} <= names
+    indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='chunks'")}
+    assert {"chunks_start", "chunks_device_start", "chunks_status", "chunks_session", "chunks_path",
+            "chunks_timeline"} <= indexes
+    # the cascade still works through the rebuilt table
+    conn.execute("DELETE FROM chunks WHERE id = ?", (cid,))
+    assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 0
+    # a derived chunk needs no path
+    conn.execute(
+        """INSERT INTO chunks (sha256, kind, device_id, start_utc_ms, end_utc_ms, duration_ms, path,
+                               n_start, n_samples, meta_json, run_id, epoch, received_utc_ms)
+           VALUES ('ab', 'derived', 'oma', 0, 1000, 1000, NULL, 0, 16000, '{}', 'r', 0, 0)"""
+    )
+    conn.close()
+
+
+def test_migration_tolerates_preexisting_dangling_rows_and_rolls_back_new_ones(tmp_path, caplog):
+    import logging
+    import sqlite3
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    dbmod.migrate(conn, target=2)
+    cid = seed_chunk(conn)
+    insert_segment(conn, cid, 0, "god rad")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) "
+                 "VALUES (999, 0, 0, 1, 0, 'foreldrelaus', 'm')")
+    conn.close()
+
+    # a dangling row from before is not the migration's fault: the first start succeeds like the second
+    with caplog.at_level(logging.WARNING, logger="roomlog.db"):
+        conn = dbmod.connect(path)
+    assert dbmod.user_version(conn) == 3
+    assert "dangling foreign key" in caplog.text
+    assert len(conn.execute("PRAGMA foreign_key_check").fetchall()) == 1
+    assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 2
+    conn.close()
+    conn = dbmod.connect(path)
+    assert dbmod.user_version(conn) == 3
+    conn.close()
+
+    # a step that itself leaves a dangling reference is rolled back whole and raised
+    import pytest
+    bad = ("INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) "
+           "VALUES (998, 0, 0, 1, 0, 'ny foreldrelaus', 'm');")
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    saved = dict(dbmod._MIGRATIONS)
+    dbmod._MIGRATIONS[4] = bad
+    try:
+        with pytest.raises(RuntimeError, match="v4 left 1 dangling"):
+            dbmod.migrate(conn, target=4)
+    finally:
+        dbmod._MIGRATIONS.clear()
+        dbmod._MIGRATIONS.update(saved)
+    assert dbmod.user_version(conn) == 3
+    assert not conn.in_transaction
+    assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 2
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    conn.close()

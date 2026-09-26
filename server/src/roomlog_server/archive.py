@@ -18,10 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .sidecar import SidecarError, validate_sidecar
+from .sidecar import SidecarError, kind_of, validate_sidecar
 from .times import iso_to_ms, ms_to_compact, now_ms
 
 log = logging.getLogger("roomlog.archive")
+
+RAW_PREFIX = "raw/"
 
 
 @dataclass
@@ -35,6 +37,20 @@ def archive_relpath(start_utc_ms: int, sha256: str) -> str:
     compact = ms_to_compact(start_utc_ms)
     day = compact[:8]
     return f"{day[0:4]}/{day[4:6]}/{day[6:8]}/{compact}_{sha256[:8]}.opus"
+
+
+def raw_relpath(start_utc_ms: int, sha256: str) -> str:
+    """Raw segments live under `archive/raw/` with the same naming (CONTRACT.md)."""
+    return RAW_PREFIX + archive_relpath(start_utc_ms, sha256)
+
+
+def relpath_for(meta: dict[str, Any], sha256: str) -> str:
+    start_ms = iso_to_ms(meta["start_utc"])
+    return raw_relpath(start_ms, sha256) if kind_of(meta) == "raw" else archive_relpath(start_ms, sha256)
+
+
+def table_for(meta: dict[str, Any]) -> str:
+    return "raw_segments" if kind_of(meta) == "raw" else "chunks"
 
 
 def sidecar_path(opus_path: Path) -> Path:
@@ -106,6 +122,39 @@ def insert_chunk_row(conn: sqlite3.Connection, meta: dict[str, Any], meta_json: 
     return int(cur.lastrowid)
 
 
+def insert_raw_row(conn: sqlite3.Connection, meta: dict[str, Any], meta_json: str,
+                   sha256: str, relpath: str, received_utc_ms: int | None = None) -> int:
+    cur = conn.execute(
+        """INSERT INTO raw_segments (sha256, device_id, run_id, epoch, n_start, n_samples,
+                                     start_utc_ms, discontinuity, clock_synced, cut_reason, path,
+                                     meta_json, received_utc_ms, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+        (
+            sha256,
+            meta["device_id"],
+            meta["run_id"],
+            int(meta["epoch"]),
+            int(meta["n_start"]),
+            int(meta["n_samples"]),
+            iso_to_ms(meta["start_utc"]),
+            1 if meta["discontinuity"] else 0,
+            1 if meta["clock_synced"] else 0,
+            meta["cut_reason"],
+            relpath,
+            meta_json,
+            received_utc_ms if received_utc_ms is not None else now_ms(),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def insert_row(conn: sqlite3.Connection, meta: dict[str, Any], meta_json: str, sha256: str,
+               relpath: str, received_utc_ms: int | None = None) -> int:
+    if kind_of(meta) == "raw":
+        return insert_raw_row(conn, meta, meta_json, sha256, relpath, received_utc_ms)
+    return insert_chunk_row(conn, meta, meta_json, sha256, relpath, received_utc_ms)
+
+
 def store_chunk(conn: sqlite3.Connection, archive_dir: Path, meta: dict[str, Any],
                 meta_raw: bytes, body: bytes) -> StoreResult:
     """Store one validated chunk. `meta_raw` is the sidecar exactly as received.
@@ -113,7 +162,7 @@ def store_chunk(conn: sqlite3.Connection, archive_dir: Path, meta: dict[str, Any
     The caller has already checked the token, the sha and the schema.
     """
     sha256 = hashlib.sha256(body).hexdigest()
-    start_ms = iso_to_ms(meta["start_utc"])
+    table = table_for(meta)
     # Keep the exact header text in SQLite as well as in the archive. This
     # makes a missing sidecar recoverable byte-for-byte from the DB row.
     meta_json = meta_raw.decode("utf-8")
@@ -122,7 +171,7 @@ def store_chunk(conn: sqlite3.Connection, archive_dir: Path, meta: dict[str, Any
     # audio from choosing different final paths or overwriting each other.
     conn.execute("BEGIN IMMEDIATE")
     try:
-        row = conn.execute("SELECT path, meta_json FROM chunks WHERE sha256 = ?", (sha256,)).fetchone()
+        row = conn.execute(f"SELECT path, meta_json FROM {table} WHERE sha256 = ?", (sha256,)).fetchone()
         if row is not None:
             relpath = row["path"]
             stored_meta = json.loads(row["meta_json"])
@@ -138,13 +187,13 @@ def store_chunk(conn: sqlite3.Connection, archive_dir: Path, meta: dict[str, Any
                 _write_durable(sidecar_path(opus), raw)
             result = StoreResult(created=False, sha256=sha256, path=relpath)
         else:
-            relpath = archive_relpath(start_ms, sha256)
+            relpath = relpath_for(meta, sha256)
             opus = archive_dir / relpath
             existed = _files_present(archive_dir, relpath)
             if not _files_match(archive_dir, relpath, sha256, meta):
                 _write_durable(opus, body)
                 _write_durable(sidecar_path(opus), meta_raw)
-            insert_chunk_row(conn, meta, meta_json, sha256, relpath)
+            insert_row(conn, meta, meta_json, sha256, relpath)
             result = StoreResult(created=not existed, sha256=sha256, path=relpath)
         conn.execute("COMMIT")
     except Exception:
@@ -162,7 +211,8 @@ def scan_orphans(conn: sqlite3.Connection, archive_dir: Path) -> list[str]:
     recovered: list[str] = []
     if not archive_dir.exists():
         return recovered
-    known_paths = {r[0] for r in conn.execute("SELECT path FROM chunks")}
+    known_paths = {r[0] for r in conn.execute("SELECT path FROM chunks WHERE kind = 'speech'")}
+    known_paths |= {r[0] for r in conn.execute("SELECT path FROM raw_segments")}
     for json_path in sorted(archive_dir.rglob("*.json")):
         opus = json_path.with_suffix(".opus")
         if not opus.exists():
@@ -177,15 +227,15 @@ def scan_orphans(conn: sqlite3.Connection, archive_dir: Path) -> list[str]:
             log.warning("skipping %s: sidecar unusable (%s)", relpath, e)
             continue
         sha256 = hashlib.sha256(opus.read_bytes()).hexdigest()
-        if meta["sha256"] != sha256 or relpath != archive_relpath(iso_to_ms(meta["start_utc"]), sha256):
+        if meta["sha256"] != sha256 or relpath != relpath_for(meta, sha256):
             log.warning("skipping %s: sidecar, filename and audio hash disagree", relpath)
             continue
-        if conn.execute("SELECT id FROM chunks WHERE sha256 = ?", (sha256,)).fetchone():
+        if conn.execute(f"SELECT id FROM {table_for(meta)} WHERE sha256 = ?", (sha256,)).fetchone():
             continue
         meta_json = meta_raw.decode("utf-8")
         conn.execute("BEGIN IMMEDIATE")
         try:
-            insert_chunk_row(conn, meta, meta_json, sha256, relpath)
+            insert_row(conn, meta, meta_json, sha256, relpath)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")

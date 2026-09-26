@@ -22,10 +22,14 @@ from . import sdnotify
 from .audio import SAMPLE_RATE, concat_with_gaps, decode_opus
 from .backends import Backend, NoBackendAvailable, Router, Segment, Transcript, Word
 from .config import Config, Filters
+from .segmenter import RawAudio, Segmenter, covering_segments, purge_raw
 from .sessions import rebuild_sessions
 from .times import now_ms
 
 log = logging.getLogger("roomlog.worker")
+
+PURGE_INTERVAL_MS = 86_400_000  # the worker purges old speech-free raw audio once a day
+SEGMENT_BUDGET_S = 60.0  # segmenter work per batch; a backlog continues in the next batch
 
 
 @dataclass
@@ -35,14 +39,20 @@ class Chunk:
     start_utc_ms: int
     end_utc_ms: int
     duration_ms: int
-    path: str
+    path: str | None
     attempts: int = 0
+    kind: str = "speech"
+    run_id: str = ""
+    epoch: int = 0
+    n_start: int | None = None
+    n_samples: int | None = None
 
     @classmethod
     def from_row(cls, r: sqlite3.Row) -> "Chunk":
         return cls(id=r["id"], device_id=r["device_id"], start_utc_ms=r["start_utc_ms"],
                    end_utc_ms=r["end_utc_ms"], duration_ms=r["duration_ms"], path=r["path"],
-                   attempts=r["attempts"])
+                   attempts=r["attempts"], kind=r["kind"], run_id=r["run_id"], epoch=r["epoch"],
+                   n_start=r["n_start"], n_samples=r["n_samples"])
 
 
 @dataclass
@@ -231,31 +241,81 @@ class BatchResult:
     done: int = 0
     failed: int = 0
     windows: int = 0
+    segmented_epochs: int = 0
+    segmented_chunks: int = 0
+    segment_more: bool = False  # the segmenter stopped at its budget; more raw audio waits
     errors: list[str] = field(default_factory=list)
 
 
 class Worker:
     def __init__(self, cfg: Config, conn: sqlite3.Connection, router: Router,
                  decode: Callable[[str], np.ndarray] = decode_opus,
-                 now: Callable[[], int] = now_ms) -> None:
+                 now: Callable[[], int] = now_ms,
+                 segmenter: Segmenter | None = None) -> None:
         self.cfg = cfg
         self.conn = conn
         self.router = router
         self.decode = decode
         self.now = now
+        self.segmenter = segmenter
         assert cfg.archive_dir is not None
         self.archive_dir = cfg.archive_dir
+        self._last_purge_ms: int | None = None
 
     # -- claiming
 
     def claim(self) -> list[Chunk]:
         rows = self.conn.execute(
-            """SELECT id, device_id, start_utc_ms, end_utc_ms, duration_ms, path, attempts
+            """SELECT id, device_id, start_utc_ms, end_utc_ms, duration_ms, path, attempts,
+                      kind, run_id, epoch, n_start, n_samples
                FROM chunks WHERE status = 'pending' AND attempts < ?
                ORDER BY device_id, start_utc_ms, id LIMIT ?""",
             (self.cfg.max_attempts, self.cfg.batch_size),
         ).fetchall()
         return [Chunk.from_row(r) for r in rows]
+
+    # -- audio
+
+    def audio_for(self, c: Chunk, raw: RawAudio | None = None) -> np.ndarray:
+        """The one seam between chunk kinds: a file for speech chunks, a slice of the
+        decoded raw segments for derived ones (`raw` caches decodes across a batch)."""
+        if c.kind == "derived":
+            assert c.n_start is not None and c.n_samples is not None
+            raw = raw or RawAudio(self.archive_dir, self.decode)
+            n_end = c.n_start + c.n_samples
+            segs = covering_segments(self.conn, c.device_id, c.run_id, c.epoch, c.n_start, n_end)
+            return raw.span(segs, c.n_start, n_end)
+        assert c.path is not None
+        return self.decode(str(self.archive_dir / c.path))
+
+    # -- raw segments
+
+    def segment_raw(self, res: BatchResult) -> None:
+        """One segmenter call, capped at `SEGMENT_BUDGET_S` so a raw backlog (about 25 s of
+        work per hour of audio) neither starves speech chunks nor outlasts the watchdog."""
+        if self.segmenter is None:
+            return
+        try:
+            seg = self.segmenter.run_once(budget_s=SEGMENT_BUDGET_S)
+        except Exception as e:
+            log.exception("segmenter crashed")
+            res.errors.append(f"segmenter: {e.__class__.__name__}: {e}")
+            return
+        res.segmented_epochs = seg.epochs
+        res.segmented_chunks = seg.chunks
+        res.segment_more = seg.more
+        res.errors.extend(f"segmenter: {e}" for e in seg.errors)
+
+    def maybe_purge_raw(self) -> dict[str, int] | None:
+        """Run `purge_raw` at most once per `PURGE_INTERVAL_MS`; the loop calls this every poll."""
+        now = self.now()
+        if self._last_purge_ms is not None and now - self._last_purge_ms < PURGE_INTERVAL_MS:
+            return None
+        self._last_purge_ms = now
+        out = purge_raw(self.conn, self.archive_dir, now=now)
+        if out["deleted"]:
+            log.info("purged %d raw segments (%.1f MB) older than the retention", out["deleted"], out["bytes"] / 1e6)
+        return out
 
     # -- marking
 
@@ -341,6 +401,7 @@ class Worker:
 
     def run_once(self) -> BatchResult:
         res = BatchResult()
+        self.segment_raw(res)
         chunks = self.claim()
         res.claimed = len(chunks)
         if not chunks:
@@ -348,15 +409,16 @@ class Worker:
 
         audio: dict[int, np.ndarray] = {}
         ok: list[Chunk] = []
+        raw = RawAudio(self.archive_dir, self.decode)
         for c in chunks:
             try:
-                a = self.decode(str(self.archive_dir / c.path))
+                a = self.audio_for(c, raw)
                 if len(a) == 0:
                     raise ValueError("decoded to zero samples")
                 audio[c.id] = a
                 ok.append(c)
             except Exception as e:
-                log.warning("decode failed for chunk %d (%s): %s", c.id, c.path, e)
+                log.warning("decode failed for chunk %d (%s): %s", c.id, c.path or f"derived n={c.n_start}", e)
                 self.mark_attempt_failed([c], f"decode: {e}")
                 res.failed += 1
                 res.errors.append(f"chunk {c.id}: decode: {e}")
@@ -400,13 +462,18 @@ class Worker:
         while not stop.is_set():
             sdnotify.notify("WATCHDOG=1")
             try:
+                self.maybe_purge_raw()
                 res = self.run_once()
+                if res.segmented_chunks:
+                    log.info("segmented %d raw epochs into %d chunks", res.segmented_epochs, res.segmented_chunks)
                 if res.claimed:
                     log.info("batch: claimed=%d done=%d failed=%d windows=%d",
                              res.claimed, res.done, res.failed, res.windows)
                     sdnotify.notify("WATCHDOG=1")
                     if res.done and res.claimed >= self.cfg.batch_size:
                         continue  # backlog: go straight to the next batch
+                if res.segment_more:
+                    continue  # raw backlog: the segmenter stopped at its budget
             except Exception:
                 log.exception("worker batch crashed")
             stop.wait(self.cfg.poll_s)

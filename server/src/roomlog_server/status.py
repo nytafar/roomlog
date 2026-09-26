@@ -32,6 +32,16 @@ def render_prom(st: dict[str, Any]) -> str:
     ]
     if st.get("archive_bytes") is not None:
         lines += ["# TYPE roomlog_archive_bytes gauge", f"roomlog_archive_bytes {st['archive_bytes']}"]
+    raw = st.get("raw")
+    if raw is not None:
+        lines += ["# HELP roomlog_raw_segments_total Raw segments in the archive by status.",
+                  "# TYPE roomlog_raw_segments_total gauge"]
+        for status in ("pending", "segmented", "failed"):
+            lines.append(f'roomlog_raw_segments_total{{status="{status}"}} {raw[status]}')
+        lines += ["# TYPE roomlog_raw_pending_oldest_age_seconds gauge",
+                  f"roomlog_raw_pending_oldest_age_seconds {raw['pending_oldest_age_s']}"]
+        if raw.get("bytes") is not None:
+            lines += ["# TYPE roomlog_raw_bytes gauge", f"roomlog_raw_bytes {raw['bytes']}"]
     last = st.get("last_transcribed_utc")
     lines += [
         "# TYPE roomlog_last_transcribed_utc_seconds gauge",
@@ -39,13 +49,26 @@ def render_prom(st: dict[str, Any]) -> str:
         "# TYPE roomlog_device_last_chunk_utc_seconds gauge",
     ]
     for d in st["devices"]:
-        lines.append(
-            f'roomlog_device_last_chunk_utc_seconds{{device_id="{_label(d["device_id"])}"}} '
-            f"{parse_user_time(d['last_chunk_utc']) / 1000}"
-        )
+        if d.get("last_chunk_utc"):
+            lines.append(
+                f'roomlog_device_last_chunk_utc_seconds{{device_id="{_label(d["device_id"])}"}} '
+                f"{parse_user_time(d['last_chunk_utc']) / 1000}"
+            )
     lines.append("# TYPE roomlog_device_chunks_pending gauge")
     for d in st["devices"]:
         lines.append(f'roomlog_device_chunks_pending{{device_id="{_label(d["device_id"])}"}} {d["n_pending"]}')
+    if any(d.get("n_raw") for d in st["devices"]):
+        lines.append("# TYPE roomlog_device_raw_pending gauge")
+        for d in st["devices"]:
+            if d.get("n_raw"):
+                lines.append(f'roomlog_device_raw_pending{{device_id="{_label(d["device_id"])}"}} {d["n_raw_pending"]}')
+        lines.append("# TYPE roomlog_device_last_raw_utc_seconds gauge")
+        for d in st["devices"]:
+            if d.get("last_raw_utc"):
+                lines.append(
+                    f'roomlog_device_last_raw_utc_seconds{{device_id="{_label(d["device_id"])}"}} '
+                    f"{parse_user_time(d['last_raw_utc']) / 1000}"
+                )
     return "\n".join(lines) + "\n"
 
 
@@ -59,15 +82,24 @@ def render_text(st: dict[str, Any]) -> str:
         f"oldest pending {st['pending_oldest_age_s']} s",
         f"last transcribed {st['last_transcribed_utc'] or '-'}",
     ]
+    raw = st.get("raw")
+    if raw is not None:
+        out.append(f"raw            pending={raw['pending']} segmented={raw['segmented']} "
+                   f"failed={raw.get('failed', 0)} derived={raw['derived_chunks']} "
+                   f"oldest pending {raw['pending_oldest_age_s']} s")
     if st.get("archive_bytes") is not None:
-        out.append(f"archive        {st['archive_bytes'] / 1e6:.1f} MB")
+        line = f"archive        {st['archive_bytes'] / 1e6:.1f} MB"
+        if raw is not None and raw.get("bytes") is not None:
+            line += f" (raw {raw['bytes'] / 1e6:.1f} MB)"
+        out.append(line)
     if st["devices"]:
         out.append("devices:")
         for d in st["devices"]:
-            out.append(
-                f"  {d['device_id']:<16} chunks={d['n_chunks']} pending={d['n_pending']} "
-                f"failed={d['n_failed']} last={d['last_chunk_utc']}"
-            )
+            line = (f"  {d['device_id']:<16} chunks={d['n_chunks']} pending={d['n_pending']} "
+                    f"failed={d['n_failed']} last={d['last_chunk_utc'] or '-'}")
+            if d.get("n_raw"):
+                line += f" raw={d['n_raw']} raw_pending={d['n_raw_pending']} last_raw={d['last_raw_utc']}"
+            out.append(line)
     return "\n".join(out) + "\n"
 
 

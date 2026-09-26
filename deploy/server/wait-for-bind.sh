@@ -5,6 +5,9 @@
 # as herdr-spawn's wait-for-bridge drop-in. Wildcard and loopback binds need no wait.
 #
 #   ROOMLOG_BIND=100.79.124.57:8480 wait-for-bind.sh [timeout_s]   (default 120)
+#
+# With the ADR 0007 default (ROOMLOG_BIND=127.0.0.1:8480 behind tailscale serve) this exits
+# at once; it stays for the fallback of binding the tailnet address directly.
 set -u
 timeout_s="${1:-120}"
 addr="${ROOMLOG_BIND:-}"

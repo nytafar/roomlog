@@ -6,10 +6,11 @@
 # What it does, in order:
 #   1. clone or fast-forward ~/services/apps/roomlog (ROOMLOG_REPO overrides the remote)
 #   2. uv sync in server/ with Python 3.12
-#   3. write ~/.config/roomlog/{server.toml,tokens.toml,service.env} from the examples if absent
+#   3. write ~/.config/roomlog/{server.toml,tokens.toml,service.env} from the examples if absent;
+#      warn (exit 1) when an existing service.env binds anything but the loopback (ADR 0007)
 #   4. install the user units into ~/.config/systemd/user and daemon-reload
 #   5. roomlog fetch-model (unless --skip-model) and roomlog selftest (unless --skip-selftest)
-#   6. print the ufw rule and the enable command; it never runs them
+#   6. print the tailscale serve and enable commands; it never runs them
 set -euo pipefail
 
 REPO_URL="${ROOMLOG_REPO:-https://github.com/nytafar/roomlog.git}"
@@ -88,6 +89,25 @@ fi
 if [ ! -e "$CONF_DIR/secrets/berget.key" ]; then
   printf '    note     %s/secrets/berget.key is missing; the berget backend will be skipped until it exists (0600)\n' "$CONF_DIR"
 fi
+# An install from before ADR 0007 pins ROOMLOG_BIND to the tailnet address. tailscale serve
+# proxies to 127.0.0.1:8480, so that bind would 502. The file is the operator's: say so, do not edit it.
+BIND_WARNING=0
+BIND_NOW="$(sed -n 's/^[[:space:]]*ROOMLOG_BIND=//p' "$CONF_DIR/service.env" 2>/dev/null | tail -n 1 | tr -d "\"' ")"
+case "$BIND_NOW" in
+  ""|127.0.0.1:*|localhost:*) ;;
+  *)
+    BIND_WARNING=1
+    INSTALL_STATUS=1
+    printf '    ATTENTION %s/service.env has ROOMLOG_BIND=%s (kept as is).\n' "$CONF_DIR" "$BIND_NOW" >&2
+    printf '              Ingest must bind the loopback behind tailscale serve (ADR 0007). Before enabling the services:\n' >&2
+    printf "                  sed -i 's/^ROOMLOG_BIND=.*/ROOMLOG_BIND=127.0.0.1:8480/' %s/service.env\n" "$CONF_DIR" >&2
+    printf '              and drop any ufw rule that opened 8480 to the tailnet.\n' >&2
+    ;;
+esac
+if [ -e "$CONF_DIR/server.toml" ] && ! grep -q '^\[segmenter\]' "$CONF_DIR/server.toml"; then
+  printf '    note     %s/server.toml has no [segmenter] section; the defaults apply (vad = "silero", raw_idle_s = 120,\n' "$CONF_DIR"
+  printf '             threshold 0.5 / 0.35). Copy the section from %s/server.toml.example to change them.\n' "$EXAMPLES_DIR"
+fi
 
 log "4/6 user units in $UNIT_DIR"
 run mkdir -p "$UNIT_DIR"
@@ -115,9 +135,14 @@ else
 fi
 
 log "6/6 manual steps (not run by this script)"
+if [ "$BIND_WARNING" = 1 ]; then
+  printf '    First fix ROOMLOG_BIND in %s/service.env (see ATTENTION above); the steps below assume 127.0.0.1:8480.\n' "$CONF_DIR"
+fi
 cat <<EOF
-    Open the ingest port on the tailnet interface (needs sudo, once):
-        sudo ufw allow in on tailscale0 to any port 8480 proto tcp
+    Publish ingest over HTTPS on the tailnet name (once; HTTPS certificates must be enabled
+    in the Tailscale admin console). Ingest itself binds 127.0.0.1:8480, so no ufw rule:
+        tailscale serve --bg --https=443 http://127.0.0.1:8480
+        tailscale serve status        # expect https://oma.tailf63b9a.ts.net -> http://127.0.0.1:8480
     Then enable and start the services:
         systemctl --user enable --now roomlog-ingest.service roomlog-worker.service roomlog-health.timer
     Check:

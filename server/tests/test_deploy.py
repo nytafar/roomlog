@@ -76,6 +76,26 @@ def test_installer_defaults_and_fetch_model_tolerance():
     assert 'elif ! run "$ROOMLOG" fetch-model; then' in sh
 
 
+def test_deploy_files_use_loopback_bind_behind_tailscale_serve():
+    """ADR 0007: ingest on 127.0.0.1:8480, published as https://oma.tailf63b9a.ts.net."""
+    serve = "tailscale serve --bg --https=443 http://127.0.0.1:8480"
+    url = "https://oma.tailf63b9a.ts.net"
+    env = (REPO_ROOT / "deploy" / "server" / "service.env.example").read_text()
+    assert "ROOMLOG_BIND=127.0.0.1:8480" in env and serve in env and url in env
+    assert "ufw allow" not in env
+    sh = (REPO_ROOT / "deploy" / "server" / "install.sh").read_text()
+    assert serve in sh and url in sh and "ufw allow" not in sh
+    readme = (REPO_ROOT / "server" / "README.md").read_text()
+    assert serve in readme and url in readme
+    edge_toml = (REPO_ROOT / "deploy" / "edge" / "edge.toml.example").read_text()
+    assert f'server_url = "{url}"' in edge_toml
+    edge_sh = (REPO_ROOT / "deploy" / "edge" / "install.sh").read_text()
+    assert f'SERVER_URL="${{SERVER_URL:-{url}}}"' in edge_sh
+    toml = tomllib.loads((REPO_ROOT / "deploy" / "server" / "server.toml.example").read_text())
+    assert toml["ingest"]["bind"] == "127.0.0.1:8480"
+    assert toml["segmenter"] == {"raw_idle_s": 120, "vad": "silero", "threshold": 0.5, "neg_threshold": 0.35}
+
+
 def test_installer_reports_incomplete_model_after_selftest_and_manual_steps(tmp_path):
     import os
     import subprocess
@@ -103,3 +123,56 @@ def test_installer_reports_incomplete_model_after_selftest_and_manual_steps(tmp_
     assert "manual steps" in result.stdout
     assert "fetch-model failed" in result.stderr
     assert result.returncode == 1
+
+
+def _install_env(tmp_path, service_env: str | None, server_toml: str | None = None):
+    import os
+    home = tmp_path / "home"
+    app = home / "services/apps/roomlog"
+    (app / ".git").mkdir(parents=True)
+    roomlog = app / "server/.venv/bin/roomlog"
+    roomlog.parent.mkdir(parents=True)
+    roomlog.write_text("#!/bin/sh\nexit 0\n")
+    roomlog.chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name in ("git", "uv", "systemctl"):
+        tool = fake_bin / name
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+    conf = home / ".config/roomlog"
+    conf.mkdir(parents=True)
+    if service_env is not None:
+        (conf / "service.env").write_text(service_env)
+    if server_toml is not None:
+        (conf / "server.toml").write_text(server_toml)
+    return dict(os.environ, HOME=str(home), ROOMLOG_APP_DIR=str(app), PATH=f"{fake_bin}:{os.environ['PATH']}")
+
+
+def test_installer_flags_a_non_loopback_bind_in_an_existing_service_env(tmp_path):
+    """Review 5: an install from before ADR 0007 keeps its service.env; the operator must be told."""
+    import subprocess
+    install = REPO_ROOT / "deploy/server/install.sh"
+    env = _install_env(tmp_path / "old", "ROOMLOG_BIND=100.79.124.57:8480\n",
+                       server_toml='[paths]\ndata_dir = "~/x"\n')
+    r = subprocess.run(["bash", str(install), "--skip-model", "--skip-selftest"], env=env,
+                       capture_output=True, text=True, timeout=20)
+    assert r.returncode == 1
+    assert "ATTENTION" in r.stderr and "ROOMLOG_BIND=100.79.124.57:8480 (kept as is)" in r.stderr
+    assert "sed -i 's/^ROOMLOG_BIND=.*/ROOMLOG_BIND=127.0.0.1:8480/'" in r.stderr
+    assert "ROOMLOG_BIND=100.79.124.57:8480" in (tmp_path / "old/home/.config/roomlog/service.env").read_text()
+    assert "First fix ROOMLOG_BIND" in r.stdout
+    assert "no [segmenter] section" in r.stdout
+
+    env = _install_env(tmp_path / "new", 'ROOMLOG_BIND="127.0.0.1:8480"\n',
+                       server_toml='[paths]\ndata_dir = "~/x"\n[segmenter]\nvad = "silero"\n')
+    r = subprocess.run(["bash", str(install), "--skip-model", "--skip-selftest"], env=env,
+                       capture_output=True, text=True, timeout=20)
+    assert r.returncode == 0, r.stderr
+    assert "ATTENTION" not in r.stderr and "First fix" not in r.stdout and "[segmenter]" not in r.stdout
+
+    env = _install_env(tmp_path / "fresh", None)
+    r = subprocess.run(["bash", str(install), "--skip-model", "--skip-selftest"], env=env,
+                       capture_output=True, text=True, timeout=20)
+    assert r.returncode == 0, r.stderr
+    assert "ATTENTION" not in r.stderr

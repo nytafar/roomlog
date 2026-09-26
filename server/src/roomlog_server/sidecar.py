@@ -27,6 +27,14 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _START_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 CUT_REASONS = {"silence", "cap", "discontinuity", "shutdown"}
+KINDS = {"speech", "raw"}
+RAW_SEGMENT_SAMPLES = 480_000  # 30.0 s at 16 kHz, the raw segment length (ADR 0005)
+SAMPLE_RATE = 16000
+
+
+def kind_of(meta: dict[str, Any]) -> str:
+    """`speech` when absent: everything the Linux edge sends today."""
+    return meta.get("kind", "speech")
 
 
 class SidecarError(ValueError):
@@ -96,4 +104,28 @@ def validate_sidecar(meta: Any) -> dict[str, Any]:
         raise SidecarError("session_hint must be a string or null")
     if "multi_speaker" in meta and meta["multi_speaker"] is not None and not isinstance(meta["multi_speaker"], bool):
         raise SidecarError("multi_speaker must be a boolean or null")
+    if "kind" in meta and meta["kind"] not in KINDS:
+        raise SidecarError("kind must be speech or raw")
+    if kind_of(meta) == "raw":
+        _validate_raw(meta)
     return meta
+
+
+def _validate_raw(meta: dict[str, Any]) -> None:
+    """The raw rules of CONTRACT.md: sample-counter cut, no VAD, 480 000 samples unless last."""
+    for key in ("n_start", "n_samples", "cut_reason"):
+        if key not in meta:
+            raise SidecarError(f"raw segment requires {key}")
+    if "vad" in meta:
+        raise SidecarError("raw segment must not carry a vad object")
+    n = meta["n_samples"]
+    reason = meta["cut_reason"]
+    if n > RAW_SEGMENT_SAMPLES:
+        raise SidecarError(f"raw segment n_samples must be at most {RAW_SEGMENT_SAMPLES}")
+    if n == RAW_SEGMENT_SAMPLES:
+        if reason != "cap":
+            raise SidecarError("a full raw segment must have cut_reason cap")
+    elif reason not in ("discontinuity", "shutdown"):
+        raise SidecarError("a short raw segment must have cut_reason discontinuity or shutdown")
+    if abs(float(meta["duration_s"]) - n / SAMPLE_RATE) > 0.00101:
+        raise SidecarError("raw segment duration_s must equal n_samples / 16000")

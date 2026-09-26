@@ -136,27 +136,50 @@ def list_sessions(conn: sqlite3.Connection, from_ms: int | None = None, to_ms: i
 
 
 def list_devices(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Per device: chunk counts and, for raw clients, the raw backlog and last raw segment.
+
+    A device that has only sent raw segments so far (nothing segmented yet) is listed too,
+    with `n_chunks` 0 and `last_chunk_utc` None.
+    """
     rows = conn.execute(
         """SELECT device_id, count(*) AS n_chunks,
                   sum(status = 'pending') AS n_pending, sum(status = 'failed') AS n_failed,
+                  sum(kind = 'derived') AS n_derived,
                   min(start_utc_ms) AS first_ms, max(start_utc_ms) AS last_ms,
                   max(received_utc_ms) AS last_received_ms,
                   (SELECT count(*) FROM sessions s WHERE s.device_id = c.device_id) AS n_sessions
-           FROM chunks c GROUP BY device_id ORDER BY device_id"""
+           FROM chunks c GROUP BY device_id"""
     ).fetchall()
-    return [
-        {
+    devices: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        devices[r["device_id"]] = {
             "device_id": r["device_id"],
             "n_chunks": r["n_chunks"],
             "n_pending": r["n_pending"],
             "n_failed": r["n_failed"],
+            "n_derived": r["n_derived"],
             "n_sessions": r["n_sessions"],
             "first_chunk_utc": ms_to_iso(r["first_ms"]),
             "last_chunk_utc": ms_to_iso(r["last_ms"]),
             "last_received_utc": ms_to_iso(r["last_received_ms"]),
+            "n_raw": 0,
+            "n_raw_pending": 0,
+            "last_raw_utc": None,
         }
-        for r in rows
-    ]
+    raw = conn.execute(
+        """SELECT device_id, count(*) AS n_raw, sum(status = 'pending') AS n_raw_pending,
+                  max(start_utc_ms) AS last_ms
+           FROM raw_segments GROUP BY device_id"""
+    ).fetchall()
+    for r in raw:
+        d = devices.setdefault(r["device_id"], {
+            "device_id": r["device_id"], "n_chunks": 0, "n_pending": 0, "n_failed": 0, "n_derived": 0,
+            "n_sessions": 0, "first_chunk_utc": None, "last_chunk_utc": None, "last_received_utc": None,
+        })
+        d["n_raw"] = r["n_raw"]
+        d["n_raw_pending"] = r["n_raw_pending"]
+        d["last_raw_utc"] = ms_to_iso(r["last_ms"])
+    return [devices[k] for k in sorted(devices)]
 
 
 def session_segments(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
@@ -227,12 +250,26 @@ def status(conn: sqlite3.Connection, archive_dir: Path | None = None, now: int |
         counts[r["status"]] = r["n"]
     oldest = conn.execute("SELECT min(received_utc_ms) AS t FROM chunks WHERE status = 'pending'").fetchone()["t"]
     last_done = conn.execute("SELECT max(transcribed_utc_ms) AS t FROM chunks").fetchone()["t"]
+    raw_counts = {s: 0 for s in ("pending", "segmented", "failed")}
+    for r in conn.execute("SELECT status, count(*) AS n FROM raw_segments GROUP BY status"):
+        raw_counts[r["status"]] = r["n"]
+    raw_oldest = conn.execute(
+        "SELECT min(received_utc_ms) AS t FROM raw_segments WHERE status = 'pending'").fetchone()["t"]
     archive_bytes = None
+    raw_bytes = None
     if archive_dir is not None and archive_dir.exists():
         archive_bytes = sum(p.stat().st_size for p in archive_dir.rglob("*") if p.is_file())
+        raw_dir = archive_dir / "raw"
+        raw_bytes = sum(p.stat().st_size for p in raw_dir.rglob("*") if p.is_file()) if raw_dir.exists() else 0
     return {
         "now_utc": ms_to_iso(now),
         "chunks": counts,
+        "raw": {
+            **raw_counts,
+            "pending_oldest_age_s": round((now - raw_oldest) / 1000, 1) if raw_oldest else 0.0,
+            "derived_chunks": conn.execute("SELECT count(*) FROM chunks WHERE kind = 'derived'").fetchone()[0],
+            "bytes": raw_bytes,
+        },
         "segments": conn.execute("SELECT count(*) FROM segments").fetchone()[0],
         "sessions": conn.execute("SELECT count(*) FROM sessions").fetchone()[0],
         "open_sessions": conn.execute("SELECT count(*) FROM sessions WHERE closed = 0").fetchone()[0],
