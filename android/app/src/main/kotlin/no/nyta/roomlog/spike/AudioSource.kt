@@ -62,8 +62,11 @@ class AudioSource(private val context: Context, private val log: (String) -> Uni
         )
     }
 
-    /** Blocking read of up to `buf.size` samples; negative values are AudioRecord error codes. */
-    fun read(buf: ShortArray): Int = record!!.read(buf, 0, buf.size, AudioRecord.READ_BLOCKING)
+    /** The client buffer the platform actually allocated. */
+    val bufferFrames: Int get() = record!!.bufferSizeInFrames
+
+    /** Blocking read of [count] samples; negative values are AudioRecord error codes. */
+    fun read(buf: ShortArray, count: Int): Int = record!!.read(buf, 0, count, AudioRecord.READ_BLOCKING)
 
     /** `(framePosition, nanoTime)` on the BOOTTIME clock, or null if unsupported right now. */
     fun timestamp(): Pair<Long, Long>? {
