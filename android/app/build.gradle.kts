@@ -4,6 +4,11 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Release signing: set ROOMLOG_KEYSTORE (path), ROOMLOG_KEYSTORE_PASSWORD, ROOMLOG_KEY_ALIAS and
+// ROOMLOG_KEY_PASSWORD to sign with a real key (the release workflow does this from secrets when
+// they exist). Without them the release build is debug-signed so it stays installable by sideload.
+val releaseKeystore: String? = System.getenv("ROOMLOG_KEYSTORE")?.takeIf { it.isNotBlank() }
+
 android {
     namespace = "no.nyta.roomlog.spike"
     compileSdk = 35
@@ -13,13 +18,26 @@ android {
         applicationId = "no.nyta.roomlog.spike"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-spike"
+        versionCode = System.getenv("ROOMLOG_VERSION_CODE")?.toIntOrNull() ?: 1
+        versionName = System.getenv("ROOMLOG_VERSION")?.takeIf { it.isNotBlank() } ?: "0.1.0-spike"
+    }
+
+    signingConfigs {
+        if (releaseKeystore != null) {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = System.getenv("ROOMLOG_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ROOMLOG_KEY_ALIAS")
+                keyPassword = System.getenv("ROOMLOG_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = if (releaseKeystore != null) signingConfigs.getByName("release")
+                            else signingConfigs.getByName("debug")
         }
     }
 
