@@ -44,6 +44,20 @@ import kotlin.math.abs
  * Without any successful timestamp the block falls back to the arrival time
  * minus the block duration, and stalls look like loss again; the caller logs
  * that case.
+ *
+ * Known limits:
+ * - Loss upstream of the client buffer (a HAL glitch) with the buffer not
+ *   full: when `framePosition` does not count dropped frames it is seen only
+ *   once [confirmReads] timestamps agree and is placed after the last
+ *   accepted timestamp, up to about 1.4 reads later than the true gap; when
+ *   it counts them, nothing in the timestamps changes and the loss is not
+ *   detected at all.
+ * - Once a timestamp has succeeded, a read without one keeps the old
+ *   intercept. A loss during a timestamp outage is seen only when timestamps
+ *   return, and blocks in between are stamped as if nothing was lost.
+ * - The smallest loss that registers is more than half of [slackFrames]
+ *   (10 ms by default, whatever the device's period) when `framePosition`
+ *   counts dropped frames, and more than [jitterTolNs] when it does not.
  */
 class CaptureClock(
     /** `AudioRecord.bufferSizeInFrames`: the client buffer. */

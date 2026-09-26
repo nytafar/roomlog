@@ -62,6 +62,22 @@ previous segment with `discontinuity`. A `WARNING: no getTimestamp(BOOTTIME)` li
 device gives no timestamps: stamps then come from read arrival, and a stalled read thread
 will look like loss.
 
+An overrun logs `overrun: <n> frames lost (counted by framePosition)` or `(not counted by
+framePosition)`, and every 600-read summary ends in `losses <n>, counted lost <frames>`. After
+the first loss, `counted lost` above zero means this device's `framePosition` counts frames
+dropped in an overrun; `counted lost 0` with `losses` above zero means it does not. Note which
+in the P2 findings: the two behaviours have different blind spots (below).
+
+Known limits of the capture clock (`CaptureClock`'s class doc has the detail):
+
+- Loss upstream of the client buffer while the buffer is not full (a HAL glitch, not a stalled
+  reader) is placed up to about 1.4 reads late when `framePosition` does not count dropped
+  frames, and is not detected at all when it does.
+- After the first successful timestamp, reads without one keep the previous mapping, so a loss
+  during a timestamp outage shows only when timestamps return.
+- The smallest loss that opens an epoch is just over 10 ms when `framePosition` counts dropped
+  frames and just over 5 ms when it does not.
+
 Segments land in the app's external files dir, in `unsynced/` because the spike has no clock
 probe (`clock_synced: false`):
 
@@ -99,3 +115,39 @@ reason alone. Each full segment must decode to exactly 480000 samples, and withi
 `n_start + n_samples` of a segment must equal the next `n_start`. Concatenating the decodes
 and cross-correlating against a known source (play a chirp near the phone) checks that the
 segment seams are sample-exact.
+
+P2 checklist, in addition to the decode checks above:
+
+- The first lines show the routing callback as `unchanged, ignored`, and no `WARNING: no
+  getTimestamp(BOOTTIME)`.
+- Which `framePosition` behaviour the device has, from the `counted lost` summary line after
+  a loss (see "Run the spike").
+- One pulled segment is accepted by the server (next section).
+
+## Ingest one segment by hand (P2)
+
+The spike does not upload, so P2 checks ingest with one pulled `.opus`/`.json` pair. This needs
+a server that has the raw-segment support (`kind: "raw"`, merged separately from this client)
+and a bearer token configured on the server for the device id the spike ran with, saved in a
+file `token` (secrets stay out of the repo, e.g. under `~/.config/roomlog*/`).
+
+```sh
+cd ~/scratch/spike-spool/unsynced
+f=20260926T101532417Z_9f2c1a3b        # one pair: $f.opus and $f.json
+sha=$(sha256sum "$f.opus" | cut -d' ' -f1)
+meta=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), ensure_ascii=True, separators=(",",":")))' "$f.json")
+curl -sS -w '\nHTTP %{http_code}\n' -X PUT "https://oma.tailf63b9a.ts.net/v1/chunks/$sha" \
+  -H "Authorization: Bearer $(cat token)" \
+  -H 'Content-Type: audio/ogg' \
+  -H "X-Roomlog-Meta: $meta" \
+  --data-binary @"$f.opus"
+```
+
+Expected: `HTTP 201` with a body carrying the same sha,
+`{"sha256":"<sha>","status":"created","path":"..."}`. Running it again gives `HTTP 200` with
+`"status":"exists"`. On `422`, read the `error` in the body: the sidecar fails the schema or the
+raw rules in `contract/CONTRACT.md` (`kind: "raw"`, `n_start` and `n_samples` present,
+`n_samples == 480000` with `cut_reason: "cap"` except for the short last segment of an epoch or
+run, which carries `"discontinuity"` or `"shutdown"`, no `vad`); fix `Sidecar`, not the pulled
+file. `401` is a wrong token, `403` a sidecar `device_id` that is not the token's device, `409`
+a sha mismatch between the URL, the body and `meta.sha256`.
