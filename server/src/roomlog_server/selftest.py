@@ -62,7 +62,8 @@ def run_selftest(cfg: Config, transcribe: bool = True) -> dict[str, Any]:
 
     sample = None
     if conn is not None:
-        row = conn.execute("SELECT path FROM chunks ORDER BY received_utc_ms DESC LIMIT 1").fetchone()
+        row = conn.execute(
+            "SELECT path FROM chunks WHERE kind = 'speech' ORDER BY received_utc_ms DESC LIMIT 1").fetchone()
         if row is not None and (cfg.archive_dir / row["path"]).exists():
             try:
                 sample = decode_opus(cfg.archive_dir / row["path"])

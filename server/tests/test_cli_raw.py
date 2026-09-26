@@ -194,6 +194,15 @@ def test_selftest_reports_vad_model(raw_site, capsys):
     cfg.vad_model_path.write_bytes(b"x")
     rc, out, _ = run(base + ["selftest", "--no-transcribe"], capsys)
     assert f"[ok] vad model: {cfg.vad_model_path}" in out
+    # a derived chunk (no file) as the newest chunk must not break the decode sample check
+    toml.write_text(f'[paths]\ndata_dir = "{cfg.data_dir}"\n[segmenter]\nvad = "energy"\n'
+                    '[[backends]]\nname = "fake"\ntype = "fake"\n')
+    conn = dbmod.connect(cfg.db_path)
+    conn.execute("UPDATE raw_segments SET status = 'pending'")
+    conn.close()
+    assert run(base + ["segment"], capsys)[0] == 0
+    rc, out, _ = run(base + ["selftest"], capsys)
+    assert rc == 0 and "[ok] transcribe fake" in out and "decode" not in out
 
 
 def test_segment_command_reports_missing_model(raw_site, capsys):
