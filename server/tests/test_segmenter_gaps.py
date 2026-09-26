@@ -388,3 +388,39 @@ def test_short_decode_fails_the_segment_and_the_neighbours_go_on(tmp_path):
     assert res.errors == [] and res.chunks == 3
     assert_covers_tone(intervals(conn, "s22"), CYCLES)
     conn.close()
+
+
+# ---------------------------------------------------------------- follow-up review A and B
+
+
+def test_resegment_on_a_live_epoch_rederives_the_whole_tail_without_overlap(tmp_path):
+    """A bounded range one segment before the mark's segment, while the last segment still
+    waits for its successor: the tail from the range on is redone whole, never twice."""
+    pattern = [("s", 1.2), ("t", 2.5), ("s", 0.9), ("t", 4), ("s", 1.4)] * 24  # 240 s, pauses under 1.5 s
+    for seed in range(12):
+        cfg = make_config(tmp_path / str(seed))
+        conn = dbmod.connect(cfg.db_path)
+        fake = FakeRaw(conn)
+        plan = fake.plan(pcm_for(pattern, phase=seed / 12), last_cut="cap")  # live: no final cut
+        kw = {"chunker_kwargs": {"min_silence_ms": 700}}
+        for i, (n, piece, reason) in enumerate(plan):
+            fake.store(n, piece, reason, RAW_T0 + i * 1000)
+            Segmenter(conn, cfg.archive_dir, EnergyVad, vad_info={"model": "energy"}, decode=fake.decode,
+                      now=lambda i=i: RAW_T0 + i * 1000 + 500, **kw).run_once()
+        before = intervals(conn, "s22")
+        mark = conn.execute("SELECT segmented_to_n FROM raw_progress").fetchone()[0]
+        assert mark < 7 * SEGMENT and statuses(conn, "s22")[-1] == "pending"
+        k = mark // SEGMENT - 1  # the segment one step before the mark's segment
+        out = reset_segmentation(conn, "s22", from_ms=RAW_T0 + k * 30_000, to_ms=RAW_T0 + (k + 1) * 30_000)
+        left = intervals(conn, "s22")
+        assert out["chunks_deleted"] == len(before) - len(left)
+        assert not any(hi > conn.execute("SELECT segmented_to_n FROM raw_progress").fetchone()[0] for _, hi in left)
+        res = Segmenter(conn, cfg.archive_dir, EnergyVad, vad_info={"model": "energy"}, decode=fake.decode,
+                        now=lambda: RAW_T0 + 60_000, **kw).run_once()
+        assert res.errors == []
+        after = intervals(conn, "s22")
+        assert_disjoint(after)
+        assert after == before, f"seed {seed}"
+        assert conn.execute("SELECT segmented_to_n FROM raw_progress").fetchone()[0] == mark
+        conn.close()
+

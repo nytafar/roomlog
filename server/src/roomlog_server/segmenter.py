@@ -635,10 +635,11 @@ def reset_segmentation(conn: sqlite3.Connection, device_id: str, from_ms: int | 
     Per affected epoch, the derived chunks that intersect the selected samples are deleted
     (their transcript segments go by cascade) and the raw segments under them go back to
     `pending`. A chunk straddling either end is deleted whole and its whole extent is redone,
-    so the reset never leaves half a chunk. Chunks outside that extent stay: when the extent
-    reaches the epoch's progress mark the mark moves back to its start and the tail is
-    re-derived in order; otherwise the next pass re-derives the extent in place, between the
-    surviving neighbours, like a gap that filled late.
+    so the reset never leaves half a chunk. When the extent reaches the epoch's progress
+    mark, the mark moves back to its start and the whole tail from there (chunks after the
+    extent included) is re-derived in order; otherwise chunks outside the extent stay and
+    the next pass re-derives the extent in place, between the surviving neighbours, like a
+    gap that filled late.
     """
     where = ["device_id = ?"]
     params: list[Any] = [device_id]
@@ -667,12 +668,6 @@ def reset_segmentation(conn: sqlite3.Connection, device_id: str, from_ms: int | 
             ).fetchone()
             n_lo = r["n_from"] if ext["lo"] is None else min(r["n_from"], ext["lo"])
             n_hi = r["n_to"] if ext["hi"] is None else max(r["n_to"], ext["hi"])
-            cur = conn.execute(
-                """DELETE FROM chunks WHERE device_id = ? AND run_id = ? AND epoch = ?
-                   AND kind = 'derived' AND n_start < ? AND n_start + n_samples > ?""",
-                (*key, n_hi, n_lo),
-            )
-            out["chunks_deleted"] += cur.rowcount
             prog = conn.execute(
                 "SELECT segmented_to_n FROM raw_progress WHERE device_id = ? AND run_id = ? AND epoch = ?", key,
             ).fetchone()
@@ -684,9 +679,25 @@ def reset_segmentation(conn: sqlite3.Connection, device_id: str, from_ms: int | 
                    WHERE device_id = ? AND run_id = ? AND epoch = ? AND n_start < ? AND n_start + n_samples > ?""",
                 (*key, n_hi, n_lo),
             ).fetchone()[0]
-            if mark is None or seg_hi >= mark:
-                # The extent reaches the open end of the epoch: everything from n_lo on is
-                # re-derived in order, so every segment from there must be pending again.
+            tail = mark is None or seg_hi >= mark
+            if tail:
+                # The extent reaches the open end of the epoch: the mark moves back to n_lo and
+                # everything from there on is re-derived in order, so every chunk and segment
+                # from n_lo on goes, the ones between n_hi and the old mark included; leaving
+                # them would let the replay derive their span a second time.
+                cur = conn.execute(
+                    """DELETE FROM chunks WHERE device_id = ? AND run_id = ? AND epoch = ?
+                       AND kind = 'derived' AND n_start + n_samples > ?""",
+                    (*key, n_lo),
+                )
+            else:
+                cur = conn.execute(
+                    """DELETE FROM chunks WHERE device_id = ? AND run_id = ? AND epoch = ?
+                       AND kind = 'derived' AND n_start < ? AND n_start + n_samples > ?""",
+                    (*key, n_hi, n_lo),
+                )
+            out["chunks_deleted"] += cur.rowcount
+            if tail:
                 cur = conn.execute(
                     """UPDATE raw_segments SET status = 'pending', segmented_utc_ms = NULL
                        WHERE device_id = ? AND run_id = ? AND epoch = ? AND n_start + n_samples > ?
