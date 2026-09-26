@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "device_id": "oma",
+  "sha256": "9f2c1a3b5d7e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6a7b8c",
+  "start_utc": "2026-09-26T10:15:32.417Z",
+  "duration_s": 12.352,
+  "sample_rate": 16000,
+  "run_id": "b0d0f1a2-3c4d-4e5f-8a9b-0c1d2e3f4a5b",
+  "epoch": 0,
+  "n_start": 1234567,
+  "n_samples": 197632,
+  "discontinuity": false,
+  "clock_step": false,
+  "clock_synced": true,
+  "cut_reason": "silence",
+  "vad": {"model": "silero-vad", "version": "v6.2.3", "threshold": 0.5},
+  "edge_version": "0.1.0",
+  "session_hint": null,
+  "multi_speaker": null
+}

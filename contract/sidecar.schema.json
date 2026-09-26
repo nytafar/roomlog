@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nytafar/roomlog/contract/sidecar.schema.json",
+  "title": "roomlog chunk sidecar, schema_version 1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "device_id",
+    "sha256",
+    "start_utc",
+    "duration_s",
+    "run_id",
+    "epoch",
+    "discontinuity",
+    "clock_synced"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "device_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+      "description": "Stable identifier of the capturing device; must match the device the bearer token belongs to."
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of the .opus bytes. Identity of the chunk; must equal the URL path segment."
+    },
+    "start_utc": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+      "description": "UTC time of the first sample, ISO 8601 with millisecond precision and a Z suffix."
+    },
+    "duration_s": { "type": "number", "exclusiveMinimum": 0, "maximum": 31 },
+    "sample_rate": { "type": "integer", "enum": [16000] },
+    "run_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUID4 of one capture process lifetime."
+    },
+    "epoch": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sample-continuity segment within run_id; increments when samples were lost."
+    },
+    "n_start": { "type": "integer", "minimum": 0, "description": "Absolute sample index of the first sample in the run timeline." },
+    "n_samples": { "type": "integer", "minimum": 1 },
+    "discontinuity": {
+      "type": "boolean",
+      "description": "True when an unknown amount of audio was lost immediately before this chunk."
+    },
+    "clock_step": {
+      "type": "boolean",
+      "description": "True when the system clock stepped while this chunk was open; start_utc uses the post-step mapping."
+    },
+    "clock_synced": {
+      "type": "boolean",
+      "description": "False when the device clock was not NTP-synchronised at stamping time."
+    },
+    "cut_reason": { "type": "string", "enum": ["silence", "cap", "discontinuity", "shutdown"] },
+    "vad": {
+      "type": "object",
+      "properties": {
+        "model": { "type": "string" },
+        "version": { "type": "string" },
+        "threshold": { "type": "number" }
+      }
+    },
+    "edge_version": { "type": "string" },
+    "session_hint": { "type": ["string", "null"], "description": "Reserved for v2; always null in v1." },
+    "multi_speaker": { "type": ["boolean", "null"], "description": "Reserved for v2; always null in v1." }
+  },
+  "additionalProperties": true
+}

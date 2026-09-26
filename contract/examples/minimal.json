@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "device_id": "pi-work",
+  "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "start_utc": "2026-09-26T10:17:00.000Z",
+  "duration_s": 3.5,
+  "run_id": "11111111-2222-4333-8444-555555555555",
+  "epoch": 0,
+  "discontinuity": false,
+  "clock_synced": true
+}
