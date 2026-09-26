@@ -1,0 +1,54 @@
+# roomlog-edge configuration. Every path lives here; ~ and $VAR are expanded.
+# User-mode install (this workstation): ~/.config/roomlog-edge/edge.toml
+# System-mode install (the Pi):         /etc/roomlog/edge.toml
+
+device_id = "oma"                              # [a-z0-9-], matches the server's token entry
+server_url = "http://100.79.124.57:8480"        # full base URL, scheme included
+
+token_file = "~/.config/roomlog-edge/token"    # bearer token, one line, mode 0600
+spool_dir = "~/.local/share/roomlog-edge/spool"
+model_path = "~/.local/share/roomlog-edge/silero_vad.onnx"
+model_sha256 = ""                              # filled in by the installer after the blob-sha1 check
+status_dir = "$XDG_RUNTIME_DIR/roomlog-edge"   # capture.json, uploader.json (temp+rename every 5 s)
+metrics_file = "~/.local/share/roomlog-edge/metrics.prom"
+
+[audio]
+# device = "plughw:CARD=USB"   # Pi; see `roomlog-edge devices`. Unset → PortAudio default (PipeWire here)
+sample_rate = 16000
+blocksize = 512               # one Silero window, 32 ms
+zero_exit_s = 60.0            # exactly-zero samples this long → exit 3 "mic dead"
+
+[vad]
+threshold = 0.5
+neg_threshold = 0.35
+
+[chunker]
+pad_ms = 300
+min_silence_ms = 1500
+min_speech_ms = 250
+max_chunk_s = 30.0
+min_pause_ms = 100
+ring_s = 60.0
+
+[encoder]
+backend = "auto"              # auto | opusenc | ffmpeg
+bitrate_kbps = 24
+
+[spool]
+max_bytes = 2147483648        # 2 GiB high-water mark: stop writing, never delete
+min_free_fraction = 0.05
+
+[uploader]
+timeout_s = 30.0
+max_backoff_s = 300.0
+idle_poll_s = 5.0
+
+[clock]
+sync_wait_s = 120.0           # wait this long for NTPSynchronized=yes before capturing unsynced
+sync_poll_s = 10.0
+
+[health]
+# healthchecks_url = "https://hc-ping.com/<uuid>"
+frame_age_max_s = 60.0
+upload_stall_s = 3600.0
+status_stale_s = 30.0
