@@ -44,7 +44,7 @@ CREATE INDEX chunks_status ON chunks (status);
 CREATE INDEX chunks_session ON chunks (session_id);
 
 CREATE TABLE segments (
-    id                  INTEGER PRIMARY KEY,
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     chunk_id            INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
     idx                 INTEGER NOT NULL,
     start_utc_ms        INTEGER NOT NULL,
