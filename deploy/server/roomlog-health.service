@@ -1,0 +1,11 @@
+[Unit]
+Description=roomlog health snapshot (status --prom to a .prom file)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/services/apps/roomlog/server
+Environment=HOME=%h
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%h/.config/roomlog/service.env
+ExecStart=%h/services/apps/roomlog/server/.venv/bin/roomlog status --prom --write %h/.local/share/roomlog/roomlog.prom
+# Healthchecks ping is deferred (design section 8); add an ExecStartPost=curl ... once a URL exists.

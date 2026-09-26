@@ -1,0 +1,5 @@
+# Per-device bearer tokens: device_id = "token", one line per client.
+# Copy to ~/.config/roomlog/tokens.toml (mode 0600). Generate a token with:
+#   python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+oma = "replace-me-with-a-long-random-token"
+# pi-home = "..."

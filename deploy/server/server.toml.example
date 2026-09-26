@@ -1,0 +1,62 @@
+# roomlog server configuration. Copy to ~/.config/roomlog/server.toml.
+# Every path the server touches is set here; `~` is expanded.
+
+[paths]
+data_dir = "~/.local/share/roomlog"          # archive/, roomlog.db, models/ live under here
+# archive_dir = "~/.local/share/roomlog/archive"
+# db_path     = "~/.local/share/roomlog/roomlog.db"
+# models_dir  = "~/.local/share/roomlog/models"
+# tokens_file = "~/.config/roomlog/tokens.toml"
+
+[ingest]
+# Pinned per host in ~/.config/roomlog/service.env as ROOMLOG_BIND, which overrides this.
+bind = "127.0.0.1:8480"
+max_body_bytes = 8388608                      # 8 MiB, the contract's cap
+
+[worker]
+poll_s = 10                                   # idle poll interval
+batch_size = 50                               # pending chunks claimed per batch
+window_s = 30.0                               # max audio per transcription request
+window_gap_s = 0.3                            # silence inserted between chunks in a window
+max_attempts = 3
+language = "no"                               # "auto" for per-window language detection
+
+[worker.filters]
+min_avg_logprob = -1.0                        # applied only when the backend reports the stat
+max_compression_ratio = 2.4
+max_no_speech_prob = 0.6
+blocklist = ["Teksting av", "Takk for at du så på", "Thank you for watching"]
+
+[sessions]
+gap_s = 300                                   # silence that separates two sessions
+
+[health]
+prom_file = "~/.local/share/roomlog/roomlog.prom"
+# healthchecks_url = ""                        # deferred; unset means no ping
+
+# Backends in priority order: the first whose probe passes is used, the next on
+# connection failure, timeout or 5xx. Every segment records the model_id that produced it.
+
+[[backends]]
+name = "berget"
+type = "openai"                               # any OpenAI-compatible /audio/transcriptions
+base_url = "https://api.berget.ai/v1"
+model = "NbAiLab/nb-whisper-large"
+api_key_file = "~/.config/roomlog/secrets/berget.key"
+timeout_s = 120
+max_concurrent = 1
+extra_fields = { align = "true" }             # WhisperX word timestamps
+
+[[backends]]
+name = "local"
+type = "local"                                # faster-whisper in-process, lazy-loaded
+model = "NbAiLab/nb-whisper-medium"           # fetched by `roomlog fetch-model` (ct2/ subfolder)
+compute_type = "int8"
+device = "cpu"
+beam_size = 5
+
+# [[backends]]
+# name = "mac"
+# type = "whisper_cpp"                        # whisper.cpp server on the M4 Pro; per-chunk mode
+# base_url = "http://mac.tailnet:8081"
+# model = "nb-whisper-medium-ggml"
