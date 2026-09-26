@@ -223,6 +223,23 @@ def test_observe_offset_applies_step_outside_callbacks():
     assert r.clock_step_ns is None
 
 
+def test_observed_step_is_not_reversed_by_queued_pre_step_callbacks():
+    tl, mic = Timeline(), Mic()
+    mic.offset -= 90 * NS
+    run(tl, mic, 100)
+    queued = [mic.block()[0] for _ in range(2)]
+    mic.offset += 90 * NS
+    observed_mono = queued[-1].mono_ns + 1_000_000
+    assert tl.observe_offset(observed_mono + mic.offset, observed_mono) == 90 * NS
+    for block in queued:
+        assert tl.feed(block).clock_step_ns is None
+    assert tl.step_count == 1
+    block, n_mic = mic.block()
+    assert tl.feed(block).clock_step_ns is None
+    assert tl.step_count == 1
+    assert abs(tl.utc_ns(tl.n - W) - mic.true_real(n_mic)) < 1_000_000
+
+
 def test_anchor_lookup_and_pruning():
     tl, mic = Timeline(), Mic(ppm=50.0)
     blocks = 20 * 60 * RATE // W  # twenty minutes → ~20 anchors

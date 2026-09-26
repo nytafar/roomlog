@@ -114,6 +114,7 @@ class Timeline:
     epochs: dict[int, Epoch] = field(default_factory=dict)
     last_step_n: int | None = None
     last_step_ns: int | None = None
+    last_observe_mono_ns: int | None = None
     step_count: int = 0
     retain_from_n: int = 0  # anchors and epochs before this sample may be pruned
     _late_run: int = 0
@@ -175,7 +176,12 @@ class Timeline:
                 self._late_first = None
             # a clock step is applied to every existing epoch, whether or not
             # this block also opens a new one
-            step = self._apply_offset(offset, n_b, block.mono_ns)
+            if self.last_observe_mono_ns is not None and block.mono_ns <= self.last_observe_mono_ns:
+                # These callbacks were queued before an out-of-band observation
+                # corrected the clock. Their old realtime offset must not undo it.
+                offset = ep.offset_ns
+            else:
+                step = self._apply_offset(offset, n_b, block.mono_ns)
 
         if new_epoch:
             eid = 0 if ep is None else ep.id + 1
@@ -219,7 +225,10 @@ class Timeline:
     def observe_offset(self, real_ns: int, mono_ns: int) -> int | None:
         """Apply a clock step seen outside a callback (e.g. right before
         re-stamping held chunks). Returns the delta if one was applied."""
-        return self._apply_offset(real_ns - mono_ns, self.n, mono_ns)
+        delta = self._apply_offset(real_ns - mono_ns, self.n, mono_ns)
+        if delta is not None:
+            self.last_observe_mono_ns = mono_ns
+        return delta
 
     def _prune(self) -> None:
         keep = self.retain_from_n

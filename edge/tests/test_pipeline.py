@@ -58,11 +58,11 @@ def loud(window: np.ndarray) -> float:
     return 0.95 if float(np.sqrt(np.mean(window ** 2))) > 0.05 else 0.02
 
 
-def make_pipeline(tmp_path, synced=True, encoder=None, src=None, **over):
+def make_pipeline(tmp_path, synced=True, encoder=None, src=None, threaded=True, **over):
     cfg = make_config(tmp_path, **over)
     spool = Spool(cfg.spool_dir)
     vad = FunctionVad(loud)
-    p = Pipeline(cfg, vad, encoder or FakeEncoder(), spool, clock_synced=synced, threaded=True,
+    p = Pipeline(cfg, vad, encoder or FakeEncoder(), spool, clock_synced=synced, threaded=threaded,
                  clocks=src.clocks if src else None)
     return p, spool, vad
 
@@ -198,6 +198,26 @@ def test_sync_poll_before_next_block_still_applies_the_step(tmp_path):
     p.shutdown()
 
 
+def test_queued_pre_step_callbacks_do_not_reverse_sync_poll(tmp_path):
+    src = Source()
+    p, spool, _ = make_pipeline(tmp_path, synced=False, src=src, threaded=False)
+    src.offset -= 90 * 10**9
+    feed(p, src, 2.0, True)
+    feed(p, src, 1.44, False)
+    queued = [src.block(False) for _ in range(2)]
+    src.offset += 90 * 10**9
+    p.set_synced(True)
+    for block in queued:
+        p.process_block(*block)
+    p.flush()
+    (entry,) = spool.entries("pending")
+    meta = entry.read_meta()
+    assert meta["clock_synced"]
+    assert meta["start_utc"] == sidecar.format_utc(1_790_000_000 * 10**9)
+    assert p.timeline.step_count == 1
+    p.shutdown()
+
+
 def test_unsynced_release_without_a_step_is_not_flagged(tmp_path):
     """Boot clock was right all along: sync arrives, nothing steps."""
     src = Source()
@@ -228,6 +248,28 @@ def test_silent_loss_cuts_before_the_gap_and_reprocesses_post_gap_blocks(tmp_pat
     assert first["epoch"] == 0 and second["epoch"] == 1 and second["discontinuity"]
     assert second["n_start"] == n_gap  # post-gap audio starts the next chunk
     assert p.timeline.epochs[0].end_n == n_gap
+    p.shutdown()
+
+
+def test_cap_cut_during_late_blocks_is_trimmed_at_gap(tmp_path):
+    src = Source()
+    p, spool, _ = make_pipeline(tmp_path, src=src, threaded=False)
+    for _ in range(937):
+        p.process_block(*src.block(True))
+    gap_n = src.n
+    p.process_block(*src.block(True, lost_blocks=10))
+    p.process_block(*src.block(True))
+    p.process_block(*src.block(True))  # third late block confirms silent loss
+    feed(p, src, 2.0, True)
+    feed(p, src, 2.0, False)
+    p.flush()
+    metas = sorted((e.read_meta() for e in spool.entries("pending")), key=lambda m: m["n_start"])
+    assert len(metas) == 2
+    first, second = metas
+    assert first["n_start"] + first["n_samples"] == gap_n
+    assert second["n_start"] == gap_n
+    assert [m["epoch"] for m in metas] == [0, 1]
+    assert second["discontinuity"]
     p.shutdown()
 
 

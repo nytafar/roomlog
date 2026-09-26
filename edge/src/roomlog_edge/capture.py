@@ -124,6 +124,9 @@ class Pipeline:
         self._inflight: dict[int, int] = {}  # job seq -> n_start
         self._seq = 0
         self._held: dict[str, tuple[int, int]] = {}  # sha8 -> (n_start, step_count at hold)
+        # A silent gap is confirmed only after several late blocks. Keep chunks
+        # cut during that short interval out of the encoder until it resolves.
+        self._deferred: list[tuple[Chunk, int]] = []
         # stats
         self.blocks = 0
         self.chunks_written = 0
@@ -158,6 +161,7 @@ class Pipeline:
             log.warning("clock step of %.3f s at n=%d", res.clock_step_ns / NS, res.n_start)
         self.ring.write(res.n_start, samples)
         if res.new_epoch:
+            self._submit_deferred(res.epoch_start_n if res.epoch > 0 else None)
             if res.epoch > 0:
                 log.warning("sample loss: new epoch %d starts at n=%d (%s, lateness %.1f ms)",
                             res.epoch, res.epoch_start_n,
@@ -167,6 +171,9 @@ class Pipeline:
                 # silent loss was decided a few blocks late: the blocks since
                 # the gap belong to the new epoch, re-run them through the VAD
                 samples = self.ring.read(res.epoch_start_n, res.n_end)
+        elif res.lateness_ns <= self.timeline.lateness_limit_ns:
+            self._submit_deferred()
+        defer_cuts = not res.new_epoch and res.lateness_ns > self.timeline.lateness_limit_ns
         self._pending = np.concatenate([self._pending, samples]) if len(self._pending) else samples
         while len(self._pending) >= self.window:
             win = self._pending[:self.window]
@@ -174,7 +181,10 @@ class Pipeline:
             p = self.vad(vadmod.pcm_to_float(win))
             self.last_prob = p
             for chunk in self.chunker.feed(self._next_index, p):
-                self._submit(chunk)
+                if defer_cuts:
+                    self._deferred.append((chunk, self._epoch))
+                else:
+                    self._submit(chunk)
             self._next_index += 1
         self.drain_encoded()
         self.timeline.retain_from_n = self._retain_from_n()
@@ -198,6 +208,15 @@ class Pipeline:
         self._next_index = 0
         self._origin = n_start
         self._epoch = epoch
+
+    def _submit_deferred(self, gap_n: int | None = None) -> None:
+        """Commit tentative cuts, clipping them if the late blocks revealed a gap."""
+        for chunk, epoch in self._deferred:
+            if gap_n is not None and chunk.n_end > gap_n:
+                chunk = Chunk(chunk.n_start, gap_n, chunk.cut_reason, chunk.discontinuity)
+            if chunk.n_end > chunk.n_start:
+                self._submit(chunk, epoch=epoch)
+        self._deferred.clear()
 
     def _submit(self, chunk: Chunk, epoch: int | None = None) -> None:
         epoch = self._epoch if epoch is None else epoch
@@ -331,6 +350,7 @@ class Pipeline:
     # -- shutdown ----------------------------------------------------------
 
     def shutdown(self) -> None:
+        self._submit_deferred()
         for chunk in self.chunker.cut("shutdown"):
             self._submit(chunk)
         self.flush()
