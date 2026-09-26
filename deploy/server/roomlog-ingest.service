@@ -1,0 +1,28 @@
+[Unit]
+Description=roomlog ingest (chunk upload endpoint)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# A `systemctl --user` unit running as the login user; %h is the home directory, so no
+# absolute path appears here. Checkout lives at ~/services/apps/roomlog (services convention).
+WorkingDirectory=%h/services/apps/roomlog/server
+Environment=HOME=%h
+# A systemd --user PATH has no ~/.local/bin, where uv lives; mise shims come first.
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+# ROOMLOG_BIND (the tailnet address) is pinned here; see service.env.example.
+EnvironmentFile=-%h/.config/roomlog/service.env
+# The Tailscale address in ROOMLOG_BIND may not exist yet at boot; wait for it (up to
+# 120 s) rather than lose the race and fall back on Restart=on-failure. Same pattern as
+# herdr-spawn's wait-for-bridge drop-in. Skipped when ROOMLOG_BIND names 0.0.0.0/localhost.
+ExecStartPre=/bin/bash %h/services/apps/roomlog/deploy/server/wait-for-bind.sh 120
+ExecStart=%h/services/apps/roomlog/server/.venv/bin/roomlog ingest
+Restart=on-failure
+RestartSec=5
+MemoryMax=300M
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

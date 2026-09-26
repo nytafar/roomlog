@@ -1,0 +1,28 @@
+[Unit]
+Description=roomlog worker (transcription, sessions)
+After=network-online.target roomlog-ingest.service
+Wants=network-online.target
+
+[Service]
+# The worker feeds the watchdog once per poll loop (sd_notify WATCHDOG=1); a hung model
+# call or a stuck backend request gets the unit restarted after WatchdogSec.
+Type=notify
+NotifyAccess=main
+WatchdogSec=600
+WorkingDirectory=%h/services/apps/roomlog/server
+Environment=HOME=%h
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+# Keep the CTranslate2 thread pool bounded on the 10-core i9 (edit to taste).
+Environment=OMP_NUM_THREADS=8
+EnvironmentFile=-%h/.config/roomlog/service.env
+ExecStart=%h/services/apps/roomlog/server/.venv/bin/roomlog worker
+Restart=on-failure
+RestartSec=10
+# NB-Whisper medium int8 needs about 2 GB resident; leave headroom for PyAV and windows.
+MemoryMax=6G
+Nice=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
