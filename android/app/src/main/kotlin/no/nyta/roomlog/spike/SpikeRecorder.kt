@@ -39,10 +39,13 @@ import kotlin.random.Random
 class SpikeRecorder(
     private val context: Context,
     private val spoolDir: File,
+    /** Goes into every sidecar and the ROOMLOG_DEVICE_ID tag; must match the server token's device. */
+    private val deviceId: String,
     private val log: (String) -> Unit,
+    /** Called on the encode thread once the last segment is spooled (or capture failed). */
+    private val onFinished: (SpikeRecorder) -> Unit = {},
 ) {
     val runId: String = UUID.randomUUID().toString()
-    private val deviceId = "spike"
     private val edgeVersion = "android-0.1.0-spike"
     private val blockFrames = 1600 // 100 ms
 
@@ -66,7 +69,7 @@ class SpikeRecorder(
     fun start() {
         check(!running)
         running = true
-        log("run_id=$runId spool=${spoolDir.absolutePath}")
+        log("run_id=$runId device_id=$deviceId spool=${spoolDir.absolutePath}")
         encodeThread = Thread(::encodeLoop, "roomlog-encode").apply { start() }
         captureThread = Thread(::captureLoop, "roomlog-capture").apply { start() }
     }
@@ -76,9 +79,9 @@ class SpikeRecorder(
         running = false
     }
 
-    fun join() {
-        captureThread?.join()
-        encodeThread?.join()
+    fun join(timeoutMs: Long = 0) {
+        captureThread?.join(timeoutMs)
+        encodeThread?.join(timeoutMs)
     }
 
     // -- capture thread ------------------------------------------------------
@@ -223,6 +226,7 @@ class SpikeRecorder(
             encoder?.release()
             val st = spool.stats()
             log("spool: pending=${st.pendingFiles} unsynced=${st.unsyncedFiles} failed=${st.failedFiles} bytes=${st.totalBytes}")
+            onFinished(this)
         }
     }
 
