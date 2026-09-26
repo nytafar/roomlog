@@ -14,7 +14,7 @@ roomlog is built for that shelf. A cheap device in the room listens all the time
 - **Timestamps you can trust.** Times come from a sample counter anchored to UTC, not from the clock at the moment a file opened. Inside one continuous stretch, two chunks are exact relative to each other to the sample; every gap, clock step and unsynced clock is marked in the data rather than papered over.
 - **Nothing lost to the network.** Audio is written to local storage first and uploaded with an idempotent, content-addressed PUT. Outages, reboots and retries cannot duplicate or drop a chunk.
 - **Your hardware, your server.** Transport is the tailnet; storage is a directory of Ogg Opus files and one SQLite database on a workstation. Transcription can use a cloud model, but that is a config choice with a local fallback, not a dependency.
-- **Search, sessions, agents.** Full-text search with Norwegian diacritics intact, fuzzy search, sessions derived from silence gaps, a CLI, a Markdown export for a notes vault, and an MCP server so agents can search and read transcripts without touching SQL.
+- **Search, sessions, agents.** Full-text search with Norwegian diacritics intact, fuzzy search, sessions derived from silence gaps, a CLI, a Markdown export with one file per session, and an MCP server so agents can search and read transcripts without touching SQL.
 - **More than one room.** Every device has its own id and token; sessions, search and status are per device.
 
 ## How it works
@@ -110,7 +110,7 @@ As of 2026-09-26: the server and the Linux edge are implemented, reviewed and de
 
 ## Design notes
 
-Design, ADRs, research and the running handoff log live outside the repo, in the owner's notes vault under `repos/roomlog/`. The decisions that shaped the code, in short:
+The decisions that shaped the code, in short:
 
 1. Content-addressed `PUT`, not a stream or a resumable protocol.
 2. Sample-counter timeline with epochs, not wall-clock stamps.

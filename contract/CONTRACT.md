@@ -2,7 +2,7 @@
 
 Pinned 2026-09-26. Both `edge/` and `server/` build against this file, `sidecar.schema.json`
 and `examples/`. Additive changes to the sidecar never bump `schema_version`; servers store
-unknown fields and ignore them. The full design is in `~/hvelv/repos/roomlog/spec-v1-design.md`.
+unknown fields and ignore them. The design overview is in the top-level README.
 
 ## Chunk
 

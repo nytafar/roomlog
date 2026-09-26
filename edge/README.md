@@ -3,7 +3,7 @@
 Always-on room audio capture for roomlog: mic → sample-counter timeline → Silero VAD →
 speech chunks → Ogg Opus + JSON sidecar → spool → `PUT /v1/chunks/{sha256}`.
 
-Design: `~/hvelv/repos/roomlog/spec-v1-design.md` §3; wire contract: `../contract/`.
+Wire contract: `../contract/`; the design overview is in the top-level README.
 
 ```
 uv sync                      # Python 3.12 (pinned: onnxruntime wheels), numpy, sounddevice, onnxruntime
