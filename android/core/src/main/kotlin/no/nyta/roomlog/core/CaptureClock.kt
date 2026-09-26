@@ -25,11 +25,13 @@ import kotlin.math.abs
  * frames. Two signals, because platforms differ in whether `framePosition`
  * counts frames dropped in an overrun:
  * - it counts them: the backlog (`framePosition` minus frames read) exceeds
- *   the buffer, which is impossible without loss.
- *   The excess over what the buffer holds after this read is the loss.
+ *   what the buffer can hold after this read, which is impossible without
+ *   loss. The excess is the loss; a single dropped period registers.
  * - it does not: the intercept jumps forward by the lost duration. Confirmed
  *   by [confirmReads] agreeing timestamps, or by a single one when it is the
- *   first timestamp after reading past a buffer that was observed full.
+ *   first timestamp after reading past a buffer that was observed full. After
+ *   a full buffer any jump beyond [jitterTolNs] is loss; [lossMinNs] only
+ *   separates loss from a re-base when no full buffer explains the jump.
  *
  * Where the gap is. The client buffer drops the newest frames when full, so a
  * buffer observed full at a read that started at frame `R` holds pre-gap
@@ -42,16 +44,37 @@ import kotlin.math.abs
  * Without any successful timestamp the block falls back to the arrival time
  * minus the block duration, and stalls look like loss again; the caller logs
  * that case.
+ *
+ * Known limits:
+ * - Loss upstream of the client buffer (a HAL glitch) with the buffer not
+ *   full: when `framePosition` does not count dropped frames it is seen only
+ *   once [confirmReads] timestamps agree and is placed after the last
+ *   accepted timestamp, up to about 1.4 reads later than the true gap; when
+ *   it counts them, nothing in the timestamps changes and the loss is not
+ *   detected at all.
+ * - Once a timestamp has succeeded, a read without one keeps the old
+ *   intercept. A loss during a timestamp outage is seen only when timestamps
+ *   return, and blocks in between are stamped as if nothing was lost.
+ * - The smallest loss that registers is more than half of [slackFrames]
+ *   (10 ms by default, whatever the device's period) when `framePosition`
+ *   counts dropped frames, and more than [jitterTolNs] when it does not.
  */
 class CaptureClock(
     /** `AudioRecord.bufferSizeInFrames`: the client buffer. */
     val bufferFrames: Int,
     val rate: Int = 16000,
     val jitterTolNs: Long = 5_000_000,
-    /** Smaller forward jumps re-base the intercept instead of opening an epoch. */
+    /**
+     * Smaller confirmed forward jumps re-base the intercept instead of opening
+     * an epoch. Not applied right after a full buffer, where any jump beyond
+     * [jitterTolNs] is loss.
+     */
     val lossMinNs: Long = 20_000_000,
     val confirmReads: Int = 3,
-    /** Slack on "buffer full" and "backlog exceeds the buffer": one HAL period. */
+    /**
+     * Slack on "buffer full": one HAL period. "Backlog exceeds the buffer"
+     * uses half of it, so a single dropped period counts as loss.
+     */
     val slackFrames: Int = rate / 50,
     private val window: Int = 5,
 ) {
@@ -119,7 +142,10 @@ class CaptureClock(
         // frames still inside the HAL are in neither number
         val backlog = posOur - framesRead
 
-        if (backlog > bufferFrames + slackFrames) {
+        // without loss the backlog is at most what the buffer holds after this read, bufferFrames − n.
+        // The tolerance is half a period, not a whole one: an overrun that drops a single HAL period
+        // must register, and a whole-period tolerance would hide exactly that loss.
+        if (backlog > bufferFrames - n + slackFrames / 2) {
             // counted overrun: the buffer (full at this read's start) holds pre-gap frames up to fFirst + bufferFrames
             val lost = backlog - (bufferFrames - n)
             val g = maxOf(fullAt ?: (fFirst + bufferFrames), fFirst)
@@ -133,9 +159,10 @@ class CaptureClock(
         val d = ci - ref
         val fa = fullAt
         if (fa != null && fFirst >= fa) {
-            // first timestamp after reading past a full buffer: a jump here is the overrun
+            // first timestamp after reading past a full buffer: any jump beyond jitter here is the overrun,
+            // however short (lossMinNs is for jumps with no full buffer to explain them)
             fullAt = null
-            if (d > lossMinNs) {
+            if (d > jitterTolNs) {
                 loss(maxOf(fa, fFirst), ci)
                 return "overrun: ${toFrames(d)} frames lost (not counted by framePosition), new epoch at frame $fa"
             }
@@ -152,6 +179,13 @@ class CaptureClock(
             if (candidates.all { abs(it - m) <= jitterTolNs }) {
                 candidates.clear()
                 val jump = m - ref
+                val full = fullAt
+                if (full != null && jump > jitterTolNs) {
+                    // post-gap frames were delivered before we read up to the full buffer's end
+                    val g = maxOf(full, fFirst)
+                    loss(g, m)
+                    return "overrun: ${toFrames(jump)} frames lost (not counted by framePosition), new epoch at frame $g"
+                }
                 if (jump > lossMinNs) {
                     val g = maxOf(lastAcceptedPos ?: fFirst, fFirst)
                     loss(g, m)

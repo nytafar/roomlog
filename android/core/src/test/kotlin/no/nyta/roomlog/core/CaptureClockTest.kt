@@ -170,6 +170,39 @@ class CaptureClockTest {
         }
     }
 
+    /** A stall of [stallMs] after block 100 of [run], then 300 more blocks: one epoch at the true gap, exact stamps. */
+    private fun assertOneEpochAtTheGap(run: Run, stallMs: Long, label: String) {
+        run.blocks(101, stallNs = mapOf(100 to stallMs * ms))
+        val gap = run.sim.readCount + run.sim.capacity
+        run.blocks(300)
+        assertTrue(run.sim.lost > 0, "$label: the simulation lost frames")
+        assertEquals(1, run.newEpochs, "$label events=${run.events}")
+        val opening = run.recs.single { it.r.newEpoch && it.r.epoch == 1 }
+        assertEquals(gap, opening.fFirst, "$label: epoch 1 starts exactly at the gap")
+        val seg = RawSegmenter()
+        val opens = run.recs.flatMap { seg.feed(it.r) }.filterIsInstance<RawSegmenter.Event.Open>()
+        val after = opens.single { it.epoch == 1 && it.nStart == gap }
+        assertTrue(after.discontinuity, "$label: the segment after the gap carries discontinuity")
+        assertTrue(run.worstNs() < 1 * ms, "$label worst ${run.worstNs()} ns events=${run.events}")
+        assertEquals(1, run.clock.losses, label)
+        assertTrue(run.events.none { it.startsWith("timestamp re-based") }, "$label events=${run.events}")
+    }
+
+    @Test
+    fun smallCountedOverrunOpensOneEpochAtTheGap() {
+        // a loss just over a period: the backlog exceeds what the buffer holds after the read by the loss
+        for (stall in listOf(2030L, 2050L, 2100L)) {
+            assertOneEpochAtTheGap(Run(SimRecord(countsLost = true)), stall, "counting stall=$stall ms")
+        }
+    }
+
+    @Test
+    fun lossOfAFewPeriodsAfterAFullBufferIsNotARebase() {
+        // 2030 ms with 20 ms periods drops one period; 2010 ms with 5 ms periods drops two
+        assertOneEpochAtTheGap(Run(SimRecord(countsLost = false)), 2030, "20 ms periods")
+        assertOneEpochAtTheGap(Run(SimRecord(countsLost = false, period = 80)), 2010, "5 ms periods")
+    }
+
     @Test
     fun singleJitteryTimestampsAreIgnored() {
         val run = Run(SimRecord(countsLost = false))
