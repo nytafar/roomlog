@@ -179,3 +179,50 @@ def test_migration_v2_to_v3_keeps_rows(tmp_path):
            VALUES ('ab', 'derived', 'oma', 0, 1000, 1000, NULL, 0, 16000, '{}', 'r', 0, 0)"""
     )
     conn.close()
+
+
+def test_migration_tolerates_preexisting_dangling_rows_and_rolls_back_new_ones(tmp_path, caplog):
+    import logging
+    import sqlite3
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    dbmod.migrate(conn, target=2)
+    cid = seed_chunk(conn)
+    insert_segment(conn, cid, 0, "god rad")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) "
+                 "VALUES (999, 0, 0, 1, 0, 'foreldrelaus', 'm')")
+    conn.close()
+
+    # a dangling row from before is not the migration's fault: the first start succeeds like the second
+    with caplog.at_level(logging.WARNING, logger="roomlog.db"):
+        conn = dbmod.connect(path)
+    assert dbmod.user_version(conn) == 3
+    assert "dangling foreign key" in caplog.text
+    assert len(conn.execute("PRAGMA foreign_key_check").fetchall()) == 1
+    assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 2
+    conn.close()
+    conn = dbmod.connect(path)
+    assert dbmod.user_version(conn) == 3
+    conn.close()
+
+    # a step that itself leaves a dangling reference is rolled back whole and raised
+    import pytest
+    bad = ("INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) "
+           "VALUES (998, 0, 0, 1, 0, 'ny foreldrelaus', 'm');")
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    saved = dict(dbmod._MIGRATIONS)
+    dbmod._MIGRATIONS[4] = bad
+    try:
+        with pytest.raises(RuntimeError, match="v4 left 1 dangling"):
+            dbmod.migrate(conn, target=4)
+    finally:
+        dbmod._MIGRATIONS.clear()
+        dbmod._MIGRATIONS.update(saved)
+    assert dbmod.user_version(conn) == 3
+    assert not conn.in_transaction
+    assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 2
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    conn.close()

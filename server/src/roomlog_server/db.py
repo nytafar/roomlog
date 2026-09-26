@@ -7,8 +7,11 @@ Plain `sqlite3`. Two external-content FTS5 tables over `segments.text`:
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
+
+log = logging.getLogger("roomlog.db")
 
 SCHEMA_VERSION = 3
 
@@ -243,20 +246,29 @@ def migrate(conn: sqlite3.Connection, target: int = SCHEMA_VERSION) -> None:
         return
     # Table rebuilds (v3) drop a table that `segments` references. With foreign keys on, SQLite
     # would run the implicit DELETE with cascades first. The pragma is a no-op inside a
-    # transaction, so it is toggled around the whole run and the result is checked.
+    # transaction, so it is toggled around the whole run, and every step is checked before
+    # its COMMIT: a step that adds a dangling reference is rolled back and raised. Dangling
+    # rows that were there before are not the migration's doing; they are logged and kept,
+    # so a start never fails on them.
     conn.execute("PRAGMA foreign_keys=OFF")
     try:
+        before = set(map(tuple, conn.execute("PRAGMA foreign_key_check").fetchall()))
+        if before:
+            log.warning("database has %d dangling foreign key row(s) before migration", len(before))
         for version in range(current + 1, target + 1):
-            script = f"BEGIN;\n{_MIGRATIONS[version]}\nPRAGMA user_version={version};\nCOMMIT;"
+            script = f"BEGIN;\n{_MIGRATIONS[version]}\nPRAGMA user_version={version};"
             try:
                 conn.executescript(script)
+                after = set(map(tuple, conn.execute("PRAGMA foreign_key_check").fetchall()))
+                added = after - before
+                if added:
+                    raise RuntimeError(
+                        f"schema migration to v{version} left {len(added)} dangling foreign key(s)")
+                conn.execute("COMMIT")
             except Exception:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
                 raise
-        broken = conn.execute("PRAGMA foreign_key_check").fetchall()
-        if broken:
-            raise RuntimeError(f"schema migration left {len(broken)} dangling foreign key(s)")
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
 
