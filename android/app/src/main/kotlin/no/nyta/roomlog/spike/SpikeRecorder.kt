@@ -8,6 +8,7 @@ import no.nyta.roomlog.core.CaptureClock
 import no.nyta.roomlog.core.OggOpusWriter
 import no.nyta.roomlog.core.OpusHead
 import no.nyta.roomlog.core.RawSegmenter
+import no.nyta.roomlog.core.Retention
 import no.nyta.roomlog.core.SampleRing
 import no.nyta.roomlog.core.Sidecar
 import no.nyta.roomlog.core.Spool
@@ -58,6 +59,9 @@ class SpikeRecorder(
     }
 
     private val queue = LinkedBlockingQueue<Cmd>()
+
+    /** In-flight and unsynced-held segments whose anchors the timeline must keep. */
+    private val retention = Retention()
 
     fun start() {
         check(!running)
@@ -139,7 +143,7 @@ class SpikeRecorder(
                     log("late block at n=${res.nStart}: ${res.latenessNs / 1_000_000} ms (held)")
                 }
                 dispatch(segmenter.feed(res), ring, timeline)
-                timeline.retainFromN = segmenter.retainFromN
+                timeline.retainFromN = retention.retainFromN(segmenter.retainFromN)
                 if (blocks % 600 == 0L) {
                     log(
                         "capture: $blocks reads, last 600: max lateness ${maxLatenessNs / 1_000_000} ms, " +
@@ -173,6 +177,7 @@ class SpikeRecorder(
                 is RawSegmenter.Event.Samples -> queue.put(Cmd.Pcm(e.nStart, ring.read(e.nStart, e.nEnd)))
                 is RawSegmenter.Event.Close -> {
                     val s = e.segment
+                    retention.startInflight(s.nStart)
                     queue.put(Cmd.Close(s, timeline.utcNs(s.nStart, s.epoch), timeline.steppedIn(s.nStart, s.nEnd)))
                 }
             }
@@ -200,7 +205,11 @@ class SpikeRecorder(
                     is Cmd.Pcm -> encoder.queuePcm(c.samples, c.n, packets)
                     is Cmd.Close -> {
                         index++
-                        finishSegment(index, c, open, encoder, packets, spool)
+                        try {
+                            finishSegment(index, c, open, encoder, packets, spool)
+                        } finally {
+                            retention.endInflight(c.seg.nStart)
+                        }
                         open = null
                     }
                     Cmd.Stop -> break
@@ -251,6 +260,8 @@ class SpikeRecorder(
             return
         }
         val entry = spool.write(bytes, meta, dest = "unsynced")
+        // re-stamped through this run's timeline when a /v1/time probe succeeds (P3)
+        retention.hold(entry.stem, seg.nStart)
         val sha = Spool.sha256Hex(bytes)
         val problems = Sidecar.validate(entry.readMeta())
         log(
