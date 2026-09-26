@@ -122,14 +122,16 @@ class Chunker:
             out.extend(self._cap_cut(end))
         return out
 
-    def cut(self, reason: str) -> list[Chunk]:
-        """Close the open chunk at the end of the last window (discontinuity
-        or shutdown). Returns the chunk if any."""
+    def cut(self, reason: str, n_end: int | None = None) -> list[Chunk]:
+        """Close the open chunk at the end of the last window, or at ``n_end``
+        when the caller knows the good audio ended earlier (silent sample loss
+        detected a few blocks late). Returns the chunk if any."""
         out: list[Chunk] = []
         if self._triggered:
-            n_end = self._last_end
+            end = self._last_end if n_end is None else min(n_end, self._last_end)
             if self._temp_end is not None:
-                n_end = min(n_end, self._temp_end + self.pad)
+                end = min(end, self._temp_end + self.pad)
+            n_end = end
             out.extend(self._close(n_end, reason))
         if reason == "discontinuity":
             self._next_discontinuity = True

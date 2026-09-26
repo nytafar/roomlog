@@ -84,9 +84,17 @@ def test_silent_loss_detected_within_three_blocks():
     res = run(tl, mic, 5)
     flags = [r.new_epoch for r, _ in res]
     assert flags == [False, False, True, False, False]
-    r, n_mic = res[3]
-    assert r.epoch == 1
-    assert abs(tl.utc_ns(r.n_start) - mic.true_real(n_mic)) < 1_000_000
+    assert [r.lateness_ns > 200_000_000 for r, _ in res[:3]] == [True] * 3
+    # The epoch starts at the first late block, i.e. the first post-gap
+    # sample, so the two blocks seen before the decision belong to it too.
+    r2, _ = res[2]
+    assert r2.epoch_start_n == 100 * W and r2.n_start == 102 * W
+    assert tl.epochs[0].end_n == 100 * W
+    for r, n_mic in res[2:]:
+        assert r.epoch == 1
+        assert abs(tl.utc_ns(r.n_start) - mic.true_real(n_mic)) < 1_000_000
+    for r, n_mic in res[:2]:  # the first two late blocks map through the new epoch
+        assert abs(tl.utc_ns(r.n_start, 1) - mic.true_real(n_mic)) < 1_000_000
 
 
 def test_scheduling_hiccup_with_catchup_keeps_epoch():
@@ -115,8 +123,10 @@ def _clock_step_case(delta_ns):
     mic.offset += delta_ns  # the wall clock steps; monotonic does not
     (r, n_mic), = run(tl, mic, 1)
     assert r.clock_step_ns == delta_ns and not r.new_epoch and r.epoch == 0
-    assert tl.stepped_since(chunk_start)
-    assert not tl.stepped_since(r.n_start + 1)
+    assert tl.stepped_in(chunk_start, r.n_start + W)
+    assert not tl.stepped_in(chunk_start, r.n_start)  # chunk ended before the step
+    assert not tl.stepped_in(r.n_start + 1, r.n_start + 10 * W)
+    assert tl.step_count == 1
     # In-flight chunk re-stamped with the post-step mapping.
     assert tl.utc_ns(chunk_start) == before + delta_ns
     # Later chunks: no gap, sample-exact relative timing, same epoch.
@@ -184,3 +194,57 @@ def test_restamp_across_epochs_after_step():
     run(tl, mic, 1)
     assert tl.utc_ns(10 * W, 0) == old0 + 7 * NS
     assert tl.utc_ns(60 * W, 1) == old1 + 7 * NS
+
+
+def test_step_seen_on_epoch_opening_block_shifts_old_epochs():
+    tl, mic = Timeline(), Mic()
+    run(tl, mic, 100)
+    old = tl.utc_ns(50 * W, 0)
+    mic.offset += 5 * NS
+    mic.n_mic += 4 * W
+    (r, n_mic), = run(tl, mic, 1, overflow=True)
+    assert r.new_epoch and r.epoch == 1 and r.clock_step_ns == 5 * NS
+    assert tl.last_step_n == r.n_start and tl.step_count == 1
+    assert tl.utc_ns(50 * W, 0) == old + 5 * NS
+    assert abs(tl.utc_ns(r.n_start, 1) - mic.true_real(n_mic)) < 1_000_000
+
+
+def test_observe_offset_applies_step_outside_callbacks():
+    tl, mic = Timeline(), Mic()
+    run(tl, mic, 100)
+    old = tl.utc_ns(10 * W)
+    assert tl.observe_offset(mic.true_real(0) + 1_000_000, mic.true_mono(0)) is None  # 1 ms: no step
+    delta = tl.observe_offset(mic.true_real(0) + 90 * NS, mic.true_mono(0))
+    assert delta == 90 * NS and tl.step_count == 1 and tl.last_step_n == tl.n
+    assert tl.utc_ns(10 * W) == old + 90 * NS
+    # the next block agrees with the new offset: no second step
+    mic.offset += 90 * NS
+    (r, _), = run(tl, mic, 1)
+    assert r.clock_step_ns is None
+
+
+def test_anchor_lookup_and_pruning():
+    tl, mic = Timeline(), Mic(ppm=50.0)
+    blocks = 20 * 60 * RATE // W  # twenty minutes → ~20 anchors
+    tl.retain_from_n = 0
+    for r, n_mic in run(tl, mic, blocks):
+        pass
+    ep = tl.epochs[0]
+    assert len(ep.anchors) >= 15
+    # bisect lookup matches a linear scan for samples all over the range
+    for n in range(0, tl.n, 7919 * 5):
+        linear = max((a for a in ep.anchors if a[0] <= n), default=ep.anchors[0])
+        assert ep.anchor_for(n) == linear
+    assert ep.anchor_for(-5) == ep.anchors[0]
+    # pruning keeps the anchor that still covers retain_from_n and everything after
+    keep_n = ep.anchors[10][0] + 100
+    tl.retain_from_n = keep_n
+    run(tl, mic, 60 * RATE // W + 5)  # one more window → prune runs
+    assert ep.anchors[0][0] <= keep_n < ep.anchors[1][0]
+    assert len(ep.anchors) < 15
+    # epochs entirely before retain_from_n go too, the current one never does
+    mic.n_mic += W
+    run(tl, mic, 1, overflow=True)
+    tl.retain_from_n = tl.n
+    run(tl, mic, 60 * RATE // W + 5)
+    assert list(tl.epochs) == [1]

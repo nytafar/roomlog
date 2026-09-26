@@ -22,6 +22,12 @@ zero_exit_s = 60.0            # exactly-zero samples this long → exit 3 "mic d
 threshold = 0.5
 neg_threshold = 0.35
 
+[timeline]
+lateness_limit_ms = 200       # silent-loss detector: a callback this late counts as suspicious...
+late_blocks = 3               # ...and this many in a row open a new epoch (chrony's boot slew may need tuning)
+step_limit_ms = 50            # real-minus-monotonic offset change that counts as a clock step
+reref_interval_s = 60.0       # drift: a new anchor at the least-late block per interval
+
 [chunker]
 pad_ms = 300
 min_silence_ms = 1500

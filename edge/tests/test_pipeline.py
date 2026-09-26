@@ -35,6 +35,11 @@ class Source:
         self.mono = 5_000 * 10**9
         self.offset = 1_790_000_000 * 10**9 - self.mono
 
+    def clocks(self):
+        """(real_ns, mono_ns) as the process would read them right now."""
+        m = self.mono + self.n * 10**9 // RATE + LAT_NS + 1_000_000
+        return m + self.offset, m
+
     def block(self, speech: bool, overflow=False, lost_blocks=0):
         self.n += lost_blocks * W
         if speech:
@@ -53,11 +58,12 @@ def loud(window: np.ndarray) -> float:
     return 0.95 if float(np.sqrt(np.mean(window ** 2))) > 0.05 else 0.02
 
 
-def make_pipeline(tmp_path, synced=True, encoder=None, **over):
+def make_pipeline(tmp_path, synced=True, encoder=None, src=None, **over):
     cfg = make_config(tmp_path, **over)
     spool = Spool(cfg.spool_dir)
     vad = FunctionVad(loud)
-    p = Pipeline(cfg, vad, encoder or FakeEncoder(), spool, clock_synced=synced, threaded=True)
+    p = Pipeline(cfg, vad, encoder or FakeEncoder(), spool, clock_synced=synced, threaded=True,
+                 clocks=src.clocks if src else None)
     return p, spool, vad
 
 
@@ -128,8 +134,8 @@ def test_overflow_cuts_chunk_and_flags_next(tmp_path):
 
 
 def test_unsynced_start_holds_then_releases_restamped(tmp_path):
-    p, spool, vad = make_pipeline(tmp_path, synced=False)
     src = Source()
+    p, spool, vad = make_pipeline(tmp_path, synced=False, src=src)
     src.offset -= 90 * 10**9  # boot clock 90 s slow
     feed(p, src, 2.0, True)
     feed(p, src, 2.0, False)
@@ -160,14 +166,85 @@ def test_unsynced_start_holds_then_releases_restamped(tmp_path):
 
 
 def test_unsynced_on_shutdown_released_as_is(tmp_path):
-    p, spool, vad = make_pipeline(tmp_path, synced=False)
     src = Source()
+    p, spool, vad = make_pipeline(tmp_path, synced=False, src=src)
     feed(p, src, 1.0, True)
     p.shutdown()
     (e,) = spool.entries("pending")
     meta = e.read_meta()
     assert meta["clock_synced"] is False and meta["cut_reason"] == "shutdown"
     assert spool.entries("unsynced") == []
+
+
+def test_sync_poll_before_next_block_still_applies_the_step(tmp_path):
+    """The kernel sync flag flips between a callback and the timedatectl poll:
+    set_synced() runs before any block carries the stepped clock."""
+    src = Source()
+    p, spool, vad = make_pipeline(tmp_path, synced=False, src=src)
+    src.offset -= 90 * 10**9
+    feed(p, src, 2.0, True)
+    feed(p, src, 2.0, False)
+    p.flush()
+    assert len(spool.entries("unsynced")) == 1
+    src.offset += 90 * 10**9  # chrony steps the clock; no callback has seen it yet
+    p.set_synced(True)
+    (e,) = spool.entries("pending")
+    meta = e.read_meta()
+    assert meta["clock_synced"] is True and meta["clock_step"] is True
+    assert meta["start_utc"] == sidecar.format_utc(1_790_000_000 * 10**9)
+    # the next callback agrees with the corrected offset: no second step
+    feed(p, src, 0.5, False)
+    assert p.timeline.step_count == 1
+    p.shutdown()
+
+
+def test_unsynced_release_without_a_step_is_not_flagged(tmp_path):
+    """Boot clock was right all along: sync arrives, nothing steps."""
+    src = Source()
+    p, spool, vad = make_pipeline(tmp_path, synced=False, src=src)
+    feed(p, src, 2.0, True)
+    feed(p, src, 2.0, False)
+    p.flush()
+    p.set_synced(True)
+    (e,) = spool.entries("pending")
+    meta = e.read_meta()
+    assert meta["clock_synced"] is True and meta["clock_step"] is False
+    p.shutdown()
+
+
+def test_silent_loss_cuts_before_the_gap_and_reprocesses_post_gap_blocks(tmp_path):
+    src = Source()
+    p, spool, vad = make_pipeline(tmp_path, src=src)
+    feed(p, src, 2.0, True)
+    n_gap = src.n  # samples before the gap
+    p.process_block(*src.block(True, lost_blocks=10))  # 320 ms lost, no flag
+    feed(p, src, 2.0, True)
+    feed(p, src, 2.0, False)
+    p.flush()
+    metas = [e.read_meta() for e in spool.entries("pending")]
+    assert [m["cut_reason"] for m in metas] == ["discontinuity", "silence"]
+    first, second = metas
+    assert first["n_start"] + first["n_samples"] == n_gap  # nothing after the gap
+    assert first["epoch"] == 0 and second["epoch"] == 1 and second["discontinuity"]
+    assert second["n_start"] == n_gap  # post-gap audio starts the next chunk
+    assert p.timeline.epochs[0].end_n == n_gap
+    p.shutdown()
+
+
+def test_retain_from_n_tracks_ring_inflight_and_held(tmp_path):
+    src = Source()
+    p, spool, vad = make_pipeline(tmp_path, synced=False, src=src)
+    feed(p, src, 1.0, True)
+    feed(p, src, 2.0, False)
+    p.flush()
+    feed(p, src, 0.1, False)
+    held_n = next(iter(p._held.values()))[0]
+    assert p.timeline.retain_from_n == held_n
+    p.set_synced(True)
+    assert p.timeline.retain_from_n == 0  # ring start
+    feed(p, src, 70.0, False)  # ring wraps
+    assert p.timeline.retain_from_n == p.ring.n_end - p.ring.size
+    p.shutdown()
 
 
 def test_clock_step_during_open_chunk(tmp_path):
@@ -183,6 +260,14 @@ def test_clock_step_during_open_chunk(tmp_path):
     metas = [e.read_meta() for e in spool.entries("pending")]
     assert [m["clock_step"] for m in metas] == [True, False]
     assert [m["epoch"] for m in metas] == [0, 0]
+    # a chunk whose samples ended before the step is not flagged even though
+    # it is stored after it
+    feed(p, src, 1.0, True)
+    feed(p, src, 2.0, False)
+    src.offset -= 7 * 10**9
+    feed(p, src, 0.5, False)
+    p.flush()
+    assert spool.entries("pending")[-1].read_meta()["clock_step"] is False
     # post-step mapping: speech began at n=0 → 1_790_000_000 + 3600 s
     assert metas[0]["start_utc"] == sidecar.format_utc((1_790_000_000 + 3600) * 10**9)
     p.shutdown()

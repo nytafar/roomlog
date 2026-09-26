@@ -38,6 +38,14 @@ class VadConfig:
 
 
 @dataclass
+class TimelineConfig:
+    lateness_limit_ms: int = 200  # silent-loss detector: a block this late counts
+    late_blocks: int = 3  # ... and this many in a row open a new epoch
+    step_limit_ms: int = 50  # real-minus-monotonic offset change that counts as a clock step
+    reref_interval_s: float = 60.0  # drift: new anchor at the least-late block per interval
+
+
+@dataclass
 class ChunkerConfig:
     pad_ms: int = 300
     min_silence_ms: int = 1500
@@ -92,6 +100,7 @@ class Config:
     model_sha256: str | None = None
     audio: AudioConfig = field(default_factory=AudioConfig)
     vad: VadConfig = field(default_factory=VadConfig)
+    timeline: TimelineConfig = field(default_factory=TimelineConfig)
     chunker: ChunkerConfig = field(default_factory=ChunkerConfig)
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     spool: SpoolConfig = field(default_factory=SpoolConfig)
@@ -117,6 +126,7 @@ class Config:
 _SECTIONS = {
     "audio": AudioConfig,
     "vad": VadConfig,
+    "timeline": TimelineConfig,
     "chunker": ChunkerConfig,
     "encoder": EncoderConfig,
     "spool": SpoolConfig,

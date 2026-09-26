@@ -29,6 +29,8 @@ from .spool import Spool
 from .status import write_status
 from .timeline import NS, Block, Timeline
 
+MS = 1_000_000
+
 log = logging.getLogger("roomlog.capture")
 
 EXIT_STREAM_ERROR = 1
@@ -77,6 +79,7 @@ class _Job:
     epoch: int
     pcm: bytes
     tags: dict
+    seq: int = 0
 
 
 @dataclass
@@ -88,7 +91,8 @@ class _Encoded:
 
 class Pipeline:
     def __init__(self, cfg: Config, vad: vadmod.Vad, encoder: Encoder, spool: Spool,
-                 clock_synced: bool = True, run_id: str | None = None, threaded: bool = True):
+                 clock_synced: bool = True, run_id: str | None = None, threaded: bool = True,
+                 clocks=None):
         self.cfg = cfg
         self.vad = vad
         self.encoder = encoder
@@ -96,7 +100,12 @@ class Pipeline:
         self.run_id = run_id or str(uuid.uuid4())
         self.rate = cfg.audio.sample_rate
         self.window = vadmod.WINDOW
-        self.timeline = Timeline(rate=self.rate)
+        # clocks() -> (real_ns, mono_ns); read when re-stamping held chunks
+        self.clocks = clocks or (lambda: (time.time_ns(), time.monotonic_ns()))
+        t = cfg.timeline
+        self.timeline = Timeline(rate=self.rate, lateness_limit_ns=t.lateness_limit_ms * MS,
+                                 late_blocks=t.late_blocks, step_limit_ns=t.step_limit_ms * MS,
+                                 reref_interval_ns=int(t.reref_interval_s * NS))
         c = cfg.chunker
         self.chunker = Chunker.from_ms(rate=self.rate, window=self.window, threshold=cfg.vad.threshold,
                                        neg_threshold=cfg.vad.neg_threshold, pad_ms=c.pad_ms,
@@ -110,6 +119,11 @@ class Pipeline:
         self._epoch = 0
         self._pending = np.zeros(0, dtype=np.int16)
         self._next_index = 0
+        # samples whose timeline mapping is still needed: in-flight encode
+        # jobs and chunks held in unsynced/ from this run
+        self._inflight: dict[int, int] = {}  # job seq -> n_start
+        self._seq = 0
+        self._held: dict[str, tuple[int, int]] = {}  # sha8 -> (n_start, step_count at hold)
         # stats
         self.blocks = 0
         self.chunks_written = 0
@@ -140,14 +154,19 @@ class Pipeline:
             f = samples.astype(np.float32) / 32768.0
             rms = float(np.sqrt(np.mean(f * f)))
             self.last_rms_dbfs = 20 * np.log10(rms) if rms > 0 else -120.0
-        if res.new_epoch:
-            if res.epoch > 0:
-                log.warning("sample loss: new epoch %d at n=%d (lateness %.1f ms)",
-                            res.epoch, res.n_start, res.lateness_ns / 1e6)
-            self._start_epoch(res.n_start, res.epoch)
         if res.clock_step_ns is not None:
             log.warning("clock step of %.3f s at n=%d", res.clock_step_ns / NS, res.n_start)
         self.ring.write(res.n_start, samples)
+        if res.new_epoch:
+            if res.epoch > 0:
+                log.warning("sample loss: new epoch %d starts at n=%d (%s, lateness %.1f ms)",
+                            res.epoch, res.epoch_start_n,
+                            "xrun" if input_overflow else "silent", res.lateness_ns / 1e6)
+            self._start_epoch(res.epoch_start_n, res.epoch)
+            if res.epoch_start_n < res.n_start:
+                # silent loss was decided a few blocks late: the blocks since
+                # the gap belong to the new epoch, re-run them through the VAD
+                samples = self.ring.read(res.epoch_start_n, res.n_end)
         self._pending = np.concatenate([self._pending, samples]) if len(self._pending) else samples
         while len(self._pending) >= self.window:
             win = self._pending[:self.window]
@@ -158,10 +177,20 @@ class Pipeline:
                 self._submit(chunk)
             self._next_index += 1
         self.drain_encoded()
+        self.timeline.retain_from_n = self._retain_from_n()
+
+    def _retain_from_n(self) -> int:
+        n = self.ring.n_end - self.ring.size
+        if self._inflight:
+            n = min(n, min(self._inflight.values()))
+        if self._held:
+            n = min(n, min(h[0] for h in self._held.values()))
+        return max(n, 0)
 
     def _start_epoch(self, n_start: int, epoch: int) -> None:
         if epoch > 0:
-            for chunk in self.chunker.cut("discontinuity"):
+            # close the old chunk before the first lost sample; never span a gap
+            for chunk in self.chunker.cut("discontinuity", n_end=n_start):
                 self._submit(chunk, epoch=epoch - 1)
         self.chunker.reset(n_start)
         self.vad.reset()
@@ -179,7 +208,9 @@ class Pipeline:
             self.chunks_dropped += 1
             return
         tags = roomlog_tags(self.cfg.device_id, self.run_id, epoch, chunk.n_start, __version__)
-        job = _Job(chunk, epoch, pcm, tags)
+        self._seq += 1
+        job = _Job(chunk, epoch, pcm, tags, self._seq)
+        self._inflight[job.seq] = chunk.n_start
         if self._threaded:
             self._jobs.put(job)
         else:
@@ -220,6 +251,7 @@ class Pipeline:
 
     def _store(self, enc: _Encoded) -> None:
         job = enc.job
+        self._inflight.pop(job.seq, None)
         if enc.opus is None:
             log.error("encode failed for n=%d: %s", job.chunk.n_start, enc.error)
             self.chunks_failed += 1
@@ -230,7 +262,9 @@ class Pipeline:
             return
         meta = self._stamp(job.chunk, job.epoch, sha256=None, clock_synced=self.clock_synced)
         dest = "pending" if self.clock_synced else "unsynced"
-        self.spool.write(enc.opus, meta, dest)
+        entry = self.spool.write(enc.opus, meta, dest)
+        if dest == "unsynced":
+            self._held[entry.stem[-8:]] = (job.chunk.n_start, self.timeline.step_count)
         self.chunks_written += 1
 
     def _stamp(self, chunk: Chunk, epoch: int, sha256: str | None, clock_synced: bool) -> dict:
@@ -243,7 +277,7 @@ class Pipeline:
             run_id=self.run_id,
             epoch=epoch,
             discontinuity=chunk.discontinuity,
-            clock_step=self.timeline.stepped_since(chunk.n_start),
+            clock_step=self.timeline.stepped_in(chunk.n_start, chunk.n_end),
             clock_synced=clock_synced,
             cut_reason=chunk.cut_reason,
             vad=self.vad_info,
@@ -255,6 +289,13 @@ class Pipeline:
 
     def set_synced(self, synced: bool) -> None:
         if synced and not self.clock_synced:
+            # The sync flag may have flipped after the last callback's clocks
+            # were read; look at the clocks now so the step is applied before
+            # the held chunks are re-stamped.
+            real_ns, mono_ns = self.clocks()
+            delta = self.timeline.observe_offset(real_ns, mono_ns)
+            if delta is not None:
+                log.warning("clock step of %.3f s seen at sync", delta / NS)
             self.clock_synced = True
             n = self.release_unsynced(restamp=True)
             log.info("clock synced: released %d held chunks", n)
@@ -273,15 +314,18 @@ class Pipeline:
             except (OSError, ValueError):
                 self.spool.move(entry, "failed")
                 continue
+            held = self._held.pop(entry.stem[-8:], None)
             if (restamp and meta.get("run_id") == self.run_id and meta.get("epoch") in self.timeline.epochs
                     and isinstance(meta.get("n_start"), int)):
                 meta["start_utc"] = sidecar.format_utc(self.timeline.utc_ns(meta["n_start"], meta["epoch"]))
                 meta["clock_synced"] = True
-                meta["clock_step"] = True
+                if held is not None and self.timeline.step_count > held[1]:
+                    meta["clock_step"] = True  # a step was applied to this start_utc
                 self.spool.rewrite_meta(entry, meta, "pending")
             else:
                 self.spool.move(entry, "pending")
             n += 1
+        self.timeline.retain_from_n = self._retain_from_n()
         return n
 
     # -- shutdown ----------------------------------------------------------
@@ -427,6 +471,11 @@ def run_capture(cfg: Config) -> int:
             if item is not ...:
                 pcm, frames, m, r, lat, overflow = item
                 pipeline.process_block(pcm, frames, m, r, lat, overflow)
+                # Any arriving frame feeds the watchdog; exactly-zero audio is
+                # handled by the exit-3 path below, which shuts down cleanly
+                # (a watchdog SIGABRT would skip the shutdown cut).
+                if frames:
+                    sdnotify.watchdog()
                 if frames and pcm.count(b"\x00") == len(pcm):
                     zero_s += frames / cfg.audio.sample_rate
                     if zero_s >= cfg.audio.zero_exit_s:
@@ -435,7 +484,6 @@ def run_capture(cfg: Config) -> int:
                         break
                 else:
                     zero_s = 0.0
-                    sdnotify.watchdog()
             now = time.monotonic()
             if now - last_sync >= sync_every:
                 last_sync = now
