@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import logging
+import os
 import sqlite3
 import tempfile
 from dataclasses import dataclass
@@ -70,6 +70,15 @@ def _files_present(archive_dir: Path, relpath: str) -> bool:
     return opus.exists() and sidecar_path(opus).exists()
 
 
+def _files_match(archive_dir: Path, relpath: str, sha256: str, meta: dict[str, Any]) -> bool:
+    opus = archive_dir / relpath
+    try:
+        return (hashlib.sha256(opus.read_bytes()).hexdigest() == sha256
+                and json.loads(sidecar_path(opus).read_bytes()) == meta)
+    except (OSError, ValueError):
+        return False
+
+
 def insert_chunk_row(conn: sqlite3.Connection, meta: dict[str, Any], meta_json: str,
                      sha256: str, relpath: str, received_utc_ms: int | None = None) -> int:
     start_ms = iso_to_ms(meta["start_utc"])
@@ -105,46 +114,37 @@ def store_chunk(conn: sqlite3.Connection, archive_dir: Path, meta: dict[str, Any
     """
     sha256 = hashlib.sha256(body).hexdigest()
     start_ms = iso_to_ms(meta["start_utc"])
-    row = conn.execute("SELECT id, path FROM chunks WHERE sha256 = ?", (sha256,)).fetchone()
-    if row is not None:
-        relpath = row["path"]
-        if not _files_present(archive_dir, relpath):
-            # row-without-file: the archive lost the files (or a crash after rename of one)
-            opus = archive_dir / relpath
-            _write_durable(opus, body)
-            _write_durable(sidecar_path(opus), meta_raw)
-        return StoreResult(created=False, sha256=sha256, path=relpath)
-
-    relpath = archive_relpath(start_ms, sha256)
-    opus = archive_dir / relpath
     meta_json = json.dumps(meta, ensure_ascii=True, separators=(",", ":"))
-    if _files_present(archive_dir, relpath):
-        # file-without-row: crash between rename and insert
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            again = conn.execute("SELECT id FROM chunks WHERE sha256 = ?", (sha256,)).fetchone()
-            if again is None:
-                insert_chunk_row(conn, meta, meta_json, sha256, relpath)
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-        return StoreResult(created=False, sha256=sha256, path=relpath)
-
-    _write_durable(opus, body)
-    _write_durable(sidecar_path(opus), meta_raw)
+    # Serialize the file and row decision across handler threads and processes.
+    # Unique temp names alone do not prevent two revised sidecars for the same
+    # audio from choosing different final paths or overwriting each other.
     conn.execute("BEGIN IMMEDIATE")
     try:
-        again = conn.execute("SELECT id FROM chunks WHERE sha256 = ?", (sha256,)).fetchone()
-        if again is not None:
-            conn.execute("COMMIT")
-            return StoreResult(created=False, sha256=sha256, path=relpath)
-        insert_chunk_row(conn, meta, meta_json, sha256, relpath)
+        row = conn.execute("SELECT path, meta_json FROM chunks WHERE sha256 = ?", (sha256,)).fetchone()
+        if row is not None:
+            relpath = row["path"]
+            stored_meta = json.loads(row["meta_json"])
+            if not _files_match(archive_dir, relpath, sha256, stored_meta):
+                # A missing or corrupt archive must be repaired from the good
+                # incoming audio. The DB's first sidecar remains authoritative.
+                opus = archive_dir / relpath
+                _write_durable(opus, body)
+                _write_durable(sidecar_path(opus), row["meta_json"].encode("ascii"))
+            result = StoreResult(created=False, sha256=sha256, path=relpath)
+        else:
+            relpath = archive_relpath(start_ms, sha256)
+            opus = archive_dir / relpath
+            existed = _files_present(archive_dir, relpath)
+            if not _files_match(archive_dir, relpath, sha256, meta):
+                _write_durable(opus, body)
+                _write_durable(sidecar_path(opus), meta_raw)
+            insert_chunk_row(conn, meta, meta_json, sha256, relpath)
+            result = StoreResult(created=not existed, sha256=sha256, path=relpath)
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
-    return StoreResult(created=True, sha256=sha256, path=relpath)
+    return result
 
 
 def scan_orphans(conn: sqlite3.Connection, archive_dir: Path) -> list[str]:
@@ -170,6 +170,9 @@ def scan_orphans(conn: sqlite3.Connection, archive_dir: Path) -> list[str]:
             log.warning("skipping %s: sidecar unusable (%s)", relpath, e)
             continue
         sha256 = hashlib.sha256(opus.read_bytes()).hexdigest()
+        if meta["sha256"] != sha256 or relpath != archive_relpath(iso_to_ms(meta["start_utc"]), sha256):
+            log.warning("skipping %s: sidecar, filename and audio hash disagree", relpath)
+            continue
         if conn.execute("SELECT id FROM chunks WHERE sha256 = ?", (sha256,)).fetchone():
             continue
         meta_json = json.dumps(meta, ensure_ascii=True, separators=(",", ":"))

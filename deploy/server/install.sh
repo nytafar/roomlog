@@ -21,6 +21,7 @@ DATA_DIR="$HOME/.local/share/roomlog"
 DRY_RUN=0
 SKIP_MODEL=0
 SKIP_SELFTEST=0
+INSTALL_STATUS=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -100,14 +101,17 @@ log "5/6 model and selftest"
 if [ "$SKIP_MODEL" = 1 ]; then
   printf '    skipped: run %s fetch-model when ready (about 3 GB into %s/models)\n' "$ROOMLOG" "$DATA_DIR"
 elif ! run "$ROOMLOG" fetch-model; then
-  # A failed download (offline, HF hiccup) must not abort the install: the berget backend
-  # works without the local model, and the selftest below reports the missing model.
+  # Continue through selftest and manual instructions, but report incomplete setup.
   printf '    WARNING: fetch-model failed; rerun %s fetch-model later. Continuing.\n' "$ROOMLOG" >&2
+  INSTALL_STATUS=1
 fi
 if [ "$SKIP_SELFTEST" = 1 ]; then
   printf '    skipped: run %s selftest\n' "$ROOMLOG"
 else
-  run "$ROOMLOG" selftest || true
+  if ! run "$ROOMLOG" selftest; then
+    printf '    WARNING: selftest failed; inspect the report before starting services.\n' >&2
+    INSTALL_STATUS=1
+  fi
 fi
 
 log "6/6 manual steps (not run by this script)"
@@ -121,3 +125,4 @@ cat <<EOF
         journalctl --user -u roomlog-worker -f
         $ROOMLOG status
 EOF
+exit "$INSTALL_STATUS"

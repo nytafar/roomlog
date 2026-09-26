@@ -16,6 +16,7 @@ import logging
 import re
 import sqlite3
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -80,22 +81,13 @@ class IngestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
-    def _error(self, status: int, message: str, drain: int = 0) -> None:
-        if drain:
-            self._drain(drain)
+    def _error(self, status: int, message: str) -> None:
         self._send(status, {"error": message})
-
-    def _drain(self, n: int) -> None:
-        """Read and discard up to n body bytes so the connection can be reused."""
-        remaining = n
-        while remaining > 0:
-            chunk = self.rfile.read(min(65536, remaining))
-            if not chunk:
-                break
-            remaining -= len(chunk)
 
     def _content_length(self) -> int | None:
         """Declared body length; None when absent, unparseable or chunked (→ 411)."""
@@ -110,16 +102,21 @@ class IngestHandler(BaseHTTPRequestHandler):
             return None
         return n if n >= 0 else None
 
-    def _reject(self, status: int, message: str, length: int | None) -> None:
-        """Error reply for requests refused before the body is needed: drain a modest body
-        so the client sees the status, close the connection on an absurd one (item: no
-        uncapped reads on the 401/404 paths)."""
-        if length is None:
-            self.close_connection = True
-        elif length <= 8 * self.app.max_body:
-            self._drain(length)
-        else:
-            self.close_connection = True
+    def _reject(self, status: int, message: str, drain_length: int = 0) -> None:
+        """Reject promptly; drain a modest oversized body for a usable 413 reply."""
+        if drain_length:
+            deadline = time.monotonic() + 2.0
+            remaining = drain_length
+            while remaining > 0 and time.monotonic() < deadline:
+                self.connection.settimeout(max(0.01, deadline - time.monotonic()))
+                try:
+                    data = self.rfile.read(min(65536, remaining))
+                except TimeoutError:
+                    break
+                if not data:
+                    break
+                remaining -= len(data)
+        self.close_connection = True
         self._error(status, message)
 
     def do_GET(self) -> None:  # noqa: N802
@@ -139,13 +136,13 @@ class IngestHandler(BaseHTTPRequestHandler):
         length = self._content_length()
         m = _CHUNK_PATH.match(self.path)
         if m is None:
-            self._reject(404, "not found", length)
+            self._reject(404, "not found")
             return
         url_sha = m.group(1)
 
         device_id = self.app.device_for_token(self.headers.get("Authorization"))
         if device_id is None:
-            self._reject(401, "missing or unknown token", length)
+            self._reject(401, "missing or unknown token")
             return
 
         if length is None:
@@ -155,9 +152,8 @@ class IngestHandler(BaseHTTPRequestHandler):
             self._error(411, "Content-Length required")
             return
         if length > self.app.max_body:
-            # Drain moderately oversized bodies so the client sees the 413 instead of a
-            # broken pipe; refuse to read absurd ones and close instead.
-            self._reject(413, f"body larger than {self.app.max_body} bytes", length)
+            drain = length if length <= 8 * self.app.max_body else 0
+            self._reject(413, f"body larger than {self.app.max_body} bytes", drain)
             return
 
         body = self.rfile.read(length) if length else b""

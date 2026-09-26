@@ -74,3 +74,32 @@ def test_installer_defaults_and_fetch_model_tolerance():
     assert 'https://github.com/nytafar/roomlog.git' in sh
     assert 'BRANCH="${ROOMLOG_BRANCH:-main}"' in sh
     assert 'elif ! run "$ROOMLOG" fetch-model; then' in sh
+
+
+def test_installer_reports_incomplete_model_after_selftest_and_manual_steps(tmp_path):
+    import os
+    import subprocess
+
+    home = tmp_path / "home"
+    app = home / "services/apps/roomlog"
+    (app / ".git").mkdir(parents=True)
+    roomlog = app / "server/.venv/bin/roomlog"
+    roomlog.parent.mkdir(parents=True)
+    roomlog.write_text("#!/bin/sh\nif [ \"$1\" = fetch-model ]; then exit 1; fi\n"
+                       "if [ \"$1\" = selftest ]; then touch \"$MARKER_PATH\"; fi\n")
+    roomlog.chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name in ("git", "uv", "systemctl"):
+        tool = fake_bin / name
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+    marker = tmp_path / "selftest-ran"
+    env = dict(os.environ, HOME=str(home), ROOMLOG_APP_DIR=str(app), MARKER_PATH=str(marker),
+               PATH=f"{fake_bin}:{os.environ['PATH']}")
+    install = REPO_ROOT / "deploy/server/install.sh"
+    result = subprocess.run(["bash", str(install)], env=env, capture_output=True, text=True, timeout=20)
+    assert marker.exists()
+    assert "manual steps" in result.stdout
+    assert "fetch-model failed" in result.stderr
+    assert result.returncode == 1

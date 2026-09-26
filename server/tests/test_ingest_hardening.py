@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from roomlog_server import db as dbmod
-from roomlog_server.archive import scan_orphans
+from roomlog_server.archive import archive_relpath, scan_orphans
 from roomlog_server.backends import BackendError, BackendUnavailable, Router, Segment, Transcript
 from roomlog_server.backends.fake import FakeBackend
 from roomlog_server.backends.http import post_multipart
@@ -43,8 +43,9 @@ def test_orphan_scan_skips_bad_sidecar_and_uses_one_query(tmp_path):
     day.mkdir(parents=True)
     good = b"good" * 50
     meta = make_sidecar(good)
-    (day / "20260926T101532417Z_aaaaaaaa.opus").write_bytes(good)
-    (day / "20260926T101532417Z_aaaaaaaa.json").write_text(meta_header(meta))
+    good_path = cfg.archive_dir / archive_relpath(1790417732417, meta["sha256"])
+    good_path.write_bytes(good)
+    good_path.with_suffix(".json").write_text(meta_header(meta))
     (day / "20260926T101533000Z_bbbbbbbb.opus").write_bytes(b"bad")
     (day / "20260926T101533000Z_bbbbbbbb.json").write_text("{not json")
     (day / "20260926T101534000Z_cccccccc.opus").write_bytes(b"bad2")
@@ -53,7 +54,7 @@ def test_orphan_scan_skips_bad_sidecar_and_uses_one_query(tmp_path):
     conn.set_trace_callback(queries.append)
     recovered = scan_orphans(conn, cfg.archive_dir)
     conn.set_trace_callback(None)
-    assert recovered == ["2026/09/26/20260926T101532417Z_aaaaaaaa.opus"]
+    assert recovered == [str(good_path.relative_to(cfg.archive_dir))]
     assert sum("WHERE path" in q for q in queries) == 0
     assert sum(q.startswith("SELECT path FROM chunks") for q in queries) == 1
     # ingest still starts with the bad sidecars in place
@@ -64,6 +65,32 @@ def test_orphan_scan_skips_bad_sidecar_and_uses_one_query(tmp_path):
     assert "chunks_path" in idx
     assert dbmod.user_version(conn) == 2
     conn.close()
+
+
+def test_corrupt_orphan_is_skipped_and_good_retry_is_stored(tmp_path):
+    cfg = make_config(tmp_path)
+    good = b"good audio" * 30
+    meta = make_sidecar(good)
+    rel = archive_relpath(1790417732417, meta["sha256"])
+    opus = cfg.archive_dir / rel
+    opus.parent.mkdir(parents=True)
+    opus.write_bytes(b"corrupt audio")
+    opus.with_suffix(".json").write_text(meta_header(meta))
+    srv = make_server(cfg, tokens=TOKENS)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = dbmod.connect(cfg.db_path)
+        assert conn.execute("SELECT count(*) FROM chunks").fetchone()[0] == 0
+        conn.close()
+        client = Client(*srv.server_address[:2])
+        status, payload = client.put_chunk(good, meta)
+        assert status == 200  # existing files were repaired during recovery
+        assert payload["path"] == rel
+        assert opus.read_bytes() == good
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def test_migration_from_v1_adds_index(tmp_path):
@@ -158,6 +185,37 @@ def test_concurrent_same_sha_uploads_never_500(server):
     assert opus.with_suffix(".json").read_bytes() == meta_header(meta).encode()
 
 
+def test_concurrent_revised_sidecars_choose_one_path_and_metadata(server):
+    cfg, srv, client = server
+    body = b"same audio, revised clock" * 80
+    for i in range(6):
+        metas = [make_sidecar(body, start_utc=f"2026-09-26T10:{i:02d}:00.000Z"),
+                 make_sidecar(body, start_utc=f"2026-09-26T11:{i:02d}:00.000Z")]
+        barrier = threading.Barrier(3)
+        replies = []
+
+        def upload(meta):
+            barrier.wait()
+            replies.append(client.put_chunk(body, meta))
+
+        workers = [threading.Thread(target=upload, args=(meta,)) for meta in metas]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join()
+        assert sorted(status for status, _ in replies) == [200, 201] if i == 0 else [200, 200]
+        paths = {payload["path"] for _, payload in replies}
+        assert len(paths) == 1
+        (relpath,) = paths
+        conn = dbmod.connect(cfg.db_path)
+        row = conn.execute("SELECT path, meta_json FROM chunks WHERE sha256=?", (metas[0]["sha256"],)).fetchone()
+        assert row["path"] == relpath
+        assert json.loads((cfg.archive_dir / relpath).with_suffix(".json").read_bytes()) == json.loads(row["meta_json"])
+        conn.close()
+        assert [str(p.relative_to(cfg.archive_dir)) for p in cfg.archive_dir.rglob("*.opus")] == [relpath]
+
+
 # ---------------------------------------------------------------- 8. short fuzzy terms
 
 
@@ -232,8 +290,16 @@ def test_401_and_404_do_not_read_absurd_bodies(server):
         status, _ = client.request("PUT", path, body=b"x" * 10,
                                    headers={"Authorization": f"Bearer {token}"}, content_length=huge)
         assert status in (401, 404)
-    # a modest body on the 401 path is drained and the connection stays usable
+    # An ordinary rejected upload still receives an explicit 401.
     status, _ = client.put_chunk(b"y" * 1000, make_sidecar(b"y" * 1000), token="nope")
     assert status == 401
 
 
+def test_rejected_put_does_not_wait_for_an_incomplete_body(server):
+    _, srv, _ = server
+    host, port = srv.server_address[:2]
+    sha = "a" * 64
+    request = (f"PUT /v1/chunks/{sha} HTTP/1.1\r\nHost: x\r\n"
+               "Authorization: Bearer invalid\r\nContent-Length: 1048576\r\n\r\n")
+    status, _ = raw_request(host, port, request.encode())
+    assert status == 401
