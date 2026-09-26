@@ -56,6 +56,7 @@ class Chunker:
     _speech_start: int = 0  # first speech sample of the open chunk
     _continued: bool = False  # open chunk is the tail after a cap cut
     _speech_seen: bool = False  # a speech window landed in the open chunk
+    _last_speech_end: int = 0  # end of the last window at or above threshold
     _temp_end: int | None = None  # start of the silence in progress
     _pauses: list[tuple[int, int]] = field(default_factory=list)  # (start, len)
     _prev_end: int = 0  # end of the last emitted chunk
@@ -88,6 +89,7 @@ class Chunker:
         self._last_end = origin
         self._continued = False
         self._speech_seen = False
+        self._last_speech_end = origin
 
     def feed(self, index: int, prob: float) -> list[Chunk]:
         cur = self.origin + index * self.window
@@ -108,6 +110,7 @@ class Chunker:
                 self._continued = False
                 self._pauses = []
             self._speech_seen = True
+            self._last_speech_end = end
         elif self._triggered and prob < self.neg_threshold:
             if self._temp_end is None:
                 self._temp_end = cur
@@ -165,15 +168,17 @@ class Chunker:
             start, length = max(candidates, key=lambda c: c[1])
             cut = start + length // 2
             out = self._emit(self._chunk_start, cut, "cap")
-            # continue in the same pause if it is still running
-            self._temp_end = cut if self._temp_end is not None and start == self._temp_end else None
         else:
             cut = self._chunk_start + self.max_len
             out = self._emit(self._chunk_start, cut, "cap")
-            self._temp_end = None
+        # The continuation owns everything after the cut: a silence still
+        # running continues from max(its start, cut), completed pauses after
+        # the cut stay candidates, and speech after the cut counts as seen.
+        if self._temp_end is not None:
+            self._temp_end = max(self._temp_end, cut)
+        self._pauses = [p for p in self._pauses if p[0] >= cut]
         self._chunk_start = cut
         self._speech_start = cut
         self._continued = True
-        self._speech_seen = False
-        self._pauses = []
+        self._speech_seen = self._last_speech_end > cut
         return out

@@ -182,3 +182,50 @@ def test_consecutive_chunks_never_overlap_random():
     chunks.extend(ch.cut("shutdown"))
     assert len(chunks) > 50
     assert_no_overlap(chunks)
+
+
+def speech_windows_covered(pattern, chunks, origin=0):
+    """Every window at or above threshold lies inside the union of chunks."""
+    covered = sorted((c.n_start, c.n_end) for c in chunks)
+    merged = []
+    for a, b in covered:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    i = 0
+    missing = []
+    for p, n in pattern:
+        for _ in range(n):
+            cur = origin + i * W
+            if p >= 0.5 and not any(a <= cur and cur + W <= b for a, b in merged):
+                missing.append(cur / 16000)
+            i += 1
+    return missing
+
+
+def test_cap_cut_at_ended_pause_keeps_continuation_speech():
+    # speech 0.5-20.0 s, pause 20.0-20.5 s, speech 20.5-29.8 s, silence: the
+    # cap cuts in the ended pause and the 20.5-29.8 s speech must be emitted.
+    pattern = [(Q, windows(500)), (S, windows(19500)), (Q, windows(500)), (S, windows(9300)),
+               (Q, windows(2000))]
+    chunks, _, _ = drive(pattern)
+    assert [c.cut_reason for c in chunks] == ["cap", "silence"]
+    assert speech_windows_covered(pattern, chunks) == []
+    assert_no_overlap(chunks)
+
+
+def test_every_speech_window_lands_in_a_chunk_random():
+    import random
+
+    rng = random.Random(11)
+    for _ in range(30):
+        pattern = []
+        for _ in range(rng.randrange(5, 60)):
+            pattern.append((S, rng.randrange(8, 700)))  # speech runs >= 256 ms are never dropped
+            pattern.append((rng.choice([Q, M]), rng.randrange(1, 80)))
+        pattern.append((Q, windows(2000)))
+        chunks, ch, _ = drive(pattern)
+        chunks.extend(ch.cut("shutdown"))
+        assert_no_overlap(chunks)
+        assert speech_windows_covered(pattern, chunks) == [], pattern
