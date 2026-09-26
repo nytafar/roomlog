@@ -14,7 +14,7 @@ TimeoutStartSec=180
 TimeoutStopSec=20
 Restart=always
 RestartSec=3
-Nice=-5
+@CAPTURE_EXTRA@
 @SERVICE_EXTRA@
 
 [Install]

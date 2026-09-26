@@ -73,6 +73,7 @@ if [ "$MODE" = user ]; then
   VENV="$REPO/edge/.venv"
   WANTED_BY="default.target"
   SERVICE_EXTRA=""
+  CAPTURE_EXTRA=""   # no Nice=: the user manager has no nice privilege (exec fails 201/NICE)
   SYSTEMCTL="systemctl --user"
   DEVICE_ID="${DEVICE_ID:-oma}"
 else
@@ -86,6 +87,7 @@ else
   VENV="/opt/roomlog/edge"
   WANTED_BY="multi-user.target"
   SERVICE_EXTRA=$'User=roomlog\nGroup=roomlog\nSupplementaryGroups=audio\nRuntimeDirectory=roomlog\nRuntimeDirectoryPreserve=yes'
+  CAPTURE_EXTRA="Nice=-5"
   SYSTEMCTL="systemctl"
   DEVICE_ID="${DEVICE_ID:-$(hostname -s 2>/dev/null || echo pi)}"
 fi
@@ -131,6 +133,8 @@ fi
 run mkdir -p "$CONFIG_DIR" "$STATE/spool"
 if [ "$MODE" = system ]; then
   run chown -R roomlog:roomlog "$STATE"
+  # root-owned config dir, readable by the service user; the token alone is 0600
+  run chown root:roomlog "$CONFIG_DIR"
   run chmod 750 "$CONFIG_DIR"
 fi
 
@@ -201,8 +205,9 @@ fi
 # 7. units ------------------------------------------------------------------
 render_unit() {
   # replaces @BIN@ @CONFIG@ @WANTED_BY@ and the @SERVICE_EXTRA@ line
-  awk -v bin="$BIN" -v config="$CONFIG" -v wanted="$WANTED_BY" -v extra="$SERVICE_EXTRA" '
+  awk -v bin="$BIN" -v config="$CONFIG" -v wanted="$WANTED_BY" -v extra="$SERVICE_EXTRA" -v cextra="$CAPTURE_EXTRA" '
     /^@SERVICE_EXTRA@$/ { if (extra != "") print extra; next }
+    /^@CAPTURE_EXTRA@$/ { if (cextra != "") print cextra; next }
     { gsub(/@BIN@/, bin); gsub(/@CONFIG@/, config); gsub(/@WANTED_BY@/, wanted); print }
   ' "$1"
 }
