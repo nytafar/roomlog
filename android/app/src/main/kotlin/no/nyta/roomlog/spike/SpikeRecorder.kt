@@ -1,0 +1,274 @@
+package no.nyta.roomlog.spike
+
+import android.content.Context
+import android.media.AudioRecord
+import android.os.Process
+import android.os.SystemClock
+import no.nyta.roomlog.core.OggOpusWriter
+import no.nyta.roomlog.core.OpusHead
+import no.nyta.roomlog.core.RawSegmenter
+import no.nyta.roomlog.core.SampleRing
+import no.nyta.roomlog.core.Sidecar
+import no.nyta.roomlog.core.Spool
+import no.nyta.roomlog.core.Timeline
+import java.io.File
+import java.util.UUID
+import java.util.concurrent.LinkedBlockingQueue
+import kotlin.random.Random
+
+/**
+ * The P2 codec spike: AudioRecord → Timeline → RawSegmenter → MediaCodec
+ * Opus → OggOpusWriter → Spool, no upload.
+ *
+ * Two threads. The capture thread (urgent-audio priority) does 100 ms
+ * blocking reads, feeds the timeline and the segmenter, stamps closed
+ * segments, and passes commands to the encode thread through a queue; it
+ * never blocks on the codec. The encode thread owns the `MediaCodec`, the
+ * writer and the spool.
+ *
+ * Timing: `mono` is `elapsedRealtimeNanos()` (BOOTTIME), `real` the device
+ * wall clock, so `clock_synced` is false and segments go to `unsynced/`
+ * (the spike has no `/v1/time` probe). The block's capture time comes from
+ * `AudioRecord.getTimestamp(TIMEBASE_BOOTTIME)`, refreshed every 60 s: it
+ * measures the pipeline latency (arrival minus capture of the newest frame),
+ * which becomes the block's `adcLatencyNs` together with the block duration.
+ * Between refreshes, late reads show up as lateness, which is the silent-loss
+ * detector (AudioRecord has no overflow flag). A dead AudioRecord or a
+ * routing change forces a new epoch.
+ */
+class SpikeRecorder(
+    private val context: Context,
+    private val spoolDir: File,
+    private val log: (String) -> Unit,
+) {
+    val runId: String = UUID.randomUUID().toString()
+    private val deviceId = "spike"
+    private val edgeVersion = "android-0.1.0-spike"
+    private val blockFrames = 1600 // 100 ms
+
+    @Volatile
+    private var running = false
+    private var captureThread: Thread? = null
+    private var encodeThread: Thread? = null
+
+    private sealed interface Cmd {
+        data class Open(val epoch: Int, val nStart: Long, val discontinuity: Boolean) : Cmd
+        data class Pcm(val n: Long, val samples: ShortArray) : Cmd
+        data class Close(val seg: RawSegmenter.Segment, val utcNs: Long, val clockStep: Boolean) : Cmd
+        data object Stop : Cmd
+    }
+
+    private val queue = LinkedBlockingQueue<Cmd>()
+
+    fun start() {
+        check(!running)
+        running = true
+        log("run_id=$runId spool=${spoolDir.absolutePath}")
+        encodeThread = Thread(::encodeLoop, "roomlog-encode").apply { start() }
+        captureThread = Thread(::captureLoop, "roomlog-capture").apply { start() }
+    }
+
+    /** Stop capture; the capture thread cuts the shutdown segment and the encode thread finishes it. */
+    fun stop() {
+        running = false
+    }
+
+    fun join() {
+        captureThread?.join()
+        encodeThread?.join()
+    }
+
+    // -- capture thread ------------------------------------------------------
+
+    private fun captureLoop() {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+        val timeline = Timeline()
+        val segmenter = RawSegmenter(latenessLimitNs = timeline.latenessLimitNs)
+        val ring = SampleRing(3 * 16000)
+        val source = AudioSource(context, log)
+        val buf = ShortArray(blockFrames)
+        var framesThisRecord = 0L
+        var pipelineLatencyNs = 0L
+        var lastTsMono = Long.MIN_VALUE
+        var forceNewEpoch = false
+        var blocks = 0L
+        var maxLatenessNs = 0L
+        try {
+            source.open()
+            while (running) {
+                val got = source.read(buf)
+                val mono = SystemClock.elapsedRealtimeNanos()
+                val real = System.currentTimeMillis() * 1_000_000
+                if (got == AudioRecord.ERROR_DEAD_OBJECT) {
+                    log("AudioRecord dead object: reopening, next block starts a new epoch")
+                    source.close()
+                    source.open()
+                    framesThisRecord = 0
+                    lastTsMono = Long.MIN_VALUE
+                    forceNewEpoch = true
+                    continue
+                }
+                if (got < 0) {
+                    log("AudioRecord.read error $got: stopping")
+                    break
+                }
+                if (got == 0) continue
+                framesThisRecord += got
+                if (source.routingChanged) {
+                    source.routingChanged = false
+                    log("routing changed: new epoch")
+                    forceNewEpoch = true
+                }
+                if (lastTsMono == Long.MIN_VALUE || mono - lastTsMono >= 60 * Timeline.NS) {
+                    lastTsMono = mono
+                    val ts = source.timestamp()
+                    if (ts != null) {
+                        val (pos, tsNs) = ts
+                        // capture time of the newest frame we hold, extrapolated from the timestamp
+                        val newestCapture = tsNs + (framesThisRecord - pos) * Timeline.NS / 16000
+                        pipelineLatencyNs = mono - newestCapture
+                        log(
+                            "timestamp: framePosition=$pos read=$framesThisRecord (ahead ${pos - framesThisRecord}) " +
+                                "pipeline latency ${pipelineLatencyNs / 1_000_000} ms",
+                        )
+                    } else {
+                        log("getTimestamp(BOOTTIME) unavailable; latency assumed ${pipelineLatencyNs / 1_000_000} ms")
+                    }
+                }
+                val adcLatency = timeline.samplesToNs(got.toLong()) + pipelineLatencyNs
+                val res = timeline.feed(Timeline.Block(got, mono, real, adcLatency, forceNewEpoch))
+                forceNewEpoch = false
+                ring.write(res.nStart, buf, got)
+                blocks++
+                maxLatenessNs = maxOf(maxLatenessNs, res.latenessNs)
+                if (res.newEpoch && res.epoch > 0) {
+                    log("new epoch ${res.epoch} at n=${res.epochStartN} (lateness ${res.latenessNs / 1_000_000} ms)")
+                }
+                res.clockStepNs?.let { log("clock step ${it / 1_000_000} ms at n=${res.nStart}") }
+                if (res.latenessNs > timeline.latenessLimitNs && !res.newEpoch) {
+                    log("late block at n=${res.nStart}: ${res.latenessNs / 1_000_000} ms (held)")
+                }
+                dispatch(segmenter.feed(res), ring, timeline)
+                timeline.retainFromN = segmenter.retainFromN
+                if (blocks % 600 == 0L) {
+                    log("capture: ${blocks / 10} s, max lateness in last minute ${maxLatenessNs / 1_000_000} ms")
+                    maxLatenessNs = 0
+                }
+            }
+        } catch (e: Exception) {
+            log("capture failed: $e")
+        } finally {
+            try {
+                dispatch(segmenter.shutdown(), ring, timeline)
+            } catch (e: Exception) {
+                log("shutdown cut failed: $e")
+            }
+            source.close()
+            queue.put(Cmd.Stop)
+            running = false
+            log("capture stopped after ${blocks / 10.0} s")
+        }
+    }
+
+    private fun dispatch(events: List<RawSegmenter.Event>, ring: SampleRing, timeline: Timeline) {
+        for (e in events) {
+            when (e) {
+                is RawSegmenter.Event.Open -> queue.put(Cmd.Open(e.epoch, e.nStart, e.discontinuity))
+                is RawSegmenter.Event.Samples -> queue.put(Cmd.Pcm(e.nStart, ring.read(e.nStart, e.nEnd)))
+                is RawSegmenter.Event.Close -> {
+                    val s = e.segment
+                    queue.put(Cmd.Close(s, timeline.utcNs(s.nStart, s.epoch), timeline.steppedIn(s.nStart, s.nEnd)))
+                }
+            }
+        }
+    }
+
+    // -- encode thread -------------------------------------------------------
+
+    private fun encodeLoop() {
+        val spool = Spool(spoolDir)
+        val cleaned = spool.cleanupTmp()
+        if (cleaned > 0) log("spool: cleaned $cleaned leftover files")
+        var encoder: OpusEncoder? = null
+        var packets = mutableListOf<ByteArray>()
+        var open: Cmd.Open? = null
+        var index = 0
+        try {
+            encoder = OpusEncoder(log)
+            while (true) {
+                when (val c = queue.take()) {
+                    is Cmd.Open -> {
+                        open = c
+                        packets = mutableListOf()
+                    }
+                    is Cmd.Pcm -> encoder.queuePcm(c.samples, c.n, packets)
+                    is Cmd.Close -> {
+                        index++
+                        finishSegment(index, c, open, encoder, packets, spool)
+                        open = null
+                    }
+                    Cmd.Stop -> break
+                }
+            }
+        } catch (e: Exception) {
+            log("encode failed: $e")
+            // keep draining so the capture thread never blocks on a full queue
+            while (queue.take() != Cmd.Stop) Unit
+        } finally {
+            encoder?.release()
+            val st = spool.stats()
+            log("spool: pending=${st.pendingFiles} unsynced=${st.unsyncedFiles} failed=${st.failedFiles} bytes=${st.totalBytes}")
+        }
+    }
+
+    private fun finishSegment(
+        index: Int, c: Cmd.Close, open: Cmd.Open?, encoder: OpusEncoder, packets: MutableList<ByteArray>, spool: Spool,
+    ) {
+        val seg = c.seg
+        check(open != null && open.nStart == seg.nStart) { "close of ${seg.nStart} without matching open" }
+        val preSkipGuess = encoder.csd?.preSkip ?: DEFAULT_PRE_SKIP
+        // enough silence for the lookahead (preSkip at 48 kHz) plus one 20 ms frame
+        val pad = (preSkipGuess + 2) / 3 + 320
+        val t0 = SystemClock.elapsedRealtime()
+        encoder.endSegment(seg.nEnd, pad, packets)
+        val csd = encoder.csd
+        for (note in encoder.takeCsdNotes()) log("seg $index CSD: $note")
+        val preSkip = csd?.preSkip ?: DEFAULT_PRE_SKIP.also { log("seg $index: no CSD seen, assuming preSkip $it") }
+        val tags = OggOpusWriter.roomlogTags(deviceId, runId, seg.epoch, seg.nStart, edgeVersion)
+        val writer = OggOpusWriter(OpusHead(preSkip = preSkip), tags, serial = Random.nextInt())
+        packets.forEach(writer::writePacket)
+        val sizes = packets.map { it.size }
+        val bytes = try {
+            writer.finish(seg.nSamples)
+        } catch (e: IllegalStateException) {
+            log("seg $index n_start=${seg.nStart}: NOT WRITTEN: ${e.message}")
+            return
+        }
+        val meta = Sidecar.build(
+            deviceId = deviceId, sha256 = "0".repeat(64), utcNs = c.utcNs, nStart = seg.nStart,
+            nSamples = seg.nSamples, runId = runId, epoch = seg.epoch, discontinuity = seg.discontinuity,
+            clockStep = c.clockStep, clockSynced = false, cutReason = seg.reason.wire, vad = null,
+            edgeVersion = edgeVersion, kind = "raw",
+        )
+        if (!spool.diskOk()) {
+            log("seg $index: spool full or disk low, segment dropped (nothing deleted)")
+            return
+        }
+        val entry = spool.write(bytes, meta, dest = "unsynced")
+        val sha = Spool.sha256Hex(bytes)
+        val problems = Sidecar.validate(entry.readMeta())
+        log(
+            "seg $index ${seg.reason.wire} epoch=${seg.epoch} n_start=${seg.nStart} n_samples=${seg.nSamples} " +
+                "bytes=${bytes.size} sha8=${sha.take(8)} packets=${packets.size} " +
+                "(min ${sizes.minOrNull()} max ${sizes.maxOrNull()} B) cover48=${writer.totalSamples48} " +
+                "need48=${preSkip + 3 * seg.nSamples} preSkip=$preSkip pad=$pad disc=${seg.discontinuity} " +
+                "start=${Sidecar.formatUtc(c.utcNs)} close ${SystemClock.elapsedRealtime() - t0} ms" +
+                if (problems.isEmpty()) "" else " SIDECAR INVALID $problems",
+        )
+    }
+
+    companion object {
+        /** libopus's lookahead at 48 kHz (6.5 ms), used only if the codec reports no CSD. */
+        const val DEFAULT_PRE_SKIP = 312
+    }
+}

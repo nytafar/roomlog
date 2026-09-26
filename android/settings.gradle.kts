@@ -15,4 +15,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "roomlog-android"
-include(":core")
+include(":core", ":app")
