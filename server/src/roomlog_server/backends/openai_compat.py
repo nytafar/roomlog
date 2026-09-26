@@ -107,11 +107,15 @@ class OpenAICompatBackend(Backend):
         return {"Authorization": f"Bearer {self._key}"} if self._key else {}
 
     def probe(self) -> bool:
+        if self.api_key_file and not self._headers():
+            return False  # key file configured but missing or empty: skip, do not burn attempts
         try:
             get_json(f"{self.base_url}/models", headers=self._headers(), timeout=min(self.timeout, 15))
             return True
-        except BackendError:
-            return True  # the server answered (4xx): reachable, model check happens on use
+        except BackendError as e:
+            # The server answered. 401/403 means the key is wrong: treat as unavailable so the
+            # next backend takes over; any other 4xx (e.g. no /models route) counts as reachable.
+            return e.status not in (401, 403)
         except Exception:
             return False
 

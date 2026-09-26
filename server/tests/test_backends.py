@@ -94,7 +94,9 @@ def make_fake_server(state: FakeState, inference_path: str = "/v1/audio/transcri
         def do_GET(self):  # noqa: N802
             state.requests.append({"method": "GET", "path": self.path,
                                    "auth": self.headers.get("Authorization")})
-            if self.path in ("/v1/models", "/"):
+            if state.status == 401:
+                self._json(401, {"error": {"message": "bad key", "type": "auth", "code": None}})
+            elif self.path in ("/v1/models", "/"):
                 self._json(200, {"data": []})
             else:
                 self._json(404, {"error": "nope"})
@@ -300,3 +302,19 @@ def test_wav_roundtrip():
 def test_unknown_backend_type(tmp_path):
     with pytest.raises(ValueError):
         build_backend(BackendConfig(name="x", type="nope"), make_config(tmp_path))
+
+
+def test_openai_probe_fails_on_missing_key_or_rejected_key(berget, tmp_path):
+    state, bcfg, backend = berget
+    assert backend.probe() is True
+    state.status = 401
+    assert backend.probe() is False
+    state.status = 200
+    missing = build_backend(BackendConfig(name="b", type="openai", model="m", base_url=bcfg.base_url,
+                                          api_key_file=str(tmp_path / "absent.key"), timeout_s=5),
+                            make_config(tmp_path))
+    assert missing.probe() is False
+    nokey = build_backend(BackendConfig(name="b", type="openai", model="m", base_url=bcfg.base_url,
+                                        timeout_s=5), make_config(tmp_path))
+    assert nokey.probe() is True  # no key configured at all (a local OpenAI-compatible server)
+    assert state.requests[-1]["auth"] is None

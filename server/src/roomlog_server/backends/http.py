@@ -53,7 +53,7 @@ def _do(req: urllib.request.Request, timeout: float) -> Any:
         detail = e.read()[:500].decode("utf-8", "replace")
         if e.code >= 500:
             raise BackendUnavailable(f"{req.full_url}: HTTP {e.code}: {detail}") from e
-        raise BackendError(f"{req.full_url}: HTTP {e.code}: {detail}") from e
+        raise BackendError(f"{req.full_url}: HTTP {e.code}: {detail}", status=e.code) from e
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as e:
         raise BackendUnavailable(f"{req.full_url}: {e}") from e
     if not raw:

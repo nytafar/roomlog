@@ -53,6 +53,10 @@ class BackendUnavailable(Exception):
 class BackendError(Exception):
     """Non-transient: the request itself is bad or the response unusable."""
 
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
 
 class Backend:
     name: str = "backend"
