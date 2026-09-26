@@ -9,7 +9,7 @@
 #   3. write ~/.config/roomlog/{server.toml,tokens.toml,service.env} from the examples if absent
 #   4. install the user units into ~/.config/systemd/user and daemon-reload
 #   5. roomlog fetch-model (unless --skip-model) and roomlog selftest (unless --skip-selftest)
-#   6. print the ufw rule and the enable command; it never runs them
+#   6. print the tailscale serve and enable commands; it never runs them
 set -euo pipefail
 
 REPO_URL="${ROOMLOG_REPO:-https://github.com/nytafar/roomlog.git}"
@@ -116,8 +116,10 @@ fi
 
 log "6/6 manual steps (not run by this script)"
 cat <<EOF
-    Open the ingest port on the tailnet interface (needs sudo, once):
-        sudo ufw allow in on tailscale0 to any port 8480 proto tcp
+    Publish ingest over HTTPS on the tailnet name (once; HTTPS certificates must be enabled
+    in the Tailscale admin console). Ingest itself binds 127.0.0.1:8480, so no ufw rule:
+        tailscale serve --bg --https=443 http://127.0.0.1:8480
+        tailscale serve status        # expect https://oma.tailf63b9a.ts.net -> http://127.0.0.1:8480
     Then enable and start the services:
         systemctl --user enable --now roomlog-ingest.service roomlog-worker.service roomlog-health.timer
     Check:

@@ -92,7 +92,7 @@ else
   DEVICE_ID="${DEVICE_ID:-$(hostname -s 2>/dev/null || echo pi)}"
 fi
 BIN="$VENV/bin/roomlog-edge"
-SERVER_URL="${SERVER_URL:-http://100.79.124.57:8480}"
+SERVER_URL="${SERVER_URL:-https://oma.tailf63b9a.ts.net}"
 
 log "roomlog-edge install: mode=$MODE dry_run=$DRY_RUN"
 log "  repo      $REPO"

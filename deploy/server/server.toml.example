@@ -30,6 +30,14 @@ blocklist = ["Teksting av", "Takk for at du så på", "Thank you for watching"]
 [sessions]
 gap_s = 300                                   # silence that separates two sessions
 
+[segmenter]                                   # raw segments → speech chunks on the server (ADR 0005)
+raw_idle_s = 120                              # idle epoch: close the open chunk after this long without new raw audio
+vad = "silero"                                # silero | energy (RMS gate; tests, or before fetch-model)
+threshold = 0.5
+neg_threshold = 0.35
+# model_path = "~/.local/share/roomlog/models/silero_vad.onnx"   # fetched by `roomlog fetch-model`
+# Raw audio that overlaps no speech chunk is purged after 30 days (fixed in v1).
+
 [health]
 prom_file = "~/.local/share/roomlog/roomlog.prom"
 # healthchecks_url = ""                        # deferred; unset means no ping

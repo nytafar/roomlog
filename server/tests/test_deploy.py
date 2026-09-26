@@ -76,6 +76,26 @@ def test_installer_defaults_and_fetch_model_tolerance():
     assert 'elif ! run "$ROOMLOG" fetch-model; then' in sh
 
 
+def test_deploy_files_use_loopback_bind_behind_tailscale_serve():
+    """ADR 0007: ingest on 127.0.0.1:8480, published as https://oma.tailf63b9a.ts.net."""
+    serve = "tailscale serve --bg --https=443 http://127.0.0.1:8480"
+    url = "https://oma.tailf63b9a.ts.net"
+    env = (REPO_ROOT / "deploy" / "server" / "service.env.example").read_text()
+    assert "ROOMLOG_BIND=127.0.0.1:8480" in env and serve in env and url in env
+    assert "ufw allow" not in env
+    sh = (REPO_ROOT / "deploy" / "server" / "install.sh").read_text()
+    assert serve in sh and url in sh and "ufw allow" not in sh
+    readme = (REPO_ROOT / "server" / "README.md").read_text()
+    assert serve in readme and url in readme
+    edge_toml = (REPO_ROOT / "deploy" / "edge" / "edge.toml.example").read_text()
+    assert f'server_url = "{url}"' in edge_toml
+    edge_sh = (REPO_ROOT / "deploy" / "edge" / "install.sh").read_text()
+    assert f'SERVER_URL="${{SERVER_URL:-{url}}}"' in edge_sh
+    toml = tomllib.loads((REPO_ROOT / "deploy" / "server" / "server.toml.example").read_text())
+    assert toml["ingest"]["bind"] == "127.0.0.1:8480"
+    assert toml["segmenter"] == {"raw_idle_s": 120, "vad": "silero", "threshold": 0.5, "neg_threshold": 0.35}
+
+
 def test_installer_reports_incomplete_model_after_selftest_and_manual_steps(tmp_path):
     import os
     import subprocess
