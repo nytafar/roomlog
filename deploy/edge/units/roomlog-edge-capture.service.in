@@ -1,0 +1,21 @@
+[Unit]
+Description=roomlog edge capture (mic -> VAD -> Opus spool)
+Documentation=https://github.com/nytafar/roomlog
+After=sound.target time-sync.target
+Wants=time-sync.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+Environment=ROOMLOG_EDGE_CONFIG=@CONFIG@
+ExecStart=@BIN@ capture
+WatchdogSec=30
+TimeoutStartSec=180
+TimeoutStopSec=20
+Restart=always
+RestartSec=3
+@CAPTURE_EXTRA@
+@SERVICE_EXTRA@
+
+[Install]
+WantedBy=@WANTED_BY@

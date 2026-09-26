@@ -1,0 +1,9 @@
+[Unit]
+Description=roomlog edge health check (metrics file, optional healthchecks ping)
+Documentation=https://github.com/nytafar/roomlog
+
+[Service]
+Type=oneshot
+Environment=ROOMLOG_EDGE_CONFIG=@CONFIG@
+ExecStart=@BIN@ health
+@SERVICE_EXTRA@
