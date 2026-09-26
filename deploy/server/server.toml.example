@@ -31,8 +31,10 @@ blocklist = ["Teksting av", "Takk for at du så på", "Thank you for watching"]
 gap_s = 300                                   # silence that separates two sessions
 
 [segmenter]                                   # raw segments → speech chunks on the server (ADR 0005)
+                                              # (absent in a server.toml from before v3: these values are the defaults)
 raw_idle_s = 120                              # idle epoch: close the open chunk after this long without new raw audio
-vad = "silero"                                # silero | energy (RMS gate; tests, or before fetch-model)
+vad = "silero"                                # silero | energy (RMS gate; tests, or before fetch-model; never production:
+                                              # purge-raw would delete raw audio on the gate's decisions)
 threshold = 0.5
 neg_threshold = 0.35
 # model_path = "~/.local/share/roomlog/models/silero_vad.onnx"   # fetched by `roomlog fetch-model`

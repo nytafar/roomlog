@@ -123,3 +123,56 @@ def test_installer_reports_incomplete_model_after_selftest_and_manual_steps(tmp_
     assert "manual steps" in result.stdout
     assert "fetch-model failed" in result.stderr
     assert result.returncode == 1
+
+
+def _install_env(tmp_path, service_env: str | None, server_toml: str | None = None):
+    import os
+    home = tmp_path / "home"
+    app = home / "services/apps/roomlog"
+    (app / ".git").mkdir(parents=True)
+    roomlog = app / "server/.venv/bin/roomlog"
+    roomlog.parent.mkdir(parents=True)
+    roomlog.write_text("#!/bin/sh\nexit 0\n")
+    roomlog.chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for name in ("git", "uv", "systemctl"):
+        tool = fake_bin / name
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+    conf = home / ".config/roomlog"
+    conf.mkdir(parents=True)
+    if service_env is not None:
+        (conf / "service.env").write_text(service_env)
+    if server_toml is not None:
+        (conf / "server.toml").write_text(server_toml)
+    return dict(os.environ, HOME=str(home), ROOMLOG_APP_DIR=str(app), PATH=f"{fake_bin}:{os.environ['PATH']}")
+
+
+def test_installer_flags_a_non_loopback_bind_in_an_existing_service_env(tmp_path):
+    """Review 5: an install from before ADR 0007 keeps its service.env; the operator must be told."""
+    import subprocess
+    install = REPO_ROOT / "deploy/server/install.sh"
+    env = _install_env(tmp_path / "old", "ROOMLOG_BIND=100.79.124.57:8480\n",
+                       server_toml='[paths]\ndata_dir = "~/x"\n')
+    r = subprocess.run(["bash", str(install), "--skip-model", "--skip-selftest"], env=env,
+                       capture_output=True, text=True, timeout=20)
+    assert r.returncode == 1
+    assert "ATTENTION" in r.stderr and "ROOMLOG_BIND=100.79.124.57:8480 (kept as is)" in r.stderr
+    assert "sed -i 's/^ROOMLOG_BIND=.*/ROOMLOG_BIND=127.0.0.1:8480/'" in r.stderr
+    assert "ROOMLOG_BIND=100.79.124.57:8480" in (tmp_path / "old/home/.config/roomlog/service.env").read_text()
+    assert "First fix ROOMLOG_BIND" in r.stdout
+    assert "no [segmenter] section" in r.stdout
+
+    env = _install_env(tmp_path / "new", 'ROOMLOG_BIND="127.0.0.1:8480"\n',
+                       server_toml='[paths]\ndata_dir = "~/x"\n[segmenter]\nvad = "silero"\n')
+    r = subprocess.run(["bash", str(install), "--skip-model", "--skip-selftest"], env=env,
+                       capture_output=True, text=True, timeout=20)
+    assert r.returncode == 0, r.stderr
+    assert "ATTENTION" not in r.stderr and "First fix" not in r.stdout and "[segmenter]" not in r.stdout
+
+    env = _install_env(tmp_path / "fresh", None)
+    r = subprocess.run(["bash", str(install), "--skip-model", "--skip-selftest"], env=env,
+                       capture_output=True, text=True, timeout=20)
+    assert r.returncode == 0, r.stderr
+    assert "ATTENTION" not in r.stderr

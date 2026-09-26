@@ -26,7 +26,16 @@ this directory (no model weights, no network; ffmpeg encodes the test audio).
 `[n_start, n_start + n_samples)` of the raw stream of one `(device, run_id, epoch)`, identity
 = SHA-256 of that int16 PCM slice). Both kinds flow through the same worker, sessions, search
 and MCP. Raw segments keep `status` `pending` until the segmenter has covered them;
-`raw_progress.segmented_to_n` is the per-epoch high-water mark.
+`raw_progress.segmented_to_n` is the per-epoch high-water mark. A raw file that does not
+decode to its `n_samples` (beyond 64 samples of codec priming) gets `status` `failed`, is
+counted in `roomlog status`, and its neighbours continue as if it were a gap; `resegment`
+over its time puts it back to `pending` for another try.
+
+`[segmenter] vad = "energy"` is an RMS gate for tests and for bootstrapping before
+`fetch-model`; it is not for production. The 30-day `purge-raw` deletes raw audio that
+overlaps no derived chunk, so with the energy gate it would delete on the gate's decisions.
+Existing `server.toml` files without a `[segmenter]` section get the defaults (`silero`,
+`raw_idle_s = 120`, thresholds 0.5 / 0.35); see `deploy/server/server.toml.example`.
 
 ## Run
 
@@ -37,6 +46,7 @@ uv run roomlog -c ~/.config/roomlog/server.toml status
 uv run roomlog fetch-model            # NB-Whisper ct2 snapshot and the pinned Silero blob
 uv run roomlog segment                # one segmenter pass (the worker does this every poll)
 uv run roomlog resegment --device s22 --from 2026-09-26   # re-run VAD + chunker over history
+uv run roomlog resegment --device s22 --from 2026-09-26T13:00 --to 2026-09-26T13:30  # only that range; chunks outside stay
 uv run roomlog purge-raw              # 30-day retention for speech-free raw audio (the worker: daily)
 uv run roomlog verify                 # archive, archive/raw and derived-chunk coverage
 ```
