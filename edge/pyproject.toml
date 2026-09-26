@@ -1,0 +1,26 @@
+[project]
+name = "roomlog-edge"
+version = "0.1.0"
+description = "roomlog edge client: always-on room audio capture, VAD chunking, Opus spool and upload"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "sounddevice>=0.5",
+    "onnxruntime>=1.17",
+]
+
+[project.scripts]
+roomlog-edge = "roomlog_edge.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/roomlog_edge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
