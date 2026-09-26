@@ -177,7 +177,7 @@ CREATE TABLE raw_segments (
     meta_json           TEXT NOT NULL,
     received_utc_ms     INTEGER NOT NULL,
     status              TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (status IN ('pending', 'segmented')),
+                        CHECK (status IN ('pending', 'segmented', 'failed')),
     segmented_utc_ms    INTEGER
 );
 CREATE INDEX raw_segments_timeline ON raw_segments (device_id, run_id, epoch, n_start);

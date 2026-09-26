@@ -121,9 +121,10 @@ def test_waits_for_successor_then_idle_tail_gets_shutdown_cut(tmp_path):
     received = fx.received_utc_ms
 
     res = make_segmenter(cfg, conn, received + 10_000).run_once()
-    assert (res.epochs, res.chunks) == (1, 0)  # segment 1 done (silence); segment 2 waits
-    assert raw_status(conn) == ["segmented", "pending"]
-    assert conn.execute("SELECT segmented_to_n FROM raw_progress").fetchone()[0] == SEGMENT
+    assert (res.epochs, res.chunks) == (1, 0)  # segment 1 scanned (silence); segment 2 waits
+    # the last pad before the seam stays open so speech right after it keeps its pre-roll
+    assert conn.execute("SELECT segmented_to_n FROM raw_progress").fetchone()[0] == window_start(SEGMENT) - PAD
+    assert raw_status(conn) == ["pending", "pending"]
 
     res = make_segmenter(cfg, conn, received + 60_000).run_once()
     assert (res.epochs, res.chunks) == (0, 0)  # nothing new arrived: no decode, no work
@@ -218,11 +219,16 @@ def test_late_segment_filling_a_gap_behind_the_mark_is_segmented_alone(tmp_path)
     fx.store(*plan[2])
     make_segmenter(cfg, conn, fx.received_utc_ms + 1000).run_once()
     assert derived(conn) == []
-    # the last segment closes the epoch and is final; the first still waits for its successor
-    assert raw_status(conn) == ["pending", "segmented"]
+    # a young gap: the first segment waits for its successor, and the last one, though it ends
+    # the epoch, waits behind it (the mark is per epoch and must not pass an open chain)
+    assert raw_status(conn) == ["pending", "pending"]
+    assert conn.execute("SELECT count(*) FROM raw_progress").fetchone()[0] == 0
+    make_segmenter(cfg, conn, fx.received_utc_ms + 121_000).run_once()
+    # the gap aged past raw_idle_s: both chains are closed, the mark is at the epoch's end
+    assert raw_status(conn) == ["segmented", "segmented"]
     assert conn.execute("SELECT segmented_to_n FROM raw_progress").fetchone()[0] == 3 * SEGMENT
     fx.store(*plan[1])  # the middle one, with the speech, arrives late
-    res = make_segmenter(cfg, conn, fx.received_utc_ms + 2000).run_once()
+    res = make_segmenter(cfg, conn, fx.received_utc_ms + 122_000).run_once()
     assert res.chunks == 1
     c = derived(conn)[0]
     assert SEGMENT <= c["n_start"] and c["n_start"] + c["n_samples"] <= 2 * SEGMENT
@@ -323,8 +329,10 @@ def test_reset_segmentation_rederives_the_same_chunks(tmp_path):
 
     # a range that starts inside the epoch: the straddling chunk is re-derived whole
     out = reset_segmentation(conn, "s22", from_ms=RAW_T0 + 30_000)
-    assert out["raw_reset"] == 2 and out["chunks_deleted"] == 2  # both chunks end after 30 s
+    assert out["chunks_deleted"] == 2  # both chunks end after 30 s
     # the mark moves back to the straddling chunk's start, inside segment 0, which reopens too
+    # and is counted: `raw=` is what was actually reset, not what the range selected
+    assert out["raw_reset"] == 3
     prog = conn.execute("SELECT segmented_to_n FROM raw_progress").fetchone()
     assert prog["segmented_to_n"] == before[0]["n_start"]
     assert raw_status(conn) == ["pending", "pending", "pending"]
@@ -405,4 +413,33 @@ def test_raw_audio_span_refuses_gaps(tmp_path):
         raw.span(segs, SEGMENT - 10, 2 * SEGMENT + 10)
     with pytest.raises(ValueError):
         raw.span(segs, 2 * SEGMENT, 3 * SEGMENT)
+    conn.close()
+
+
+def test_purge_raw_rechecks_each_row_before_deleting(tmp_path):
+    """A `resegment` that reopens a row between purge's select and delete keeps row and file."""
+    cfg = make_config(tmp_path)
+    conn = dbmod.connect(cfg.db_path)
+    old_start = RAW_T0 - 40 * DAY
+    old = RawSegments(cfg, conn, start_utc_ms=old_start, received_utc_ms=old_start + 40_000)
+    old.store_all(pattern_pcm([("s", 30), ("s", 30), ("s", 5)]), last_cut="shutdown")
+    make_segmenter(cfg, conn, RAW_T0).run_once()
+    assert raw_status(conn) == ["segmented"] * 3
+    victim = conn.execute("SELECT id, path FROM raw_segments WHERE n_start = ?", (SEGMENT,)).fetchone()
+
+    class Racy:
+        """Reopens the middle row right after purge's candidate select."""
+
+        def execute(self, sql, params=()):
+            cur = conn.execute(sql, params)
+            if sql.lstrip().startswith("SELECT id, path FROM raw_segments"):
+                conn.execute("UPDATE raw_segments SET status = 'pending' WHERE id = ?", (victim["id"],))
+            return cur
+
+    out = purge_raw(Racy(), cfg.archive_dir, now=RAW_T0)
+    assert out["deleted"] == 2
+    assert [dict(r) for r in conn.execute("SELECT id, status FROM raw_segments")] == \
+        [{"id": victim["id"], "status": "pending"}]
+    assert (cfg.archive_dir / victim["path"]).exists()
+    assert (cfg.archive_dir / victim["path"]).with_suffix(".json").exists()
     conn.close()

@@ -250,7 +250,7 @@ def status(conn: sqlite3.Connection, archive_dir: Path | None = None, now: int |
         counts[r["status"]] = r["n"]
     oldest = conn.execute("SELECT min(received_utc_ms) AS t FROM chunks WHERE status = 'pending'").fetchone()["t"]
     last_done = conn.execute("SELECT max(transcribed_utc_ms) AS t FROM chunks").fetchone()["t"]
-    raw_counts = {s: 0 for s in ("pending", "segmented")}
+    raw_counts = {s: 0 for s in ("pending", "segmented", "failed")}
     for r in conn.execute("SELECT status, count(*) AS n FROM raw_segments GROUP BY status"):
         raw_counts[r["status"]] = r["n"]
     raw_oldest = conn.execute(

@@ -53,7 +53,7 @@ def test_cli_segment_status_verify_and_worker(raw_site, capsys):
     cfg, fx, base = raw_site
     rc, out, _ = run(base + ["status"], capsys)
     assert rc == 0
-    assert "raw            pending=3 segmented=0 derived=0" in out
+    assert "raw            pending=3 segmented=0 failed=0 derived=0" in out
     assert "s22" in out and "raw=3 raw_pending=3 last_raw=2026-09-26T13:01:00.000Z" in out
     assert "last=-" in out  # no chunks yet for this device
 

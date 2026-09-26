@@ -123,7 +123,7 @@ def test_raw_segments_reach_search(tmp_path, capsys):
 
         assert roomlog_cli(base + ["status"]) == 0
         out = capsys.readouterr().out
-        assert "raw            pending=0 segmented=3 derived=1" in out
+        assert "raw            pending=0 segmented=3 failed=0 derived=1" in out
         assert roomlog_cli(base + ["verify"]) == 0
         assert capsys.readouterr().out.startswith("files=3 rows=3 problems=0 derived=1")
     finally:

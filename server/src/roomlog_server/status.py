@@ -36,7 +36,7 @@ def render_prom(st: dict[str, Any]) -> str:
     if raw is not None:
         lines += ["# HELP roomlog_raw_segments_total Raw segments in the archive by status.",
                   "# TYPE roomlog_raw_segments_total gauge"]
-        for status in ("pending", "segmented"):
+        for status in ("pending", "segmented", "failed"):
             lines.append(f'roomlog_raw_segments_total{{status="{status}"}} {raw[status]}')
         lines += ["# TYPE roomlog_raw_pending_oldest_age_seconds gauge",
                   f"roomlog_raw_pending_oldest_age_seconds {raw['pending_oldest_age_s']}"]
@@ -85,7 +85,8 @@ def render_text(st: dict[str, Any]) -> str:
     raw = st.get("raw")
     if raw is not None:
         out.append(f"raw            pending={raw['pending']} segmented={raw['segmented']} "
-                   f"derived={raw['derived_chunks']} oldest pending {raw['pending_oldest_age_s']} s")
+                   f"failed={raw.get('failed', 0)} derived={raw['derived_chunks']} "
+                   f"oldest pending {raw['pending_oldest_age_s']} s")
     if st.get("archive_bytes") is not None:
         line = f"archive        {st['archive_bytes'] / 1e6:.1f} MB"
         if raw is not None and raw.get("bytes") is not None:
