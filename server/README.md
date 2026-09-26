@@ -1,9 +1,9 @@
 # roomlog-server
 
 Ingest, archive, transcription worker, sessions, CLI (`roomlog`) and MCP server (`roomlog-mcp`).
-Design: `~/hvelv/repos/roomlog/spec-v1-design.md`; raw segments and server-side segmentation:
-ADR 0005, `~/hvelv/repos/roomlog/android/plan-thin-client.md`. Gate: `uv run pytest -q` in
-this directory (no model weights, no network; ffmpeg encodes the test audio).
+Design overview in the top-level README; raw segments and server-side segmentation are
+decision 5 there. Gate: `uv run pytest -q` in this directory (no model weights, no network;
+ffmpeg encodes the test audio).
 
 ## Layout
 
