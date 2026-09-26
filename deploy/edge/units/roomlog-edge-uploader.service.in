@@ -1,0 +1,19 @@
+[Unit]
+Description=roomlog edge uploader (spool -> server)
+Documentation=https://github.com/nytafar/roomlog
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+Environment=ROOMLOG_EDGE_CONFIG=@CONFIG@
+ExecStart=@BIN@ upload
+WatchdogSec=120
+TimeoutStopSec=20
+Restart=always
+RestartSec=3
+@SERVICE_EXTRA@
+
+[Install]
+WantedBy=@WANTED_BY@

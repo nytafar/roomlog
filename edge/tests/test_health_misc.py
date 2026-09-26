@@ -153,3 +153,21 @@ def test_cli_health_with_config(cfg, tmp_path, monkeypatch, capsys):
     assert "capture status missing" in capsys.readouterr().out
     assert json.loads("{}") == {}
     assert cfg.metrics_file.exists()
+
+
+def test_wait_for_sync_gate(cfg, monkeypatch):
+    import threading
+
+    from roomlog_edge import capture
+
+    states = iter([None, False, True])
+    monkeypatch.setattr(capture.clocksync, "ntp_synchronized", lambda: next(states))
+    cfg.clock.sync_poll_s = 0.01
+    cfg.clock.sync_wait_s = 5.0
+    assert capture.wait_for_sync(cfg, threading.Event()) is True
+    monkeypatch.setattr(capture.clocksync, "ntp_synchronized", lambda: False)
+    cfg.clock.sync_wait_s = 0.05
+    assert capture.wait_for_sync(cfg, threading.Event()) is False
+    stop = threading.Event()
+    stop.set()
+    assert capture.wait_for_sync(cfg, stop) is False
