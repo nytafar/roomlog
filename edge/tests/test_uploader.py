@@ -145,7 +145,7 @@ def test_permanent_failures_go_to_failed(tmp_path, ingest, status):
     assert up.failures == 0  # not a backoff condition
 
 
-@pytest.mark.parametrize("status", [401, 403, 500, 503])
+@pytest.mark.parametrize("status", [401, 403, 411, 500, 503])
 def test_retryable_statuses_keep_file_and_back_off(tmp_path, ingest, status):
     sp, _ = _spool_with(tmp_path, 2)
     up = _uploader(sp, ingest([(status, None)]))
@@ -234,3 +234,6 @@ def test_whoami(ingest):
 
 def test_classify_unknown_status_is_retry():
     assert classify(418) == RETRY and classify(302) == RETRY
+    assert classify(411) == RETRY  # server: missing Content-Length; never failed/
+    assert classify(200) == ACK and classify(201) == ACK
+    assert {classify(s) for s in (409, 413, 422)} == {FAIL}
