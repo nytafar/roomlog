@@ -114,7 +114,9 @@ def store_chunk(conn: sqlite3.Connection, archive_dir: Path, meta: dict[str, Any
     """
     sha256 = hashlib.sha256(body).hexdigest()
     start_ms = iso_to_ms(meta["start_utc"])
-    meta_json = json.dumps(meta, ensure_ascii=True, separators=(",", ":"))
+    # Keep the exact header text in SQLite as well as in the archive. This
+    # makes a missing sidecar recoverable byte-for-byte from the DB row.
+    meta_json = meta_raw.decode("utf-8")
     # Serialize the file and row decision across handler threads and processes.
     # Unique temp names alone do not prevent two revised sidecars for the same
     # audio from choosing different final paths or overwriting each other.
@@ -129,7 +131,11 @@ def store_chunk(conn: sqlite3.Connection, archive_dir: Path, meta: dict[str, Any
                 # incoming audio. The DB's first sidecar remains authoritative.
                 opus = archive_dir / relpath
                 _write_durable(opus, body)
-                _write_durable(sidecar_path(opus), row["meta_json"].encode("ascii"))
+                # Rows written before raw JSON was retained have normalized
+                # meta_json. A retry of the same metadata restores its received
+                # bytes; a revised sidecar cannot replace the stored metadata.
+                raw = meta_raw if meta == stored_meta else row["meta_json"].encode("utf-8")
+                _write_durable(sidecar_path(opus), raw)
             result = StoreResult(created=False, sha256=sha256, path=relpath)
         else:
             relpath = archive_relpath(start_ms, sha256)
@@ -165,7 +171,8 @@ def scan_orphans(conn: sqlite3.Connection, archive_dir: Path) -> list[str]:
         if relpath in known_paths:
             continue
         try:
-            meta = validate_sidecar(json.loads(json_path.read_bytes()))
+            meta_raw = json_path.read_bytes()
+            meta = validate_sidecar(json.loads(meta_raw))
         except (ValueError, SidecarError) as e:
             log.warning("skipping %s: sidecar unusable (%s)", relpath, e)
             continue
@@ -175,7 +182,7 @@ def scan_orphans(conn: sqlite3.Connection, archive_dir: Path) -> list[str]:
             continue
         if conn.execute("SELECT id FROM chunks WHERE sha256 = ?", (sha256,)).fetchone():
             continue
-        meta_json = json.dumps(meta, ensure_ascii=True, separators=(",", ":"))
+        meta_json = meta_raw.decode("utf-8")
         conn.execute("BEGIN IMMEDIATE")
         try:
             insert_chunk_row(conn, meta, meta_json, sha256, relpath)

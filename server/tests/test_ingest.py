@@ -242,6 +242,24 @@ def test_row_without_file_recovery(server):
     assert opus.with_suffix(".json").exists()
 
 
+def test_row_repair_preserves_received_sidecar_bytes(server):
+    cfg, _, client = server
+    body = b"verbatim metadata" * 30
+    meta = make_sidecar(body)
+    raw = json.dumps(dict(reversed(list(meta.items()))), ensure_ascii=True, separators=(", ", ": "))
+    status, payload = client.put_chunk(body, meta_raw=raw)
+    assert status == 201
+    opus = cfg.archive_dir / payload["path"]
+    conn = dbmod.connect(cfg.db_path)
+    row = conn.execute("SELECT meta_json FROM chunks WHERE sha256=?", (meta["sha256"],)).fetchone()
+    assert row["meta_json"] == raw
+    conn.close()
+    opus.with_suffix(".json").unlink()
+    status, _ = client.put_chunk(body, meta_raw=raw)
+    assert status == 200
+    assert opus.with_suffix(".json").read_bytes() == raw.encode("ascii")
+
+
 def test_startup_scan_recovers_orphans(tmp_path: Path):
     cfg = make_config(tmp_path)
     srv = make_server(cfg, tokens=TOKENS)
