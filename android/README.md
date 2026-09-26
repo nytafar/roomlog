@@ -5,8 +5,8 @@ and ADRs 0005 to 0007, not here.
 
 | Module | What |
 |---|---|
-| `:core` | Pure Kotlin/JVM, no Android imports, JVM-tested. Each class mirrors an edge module so the pytest vectors port one to one: `Timeline` (`timeline.py`), `RawSegmenter` (fixed 30 s raw segments, ADR 0005), `OggOpusWriter` (inverse of `ogg.py`, `OpusCsd`, `OggCrc`), `Sidecar` (`sidecar.py`, plus a minimal `Json`), `Spool` (`spool.py`), `UploadPolicy` and `Uploader` (`uploader.py`), `ClockOffset` (`GET /v1/time`, ADR 0006). |
-| `:app` | The P2 codec spike: one Compose screen, `AudioRecord` → `Timeline` → `RawSegmenter` → `MediaCodec` Opus → `OggOpusWriter` → `Spool`. It does not upload. `Http` (the `HttpURLConnection` side of `Uploader` and `ClockOffset`) is there for P3 and not wired in. `minSdk 29`, `targetSdk 35`. |
+| `:core` | Pure Kotlin/JVM, no Android imports, JVM-tested. Each class mirrors an edge module so the pytest vectors port one to one: `Timeline` (`timeline.py`), `RawSegmenter` (fixed 30 s raw segments, ADR 0005), `OggOpusWriter` (inverse of `ogg.py`, `OpusCsd`, `OggCrc`), `Sidecar` (`sidecar.py`, plus a minimal `Json`), `Spool` (`spool.py`), `UploadPolicy` and `Uploader` (`uploader.py`), `ClockOffset` (`GET /v1/time`, ADR 0006), `Retention` (the edge's `_retain_from_n`), and `CaptureClock` (Android-specific: block capture time from `AudioRecord.getTimestamp`, loss from `framePosition` against frames read). |
+| `:app` | The P2 codec spike: one Compose screen and a microphone foreground service running `AudioRecord` → `CaptureClock` → `Timeline` → `RawSegmenter` → `MediaCodec` Opus → `OggOpusWriter` → `Spool`. It does not upload. `Http` (the `HttpURLConnection` side of `Uploader` and `ClockOffset`) is there for P3 and not wired in. `minSdk 29`, `targetSdk 35`. |
 
 ## Build
 
@@ -35,12 +35,32 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n no.nyta.roomlog.spike/.MainActivity
 ```
 
-Tap Start, grant the microphone, keep the screen on (the activity sets keep-screen-on while
-recording; there is no foreground service in the spike). The log shows the `AudioRecord`
-source and routing, the codec name, each codec-specific-data sighting (shape, pre-skip, delay),
-the `getTimestamp` latency every 60 s, late blocks and epochs, and one line per segment:
-`n_start`, `n_samples`, bytes, `sha8`, packet count and sizes, samples covered versus needed.
-The same lines go to logcat: `adb logcat -s roomlog`. Tap Stop to cut the shutdown segment.
+Set the device id (default `s22`, persisted; it goes into every sidecar and the
+`ROOMLOG_DEVICE_ID` tag, so it must match the server token's device), tap Start and grant the
+microphone and notifications.
+
+Recording runs in a foreground service of type `microphone`, with an ongoing notification
+that has a Stop action. The screen may turn off and the activity may be closed or recreated
+without ending the run; this is how the overnight screen-off run of plan §4 P2 is done.
+Without the service Android hands a background app silence, with no error. If the system
+kills the process, the service is not restarted into recording (Android does not allow a
+background start to use the microphone); a "recording stopped" notification appears instead.
+
+The log shows the `AudioRecord` source, buffer and routing, the codec name, each
+codec-specific-data sighting (shape, pre-skip, delay), capture-clock events (first
+timestamp, re-bases, overruns and losses with the frame they start at), new epochs, a
+summary every 600 reads (maximum arrival-to-capture time, timestamp failures and outliers),
+and one line per segment: `n_start`, `n_samples`, bytes, `sha8`, packet count and sizes,
+samples covered versus needed. The same lines go to logcat: `adb logcat -s roomlog`. Tap Stop
+(screen or notification) to cut the shutdown segment.
+
+In the first lines of a run, look for the routing callback. Android usually reports the
+initial route once; that must appear as `routing callback: <device> id=<n> unchanged,
+ignored`. A `routing callback: ... (was id=...): new epoch` line means the input really
+changed (or this device reports the first route differently); it opens an epoch and ends the
+previous segment with `discontinuity`. A `WARNING: no getTimestamp(BOOTTIME)` line means the
+device gives no timestamps: stamps then come from read arrival, and a stalled read thread
+will look like loss.
 
 Segments land in the app's external files dir, in `unsynced/` because the spike has no clock
 probe (`clock_synced: false`):
