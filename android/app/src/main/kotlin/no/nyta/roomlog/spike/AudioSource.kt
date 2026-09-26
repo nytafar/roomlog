@@ -25,9 +25,12 @@ class AudioSource(private val context: Context, private val log: (String) -> Uni
     private var record: AudioRecord? = null
     private val ts = AudioTimestamp()
 
-    /** Set by the routing callback; the capture loop turns it into a new epoch. */
+    /** Set by the routing callback when the routed device really changed; the capture loop turns it into a new epoch. */
     @Volatile
     var routingChanged = false
+
+    @Volatile
+    private var routedId: Int? = null
 
     @SuppressLint("MissingPermission") // checked on the first line
     fun open() {
@@ -52,10 +55,22 @@ class AudioSource(private val context: Context, private val log: (String) -> Uni
             .setBufferSizeInBytes(bufBytes)
             .build()
         check(r.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord not initialised (source $sourceName)" }
-        r.addOnRoutingChangedListener({ routingChanged = true }, Handler(Looper.getMainLooper()))
         r.startRecording()
         record = r
         val dev = r.routedDevice
+        routedId = dev?.id
+        // Registered after start, and a callback naming the device already in use is ignored:
+        // Android typically reports the initial routing once, which is not a change.
+        r.addOnRoutingChangedListener({ routing ->
+            val now = routing.routedDevice
+            if (now?.id == routedId) {
+                log("routing callback: ${now?.productName} id=${now?.id} unchanged, ignored")
+            } else {
+                log("routing callback: ${now?.productName} type=${now?.type} id=${now?.id} (was id=$routedId): new epoch")
+                routedId = now?.id
+                routingChanged = true
+            }
+        }, Handler(Looper.getMainLooper()))
         log(
             "AudioRecord: source=$sourceName rate=${r.sampleRate} minBuf=$minBuf buf=${r.bufferSizeInFrames} frames " +
                 "routed=${dev?.productName} type=${dev?.type} id=${dev?.id}",
