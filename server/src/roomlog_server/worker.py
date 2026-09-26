@@ -29,6 +29,7 @@ from .times import now_ms
 log = logging.getLogger("roomlog.worker")
 
 PURGE_INTERVAL_MS = 86_400_000  # the worker purges old speech-free raw audio once a day
+SEGMENT_BUDGET_S = 60.0  # segmenter work per batch; a backlog continues in the next batch
 
 
 @dataclass
@@ -242,6 +243,7 @@ class BatchResult:
     windows: int = 0
     segmented_epochs: int = 0
     segmented_chunks: int = 0
+    segment_more: bool = False  # the segmenter stopped at its budget; more raw audio waits
     errors: list[str] = field(default_factory=list)
 
 
@@ -289,16 +291,19 @@ class Worker:
     # -- raw segments
 
     def segment_raw(self, res: BatchResult) -> None:
+        """One segmenter call, capped at `SEGMENT_BUDGET_S` so a raw backlog (about 25 s of
+        work per hour of audio) neither starves speech chunks nor outlasts the watchdog."""
         if self.segmenter is None:
             return
         try:
-            seg = self.segmenter.run_once()
+            seg = self.segmenter.run_once(budget_s=SEGMENT_BUDGET_S)
         except Exception as e:
             log.exception("segmenter crashed")
             res.errors.append(f"segmenter: {e.__class__.__name__}: {e}")
             return
         res.segmented_epochs = seg.epochs
         res.segmented_chunks = seg.chunks
+        res.segment_more = seg.more
         res.errors.extend(f"segmenter: {e}" for e in seg.errors)
 
     def maybe_purge_raw(self) -> dict[str, int] | None:
@@ -467,6 +472,8 @@ class Worker:
                     sdnotify.notify("WATCHDOG=1")
                     if res.done and res.claimed >= self.cfg.batch_size:
                         continue  # backlog: go straight to the next batch
+                if res.segment_more:
+                    continue  # raw backlog: the segmenter stopped at its budget
             except Exception:
                 log.exception("worker batch crashed")
             stop.wait(self.cfg.poll_s)
