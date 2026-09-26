@@ -213,7 +213,7 @@ class Pipeline:
         """Commit tentative cuts, clipping them if the late blocks revealed a gap."""
         for chunk, epoch in self._deferred:
             if gap_n is not None and chunk.n_end > gap_n:
-                chunk = Chunk(chunk.n_start, gap_n, chunk.cut_reason, chunk.discontinuity)
+                chunk = Chunk(chunk.n_start, gap_n, "discontinuity", chunk.discontinuity)
             if chunk.n_end > chunk.n_start:
                 self._submit(chunk, epoch=epoch)
         self._deferred.clear()

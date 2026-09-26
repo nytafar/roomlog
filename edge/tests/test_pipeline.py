@@ -267,6 +267,7 @@ def test_cap_cut_during_late_blocks_is_trimmed_at_gap(tmp_path):
     assert len(metas) == 2
     first, second = metas
     assert first["n_start"] + first["n_samples"] == gap_n
+    assert first["cut_reason"] == "discontinuity"
     assert second["n_start"] == gap_n
     assert [m["epoch"] for m in metas] == [0, 1]
     assert second["discontinuity"]
