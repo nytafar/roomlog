@@ -164,6 +164,20 @@ def covering_segments(conn: sqlite3.Connection, device_id: str, run_id: str, epo
     return [RawSeg.from_row(r) for r in rows]
 
 
+def raw_covers(segs: list[RawSeg], lo: int, hi: int) -> bool:
+    """True when `segs` (sorted) cover `[lo, hi)` without a gap."""
+    pos = lo
+    for s in segs:
+        if s.n_end <= pos:
+            continue
+        if s.n_start > pos:
+            return False
+        pos = s.n_end
+        if pos >= hi:
+            return True
+    return pos >= hi
+
+
 class RawAudio:
     """Decoded raw segments, cached by sha for the life of one pass or worker batch."""
 

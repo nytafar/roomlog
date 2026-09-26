@@ -45,6 +45,21 @@ def run_selftest(cfg: Config, transcribe: bool = True) -> dict[str, Any]:
     except Exception as e:
         check("tokens", False, str(e))
 
+    if cfg.vad_backend == "energy":
+        check("vad model", True, "energy gate configured; Silero not needed")
+    else:
+        model = cfg.vad_model_path
+        assert model is not None
+        raw_pending = 0
+        if conn is not None:
+            raw_pending = conn.execute("SELECT count(*) FROM raw_segments WHERE status = 'pending'").fetchone()[0]
+        if model.exists():
+            check("vad model", True, str(model))
+        else:
+            # Only raw clients need it; a Pi-only server is fine without.
+            check("vad model", raw_pending == 0,
+                  f"{model} missing ({raw_pending} raw segments waiting); run `roomlog fetch-model`")
+
     sample = None
     if conn is not None:
         row = conn.execute("SELECT path FROM chunks ORDER BY received_utc_ms DESC LIMIT 1").fetchone()
