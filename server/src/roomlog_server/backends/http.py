@@ -11,6 +11,9 @@ from typing import Any
 
 from .base import BackendError, BackendUnavailable
 
+# 4xx codes that mean "not now" rather than "never": rate limit and request timeout.
+TRANSIENT_4XX = {408, 429}
+
 
 def encode_multipart(fields: dict[str, str], file_field: str, filename: str,
                      file_bytes: bytes, content_type: str = "audio/wav") -> tuple[bytes, str]:
@@ -51,7 +54,7 @@ def _do(req: urllib.request.Request, timeout: float) -> Any:
             raw = resp.read()
     except urllib.error.HTTPError as e:
         detail = e.read()[:500].decode("utf-8", "replace")
-        if e.code >= 500:
+        if e.code >= 500 or e.code in TRANSIENT_4XX:
             raise BackendUnavailable(f"{req.full_url}: HTTP {e.code}: {detail}") from e
         raise BackendError(f"{req.full_url}: HTTP {e.code}: {detail}", status=e.code) from e
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as e:

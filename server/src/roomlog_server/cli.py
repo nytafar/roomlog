@@ -59,6 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("verify", help="re-hash the archive against sidecars and the DB")
     sub.add_parser("sessionize", help="rebuild sessions from chunks")
 
+    s = sub.add_parser("requeue", help="put failed (and attempt-exhausted) chunks back in the queue")
+    s.add_argument("--failed", action="store_true", help="only rows with status=failed")
+    s.add_argument("--device", dest="device_id")
+    s.add_argument("--since", dest="since_utc", help="only chunks starting at or after this time")
+
     s = sub.add_parser("fetch-model", help="download the local backend's ct2 model")
     s.add_argument("--model", help="HF repo id (default: first local backend's model)")
     s.add_argument("--revision")
@@ -186,6 +191,16 @@ def cmd_sessionize(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_requeue(cfg: Config, args: argparse.Namespace) -> int:
+    from .worker import requeue
+    assert cfg.db_path is not None
+    conn = dbmod.connect(cfg.db_path)
+    n = requeue(conn, cfg.max_attempts, failed_only=args.failed, device_id=args.device_id,
+                since_ms=parse_user_time(args.since_utc))
+    print(f"requeued={n}")
+    return 0
+
+
 def cmd_fetch_model(cfg: Config, args: argparse.Namespace) -> int:
     from .models import fetch_model
     path = fetch_model(cfg, args.model, args.revision)
@@ -211,6 +226,7 @@ COMMANDS = {
     "status": cmd_status,
     "verify": cmd_verify,
     "sessionize": cmd_sessionize,
+    "requeue": cmd_requeue,
     "fetch-model": cmd_fetch_model,
     "selftest": cmd_selftest,
 }

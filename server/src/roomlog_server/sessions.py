@@ -63,14 +63,27 @@ def rebuild_sessions(conn: sqlite3.Connection, gap_s: float, now: int | None = N
     try:
         old = {r["id"]: r for r in conn.execute("SELECT id, title, summary, multi_speaker FROM sessions")}
         conn.execute("DELETE FROM sessions")
-        conn.execute("UPDATE chunks SET session_id = NULL")
+        # A temp table instead of `IN (?, ...)`: SQLite caps bound variables at 32,766 and a
+        # long session can hold more chunks than that.
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS session_assign (chunk_id INTEGER PRIMARY KEY, session_id TEXT NOT NULL)")
+        conn.execute("DELETE FROM temp.session_assign")
+        conn.executemany(
+            "INSERT INTO temp.session_assign (chunk_id, session_id) VALUES (?, ?)",
+            ((cid, s["id"]) for s in sessions for cid in s["chunk_ids"]),
+        )
+        conn.execute(
+            "UPDATE chunks SET session_id = (SELECT session_id FROM temp.session_assign a WHERE a.chunk_id = chunks.id)"
+        )
+        seg_counts = {
+            r["session_id"]: r["n"]
+            for r in conn.execute(
+                """SELECT a.session_id, count(*) AS n FROM segments s
+                   JOIN temp.session_assign a ON a.chunk_id = s.chunk_id GROUP BY a.session_id"""
+            )
+        }
         for s in sessions:
             ids = s["chunk_ids"]
-            marks = ",".join("?" * len(ids))
-            conn.execute(f"UPDATE chunks SET session_id = ? WHERE id IN ({marks})", [s["id"], *ids])
-            n_segments = conn.execute(
-                f"SELECT count(*) FROM segments WHERE chunk_id IN ({marks})", ids
-            ).fetchone()[0]
+            n_segments = seg_counts.get(s["id"], 0)
             prev = old.get(s["id"])
             closed = 1 if now - s["end_utc_ms"] > gap_ms else 0
             conn.execute(

@@ -277,8 +277,8 @@ class Worker:
             raise
 
     def write_window(self, window: list[Chunk], mapped: list[Mapped], dropped: dict[int, int],
-                     backend: Backend) -> None:
-        """Replace this backend's segments for the window's chunks and mark them done."""
+                     backend_by_chunk: dict[int, Backend]) -> None:
+        """Replace each chunk's segments for the backend that produced them and mark it done."""
         by_chunk: dict[int, list[Mapped]] = {c.id: [] for c in window}
         for m in mapped:
             by_chunk[m.chunk.id].append(m)
@@ -286,6 +286,7 @@ class Worker:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             for c in window:
+                backend = backend_by_chunk[c.id]
                 self.conn.execute("DELETE FROM segments WHERE chunk_id = ? AND model_id = ?",
                                   (c.id, backend.model_id))
                 pieces = sorted(by_chunk[c.id], key=lambda m: (m.start_utc_ms, m.end_utc_ms))
@@ -314,7 +315,8 @@ class Worker:
     # -- one window
 
     def transcribe_window(self, window: list[Chunk], audio: dict[int, np.ndarray],
-                          backend: Backend) -> tuple[list[Mapped], Backend]:
+                          backend: Backend) -> tuple[list[Mapped], dict[int, Backend]]:
+        """Returns the mapped segments and, per chunk id, the backend that produced its text."""
         parts = [audio[c.id] for c in window]
         joined, offsets = concat_with_gaps(parts, self.cfg.window_gap_s)
         spans = [Span(c, off, dur) for c, (off, dur) in zip(window, offsets)]
@@ -322,14 +324,18 @@ class Worker:
         no_words = (not used.supports_words) or (bool(transcript.segments) and not transcript.has_words)
         if len(window) > 1 and no_words:
             # No word timestamps for a multi-chunk window: redo it one chunk per request so
-            # the mapping is exact without words.
+            # the mapping is exact without words. Failover may switch backend mid-window, so
+            # every chunk remembers who transcribed it.
             log.info("backend %s returned no words; re-running %d chunks singly", used.name, len(window))
             mapped: list[Mapped] = []
+            by_chunk: dict[int, Backend] = {}
             for c in window:
+                sdnotify.notify("WATCHDOG=1")
                 t, used = self.router.transcribe(audio[c.id], self.cfg.language, start_at=used)
+                by_chunk[c.id] = used
                 mapped.extend(map_transcript(t, [Span(c, 0.0, len(audio[c.id]) / SAMPLE_RATE)]))
-            return mapped, used
-        return map_transcript(transcript, spans), used
+            return mapped, by_chunk
+        return map_transcript(transcript, spans), {c.id: used for c in window}
 
     # -- one batch
 
@@ -367,10 +373,11 @@ class Worker:
                                 self.cfg.session_gap_s, per_chunk=not backend.supports_words)
         res.windows = len(windows)
         for window in windows:
+            sdnotify.notify("WATCHDOG=1")  # a 50-chunk backlog can outlast WatchdogSec
             try:
-                mapped, used = self.transcribe_window(window, audio, backend)
+                mapped, by_chunk = self.transcribe_window(window, audio, backend)
                 kept, dropped = apply_filters(mapped, self.cfg.filters)
-                self.write_window(window, kept, dropped, used)
+                self.write_window(window, kept, dropped, by_chunk)
                 res.done += len(window)
             except NoBackendAvailable as e:
                 log.error("window of %d chunks: every backend failed: %s", len(window), e)
@@ -403,3 +410,28 @@ class Worker:
             except Exception:
                 log.exception("worker batch crashed")
             stop.wait(self.cfg.poll_s)
+
+
+def requeue(conn: sqlite3.Connection, max_attempts: int, failed_only: bool = False,
+            device_id: str | None = None, since_ms: int | None = None) -> int:
+    """Put `failed` rows (and stranded `pending` rows with attempts exhausted) back in the queue.
+
+    Returns the number of chunks requeued. `failed_only` leaves stranded pending rows alone.
+    """
+    if failed_only:
+        where = ["status = 'failed'"]
+        params: list[object] = []
+    else:
+        where = ["(status = 'failed' OR (status = 'pending' AND attempts >= ?))"]
+        params = [max_attempts]
+    if device_id:
+        where.append("device_id = ?")
+        params.append(device_id)
+    if since_ms is not None:
+        where.append("start_utc_ms >= ?")
+        params.append(since_ms)
+    cur = conn.execute(
+        f"UPDATE chunks SET status = 'pending', attempts = 0, error = NULL WHERE {' AND '.join(where)}",
+        params,
+    )
+    return cur.rowcount

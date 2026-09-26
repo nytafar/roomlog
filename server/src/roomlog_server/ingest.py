@@ -97,11 +97,30 @@ class IngestHandler(BaseHTTPRequestHandler):
                 break
             remaining -= len(chunk)
 
-    def _content_length(self) -> int:
+    def _content_length(self) -> int | None:
+        """Declared body length; None when absent, unparseable or chunked (→ 411)."""
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            return None
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            return None
         try:
-            return int(self.headers.get("Content-Length", "0"))
+            n = int(raw)
         except ValueError:
-            return -1
+            return None
+        return n if n >= 0 else None
+
+    def _reject(self, status: int, message: str, length: int | None) -> None:
+        """Error reply for requests refused before the body is needed: drain a modest body
+        so the client sees the status, close the connection on an absurd one (item: no
+        uncapped reads on the 401/404 paths)."""
+        if length is None:
+            self.close_connection = True
+        elif length <= 8 * self.app.max_body:
+            self._drain(length)
+        else:
+            self.close_connection = True
+        self._error(status, message)
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/healthz":
@@ -120,26 +139,25 @@ class IngestHandler(BaseHTTPRequestHandler):
         length = self._content_length()
         m = _CHUNK_PATH.match(self.path)
         if m is None:
-            self._error(404, "not found", drain=max(length, 0))
+            self._reject(404, "not found", length)
             return
         url_sha = m.group(1)
 
         device_id = self.app.device_for_token(self.headers.get("Authorization"))
         if device_id is None:
-            self._error(401, "missing or unknown token", drain=max(length, 0))
+            self._reject(401, "missing or unknown token", length)
             return
 
-        if length < 0:
+        if length is None:
+            # No usable Content-Length (absent, chunked): the body cannot be trusted, and a
+            # 409 here would make the edge discard a good chunk.
+            self.close_connection = True
             self._error(411, "Content-Length required")
             return
         if length > self.app.max_body:
             # Drain moderately oversized bodies so the client sees the 413 instead of a
             # broken pipe; refuse to read absurd ones and close instead.
-            if length <= 8 * self.app.max_body:
-                self._drain(length)
-            else:
-                self.close_connection = True
-            self._error(413, f"body larger than {self.app.max_body} bytes")
+            self._reject(413, f"body larger than {self.app.max_body} bytes", length)
             return
 
         body = self.rfile.read(length) if length else b""

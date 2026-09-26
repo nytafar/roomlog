@@ -270,20 +270,32 @@ def test_filters_count_drops_on_chunk(tmp_path):
 
 
 def test_failure_marking_and_max_attempts(tmp_path):
+    """An attempt is spent only when every configured backend failed for the window.
+
+    With a single backend a 4xx exhausts the list, so attempts accrue: pending until
+    max_attempts, then failed. With a second healthy backend the same 4xx costs nothing
+    (see test_failover.py).
+    """
     fx = Fixture(tmp_path, max_attempts=3)
     a = fx.add(T0, 10)
-    boom = FakeBackend(fail=BackendError("bad request"))
+    boom = FakeBackend(fail=BackendError("bad request", status=400))
     w = fx.worker(boom)
     for i in range(1, 3):
         res = w.run_once()
         assert res.failed == 1
         c = fx.chunk(a)
         assert (c["status"], c["attempts"]) == ("pending", i)
-        assert "bad request" in c["error"]
+        assert c["error"].startswith("backends:") and "bad request" in c["error"]
     res = w.run_once()
     c = fx.chunk(a)
     assert (c["status"], c["attempts"]) == ("failed", 3)
     assert w.run_once().claimed == 0
+    # the same 4xx with a healthy fallback: transcribed by the fallback, no attempt spent
+    fx.conn.execute("UPDATE chunks SET status='pending', attempts=0")
+    local = FakeBackend(name="local", model_id="nb-medium")
+    fx.worker(boom, local).run_once()
+    c = fx.chunk(a)
+    assert (c["status"], c["attempts"], c["model_id"]) == ("done", 0, "nb-medium")
 
 
 def test_all_backends_down_counts_attempt_but_no_backend_selected_does_not(tmp_path):

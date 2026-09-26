@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _MIGRATIONS: dict[int, str] = {
     1: """
@@ -107,13 +107,26 @@ CREATE TRIGGER segments_au AFTER UPDATE ON segments BEGIN
     INSERT INTO segments_tri(rowid, text) VALUES (new.id, new.text);
 END;
 """,
+    # The startup orphan scan and `verify` look chunks up by archive path.
+    2: """
+CREATE INDEX chunks_path ON chunks (path);
+""",
 }
+
+
+def _casefold_contains(haystack: str | None, needle: str | None) -> bool:
+    if haystack is None or needle is None:
+        return False
+    return needle.casefold() in haystack.casefold()
 
 
 def _configure(conn: sqlite3.Connection, readonly: bool) -> None:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
+    # Unicode-aware substring test for fuzzy search terms too short for the trigram index
+    # (SQLite's own lower()/LIKE fold ASCII only, so `MÅ` would not match `må`).
+    conn.create_function("casefold_contains", 2, _casefold_contains, deterministic=True)
     if not readonly:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")

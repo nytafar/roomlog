@@ -14,6 +14,10 @@ Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/bin:/usr/bi
 Environment=PYTHONUNBUFFERED=1
 # ROOMLOG_BIND (the tailnet address) is pinned here; see service.env.example.
 EnvironmentFile=-%h/.config/roomlog/service.env
+# The Tailscale address in ROOMLOG_BIND may not exist yet at boot; wait for it (up to
+# 120 s) rather than lose the race and fall back on Restart=on-failure. Same pattern as
+# herdr-spawn's wait-for-bridge drop-in. Skipped when ROOMLOG_BIND names 0.0.0.0/localhost.
+ExecStartPre=/bin/bash %h/services/apps/roomlog/deploy/server/wait-for-bind.sh 120
 ExecStart=%h/services/apps/roomlog/server/.venv/bin/roomlog ingest
 Restart=on-failure
 RestartSec=5

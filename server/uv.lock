@@ -1055,7 +1055,7 @@ dev = [
 requires-dist = [
     { name = "faster-whisper", specifier = ">=1.1" },
     { name = "huggingface-hub", specifier = ">=0.30" },
-    { name = "mcp", specifier = ">=1.10" },
+    { name = "mcp", specifier = ">=2,<3" },
     { name = "numpy", specifier = ">=1.26" },
 ]
 

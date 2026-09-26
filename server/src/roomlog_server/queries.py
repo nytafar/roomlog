@@ -32,13 +32,33 @@ def _segment_row(r: sqlite3.Row, score: float | None = None) -> dict[str, Any]:
 def search(conn: sqlite3.Connection, query: str, from_ms: int | None = None, to_ms: int | None = None,
            device_id: str | None = None, limit: int = 10, offset: int = 0,
            fuzzy: bool = False) -> list[dict[str, Any]]:
-    """bm25 over `segments_fts`, or trigram substring match over `segments_tri` with `fuzzy`."""
-    q = fts_query(query)
-    if not q:
+    """bm25 over `segments_fts`, or trigram substring match over `segments_tri` with `fuzzy`.
+
+    The trigram index cannot see terms shorter than three characters, so with `fuzzy` those
+    terms (`ok`, `må`) are applied as case-folded substring tests on the candidate rows
+    instead of being dropped; a query of only short terms scans without the index.
+    """
+    terms = query.split()
+    if not terms:
         return []
-    table = "segments_tri" if fuzzy else "segments_fts"
-    where = [f"{table} MATCH ?"]
-    params: list[Any] = [q]
+    params: list[Any] = []
+    if fuzzy:
+        long_terms = [t for t in terms if len(t) >= 3]
+        short_terms = [t for t in terms if len(t) < 3]
+        if long_terms:
+            table = "segments_tri"
+            where = ["segments_tri MATCH ?"]
+            params.append(fts_query(" ".join(long_terms)))
+        else:
+            table = None
+            where = []
+        for t in short_terms:
+            where.append("casefold_contains(s.text, ?)")
+            params.append(t)
+    else:
+        table = "segments_fts"
+        where = ["segments_fts MATCH ?"]
+        params.append(fts_query(query))
     if from_ms is not None:
         where.append("s.start_utc_ms >= ?")
         params.append(from_ms)
@@ -48,14 +68,21 @@ def search(conn: sqlite3.Connection, query: str, from_ms: int | None = None, to_
     if device_id:
         where.append("c.device_id = ?")
         params.append(device_id)
+    if table is not None:
+        source = f"FROM {table} f JOIN segments s ON s.id = f.rowid"
+        score = f"bm25({table})"
+        order = "score, s.start_utc_ms"
+    else:  # only short terms: no index can help, order newest first
+        source = "FROM segments s"
+        score = "NULL"
+        order = "s.start_utc_ms DESC"
     sql = f"""
         SELECT s.id, s.chunk_id, s.start_utc_ms, s.end_utc_ms, s.text, s.lang, s.model_id,
-               c.device_id, c.session_id, bm25({table}) AS score
-        FROM {table} f
-        JOIN segments s ON s.id = f.rowid
+               c.device_id, c.session_id, {score} AS score
+        {source}
         JOIN chunks c ON c.id = s.chunk_id
-        WHERE {" AND ".join(where)}
-        ORDER BY score, s.start_utc_ms
+        WHERE {" AND ".join(where) if where else "1=1"}
+        ORDER BY {order}
         LIMIT ? OFFSET ?
     """
     params += [max(1, min(int(limit), 500)), max(0, int(offset))]

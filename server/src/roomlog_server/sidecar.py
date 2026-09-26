@@ -8,6 +8,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .times import iso_to_ms
+
 REQUIRED = (
     "schema_version",
     "device_id",
@@ -54,6 +56,10 @@ def validate_sidecar(meta: Any) -> dict[str, Any]:
         raise SidecarError("sha256 must be 64 lowercase hex characters")
     if not isinstance(meta["start_utc"], str) or not _START_UTC.match(meta["start_utc"]):
         raise SidecarError("start_utc must be ISO 8601 with millisecond precision and Z")
+    try:
+        iso_to_ms(meta["start_utc"])  # the regex accepts 2026-02-30 and 24:00; the calendar does not
+    except ValueError:
+        raise SidecarError("start_utc is not a valid calendar time") from None
     d = meta["duration_s"]
     if not _is_num(d) or not (0 < d <= 31):
         raise SidecarError("duration_s must be a number in (0, 31]")

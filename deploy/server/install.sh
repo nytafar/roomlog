@@ -12,7 +12,7 @@
 #   6. print the ufw rule and the enable command; it never runs them
 set -euo pipefail
 
-REPO_URL="${ROOMLOG_REPO:-git@github.com:nytafar/roomlog.git}"
+REPO_URL="${ROOMLOG_REPO:-https://github.com/nytafar/roomlog.git}"
 BRANCH="${ROOMLOG_BRANCH:-main}"
 APP_DIR="${ROOMLOG_APP_DIR:-$HOME/services/apps/roomlog}"
 CONF_DIR="$HOME/.config/roomlog"
@@ -99,8 +99,10 @@ run systemctl --user daemon-reload
 log "5/6 model and selftest"
 if [ "$SKIP_MODEL" = 1 ]; then
   printf '    skipped: run %s fetch-model when ready (about 3 GB into %s/models)\n' "$ROOMLOG" "$DATA_DIR"
-else
-  run "$ROOMLOG" fetch-model
+elif ! run "$ROOMLOG" fetch-model; then
+  # A failed download (offline, HF hiccup) must not abort the install: the berget backend
+  # works without the local model, and the selftest below reports the missing model.
+  printf '    WARNING: fetch-model failed; rerun %s fetch-model later. Continuing.\n' "$ROOMLOG" >&2
 fi
 if [ "$SKIP_SELFTEST" = 1 ]; then
   printf '    skipped: run %s selftest\n' "$ROOMLOG"

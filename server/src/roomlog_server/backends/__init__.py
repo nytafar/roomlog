@@ -7,6 +7,7 @@ import time
 
 import numpy as np
 
+from .. import sdnotify
 from ..config import BackendConfig, Config
 from .base import Backend, BackendError, BackendUnavailable, Segment, Transcript, Word
 
@@ -95,10 +96,22 @@ class Router:
             if not self._healthy(b):
                 continue
             tried += 1
+            sdnotify.notify("WATCHDOG=1")
             try:
-                return b.transcribe_limited(audio, language), b
+                result = b.transcribe_limited(audio, language), b
             except BackendUnavailable as e:
-                log.warning("backend %s failed, falling through: %s", b.name, e)
+                # Transient (connection, timeout, 5xx, 429/408): mark down for the TTL.
+                log.warning("backend %s unavailable, falling through: %s", b.name, e)
                 errors.append(f"{b.name}: {e}")
                 self._mark_down(b)
+                continue
+            except BackendError as e:
+                # Non-transient for this backend (other 4xx, bad response): still try the next
+                # one; an attempt is only spent when every backend has failed.
+                log.warning("backend %s rejected the request, falling through: %s", b.name, e)
+                errors.append(f"{b.name}: {e}")
+                continue
+            finally:
+                sdnotify.notify("WATCHDOG=1")
+            return result
         raise NoBackendAvailable("; ".join(errors) if errors else "no healthy backend")

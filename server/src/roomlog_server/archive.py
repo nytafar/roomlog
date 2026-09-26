@@ -11,12 +11,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import logging
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .sidecar import SidecarError, validate_sidecar
 from .times import iso_to_ms, ms_to_compact, now_ms
+
+log = logging.getLogger("roomlog.archive")
 
 
 @dataclass
@@ -37,13 +42,22 @@ def sidecar_path(opus_path: Path) -> Path:
 
 
 def _write_durable(path: Path, data: bytes) -> None:
+    """Temp + fsync + rename. The temp name is unique per writer (`mkstemp`), so two
+    concurrent PUTs of the same sha cannot truncate or unlink each other's file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "wb") as fh:
-        fh.write(data)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     dir_fd = os.open(path.parent, os.O_RDONLY)
     try:
         os.fsync(dir_fd)
@@ -134,22 +148,26 @@ def store_chunk(conn: sqlite3.Connection, archive_dir: Path, meta: dict[str, Any
 
 
 def scan_orphans(conn: sqlite3.Connection, archive_dir: Path) -> list[str]:
-    """Archive files with no `chunks` row: insert rows for them (startup recovery)."""
+    """Archive files with no `chunks` row: insert rows for them (startup recovery).
+
+    Known paths are loaded once into a set (one indexed scan, not one query per file), and a
+    sidecar that does not parse or validate is logged and skipped rather than blocking startup.
+    """
     recovered: list[str] = []
     if not archive_dir.exists():
         return recovered
+    known_paths = {r[0] for r in conn.execute("SELECT path FROM chunks")}
     for json_path in sorted(archive_dir.rglob("*.json")):
         opus = json_path.with_suffix(".opus")
         if not opus.exists():
             continue
         relpath = str(opus.relative_to(archive_dir))
-        row = conn.execute("SELECT id FROM chunks WHERE path = ?", (relpath,)).fetchone()
-        if row is not None:
+        if relpath in known_paths:
             continue
-        meta_raw = json_path.read_bytes()
         try:
-            meta = json.loads(meta_raw)
-        except ValueError:
+            meta = validate_sidecar(json.loads(json_path.read_bytes()))
+        except (ValueError, SidecarError) as e:
+            log.warning("skipping %s: sidecar unusable (%s)", relpath, e)
             continue
         sha256 = hashlib.sha256(opus.read_bytes()).hexdigest()
         if conn.execute("SELECT id FROM chunks WHERE sha256 = ?", (sha256,)).fetchone():
