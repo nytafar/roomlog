@@ -148,16 +148,113 @@ class OggOpusWriterTest {
         return b.array()
     }
 
-    /** encode.py's ffmpeg command line, verbatim. */
-    private fun ffmpegEncode(pcm: ByteArray, dir: File): ByteArray = exec(
+    /** encode.py's ffmpeg command line, verbatim by default; the knobs make packet-size edge cases. */
+    private fun ffmpegEncode(
+        pcm: ByteArray, dir: File, bitrate: String = "24k", application: String = "voip",
+        vbr: String = "on", frameDuration: String = "20", name: String = "ffmpeg.opus",
+    ): ByteArray = exec(
         listOf(
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
             "-f", "s16le", "-ar", "16000", "-ac", "1", "-i", "pipe:0",
-            "-c:a", "libopus", "-b:a", "24k", "-application", "voip",
-            "-vbr", "on", "-frame_duration", "20", "-f", "ogg", "pipe:1",
+            "-c:a", "libopus", "-b:a", bitrate, "-application", application,
+            "-vbr", vbr, "-frame_duration", frameDuration, "-f", "ogg", "pipe:1",
         ),
         pcm,
-    ).also { File(dir, "ffmpeg.opus").writeBytes(it) }
+    ).also { File(dir, name).writeBytes(it) }
+
+    /** Lacing values of every audio page (pages after OpusHead and OpusTags). */
+    private fun audioLacing(bytes: ByteArray) = OggReader.pages(bytes).drop(2).map { it.table.toList() }
+
+    // -- lacing edge cases -------------------------------------------------
+
+    /** A SILK-WB 20 ms packet of exactly [size] bytes. */
+    private fun sized(size: Int, tag: Int = 0) = ByteArray(size) { if (it == 0) (9 shl 3).toByte() else (tag + it).toByte() }
+
+    @Test
+    fun packetsOf255And256BytesLaceAndReassemble() {
+        val w = OggOpusWriter(OpusHead(preSkip = 312), tags, serial = 9)
+        val sizes = listOf(255, 256, 254, 510, 511, 1, 765)
+        sizes.forEachIndexed { i, s -> w.writePacket(sized(s, i)) }
+        val bytes = w.finish((sizes.size * 960L - 312) / 3)
+        val page = audioLacing(bytes).single()
+        // 255 → 255,0 (a zero terminates it); 256 → 255,1; 510 → 255,255,0; 765 → 255,255,255,0
+        assertEquals(
+            listOf(255, 0, 255, 1, 254, 255, 255, 0, 255, 255, 1, 1, 255, 255, 255, 0),
+            page,
+        )
+        val got = OggReader.audioPackets(bytes)
+        assertEquals(sizes, got.map { it.size })
+        sizes.forEachIndexed { i, s -> assertContentEquals(sized(s, i), got[i]) }
+        assertTrue(OggReader.pages(bytes).all { it.crcOk })
+    }
+
+    @Test
+    fun lacingLimitSplitsPagesBeforeOneSecond() {
+        // 2.5 ms CELT packets (TOC config 16): 400 per second, but a page holds 255 lacing values
+        val w = OggOpusWriter(OpusHead(preSkip = 120), tags, serial = 10)
+        val n = 1000
+        repeat(n) { w.writePacket(byteArrayOf((16 shl 3).toByte(), it.toByte(), 7)) }
+        val bytes = w.finish((n * 120L - 120) / 3)
+        val pages = OggReader.pages(bytes).drop(2)
+        assertEquals(listOf(255, 255, 255, 235), pages.map { it.table.size })
+        assertEquals(listOf(255L * 120, 510L * 120, 765L * 120, n * 120L), pages.map { it.granule })
+        assertEquals(n, OggReader.audioPackets(bytes).size)
+        // and with 20 ms packets of 1275 bytes (6 lacing values each) the split comes at 42 packets
+        val big = OggOpusWriter(OpusHead(preSkip = 312), tags, serial = 11)
+        repeat(60) { big.writePacket(sized(1275, it)) }
+        val bb = big.finish((60 * 960L - 312) / 3)
+        assertEquals(listOf(252, 108), OggReader.pages(bb).drop(2).map { it.table.size })
+        assertEquals(60, OggReader.audioPackets(bb).size)
+        assertTrue(OggReader.pages(bb).all { it.crcOk })
+    }
+
+    @Test
+    fun realPacketsAtLacingEdgesDecodeExactly() {
+        assumeTrue(have("ffmpeg"), "ffmpeg not on PATH")
+        val dir = Files.createTempDirectory("oggedges").toFile()
+        try {
+            val pcm = chirpPcm(48_000) // 3 s
+            data class Case(val name: String, val src: ByteArray, val check: (List<List<Int>>) -> Unit)
+            val cases = listOf(
+                // CBR 102 kbps at 20 ms: every packet exactly 255 bytes, laced 255,0
+                Case("cbr255", ffmpegEncode(pcm, dir, "102000", "audio", "off", "20", "cbr255.opus")) { lacing ->
+                    assertTrue(lacing.all { t -> t.windowed(2, 2).all { it == listOf(255, 0) } }, "255,0 pairs")
+                },
+                // CBR 102.4 kbps: 256-byte packets, laced 255,1
+                Case("cbr256", ffmpegEncode(pcm, dir, "102400", "audio", "off", "20", "cbr256.opus")) { lacing ->
+                    assertTrue(lacing.all { t -> t.windowed(2, 2).all { it == listOf(255, 1) } }, "255,1 pairs")
+                },
+                // 2.5 ms frames: 400 packets a second, pages split at 255 lacing values
+                Case("f2.5", ffmpegEncode(pcm, dir, frameDuration = "2.5", application = "audio", name = "f25.opus")) { lacing ->
+                    assertTrue(lacing.dropLast(1).all { it.size == 255 }, "full lacing tables: ${lacing.map { it.size }}")
+                },
+            )
+            for (c in cases) {
+                val info = OggReader.parse(c.src)
+                val packets = OggReader.audioPackets(c.src)
+                val n = 47_000
+                val w = OggOpusWriter(OpusHead(preSkip = info.preSkip), tags, serial = c.name.hashCode())
+                packets.forEach(w::writePacket)
+                val bytes = w.finish(n.toLong())
+                c.check(audioLacing(bytes))
+                assertTrue(OggReader.pages(bytes).all { it.crcOk && it.table.size <= 255 }, c.name)
+                // the reader gets the packets back byte for byte
+                val back = OggReader.audioPackets(bytes)
+                back.forEachIndexed { i, p -> assertContentEquals(packets[i], p, "${c.name} packet $i") }
+                val f = File(dir, "remux-${c.name}.opus").apply { writeBytes(bytes) }
+                assertEquals(3 * n, decodedSamples(f, rate = null), "${c.name}: 48 kHz decode")
+                assertEquals(n, decodedSamples(f, rate = 16000), "${c.name}: 16 kHz decode")
+                val srcFile = File(dir, "src-${c.name}.opus").apply { writeBytes(c.src) }
+                val ref = exec(listOf("ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", srcFile.path,
+                    "-f", "s16le", "pipe:1"))
+                val ours = exec(listOf("ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", f.path,
+                    "-f", "s16le", "pipe:1"))
+                assertContentEquals(ref.copyOf(6 * n), ours, "${c.name}: decode differs from the source's")
+            }
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
 
     private fun decodedSamples(file: File, rate: Int?): Int {
         val cmd = mutableListOf("ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", file.path)
