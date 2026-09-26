@@ -191,5 +191,3 @@ def test_per_chunk_rerun_stamps_each_chunk_with_its_backend(tmp_path):
     assert fx.chunk(c)["model_id"] == "nb-medium"
     assert all(s["model_id"] == "nb-medium" for s in fx.segments(b) + fx.segments(c))
     assert len(local.calls) == 2
-
-
