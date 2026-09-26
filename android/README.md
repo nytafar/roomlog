@@ -1,0 +1,81 @@
+# roomlog Android thin client
+
+Two Gradle modules. The plan and its decisions live in `~/hvelv/repos/roomlog/android/plan-thin-client.md`
+and ADRs 0005 to 0007, not here.
+
+| Module | What |
+|---|---|
+| `:core` | Pure Kotlin/JVM, no Android imports, JVM-tested. Each class mirrors an edge module so the pytest vectors port one to one: `Timeline` (`timeline.py`), `RawSegmenter` (fixed 30 s raw segments, ADR 0005), `OggOpusWriter` (inverse of `ogg.py`, `OpusCsd`, `OggCrc`), `Sidecar` (`sidecar.py`, plus a minimal `Json`), `Spool` (`spool.py`), `UploadPolicy` and `Uploader` (`uploader.py`), `ClockOffset` (`GET /v1/time`, ADR 0006). |
+| `:app` | The P2 codec spike: one Compose screen, `AudioRecord` → `Timeline` → `RawSegmenter` → `MediaCodec` Opus → `OggOpusWriter` → `Spool`. It does not upload. `Http` (the `HttpURLConnection` side of `Uploader` and `ClockOffset`) is there for P3 and not wired in. `minSdk 29`, `targetSdk 35`. |
+
+## Build
+
+Toolchain: JDK 21 (the Android Gradle plugin rejects newer JDKs; do not use the system default
+if it is newer), the Android SDK with `platforms;android-35` and `build-tools;35.0.0`. Gradle
+comes from the wrapper (8.10.2); AGP 8.7.3, Kotlin 2.0.21.
+
+```sh
+cd android
+echo "sdk.dir=$HOME/Android/Sdk" > local.properties          # gitignored
+export JAVA_HOME=~/.local/share/mise/installs/java/21.0.2     # or any JDK 17 to 21
+./gradlew :core:test            # the gate for :core
+./gradlew :app:assembleDebug    # app/build/outputs/apk/debug/app-debug.apk
+```
+
+`:core:test` needs no device. The `OggOpusWriter` tests shell out to `ffmpeg`/`ffprobe` (they
+re-mux packets from `encode.py`'s ffmpeg command line and check the decoded length, the
+decoded samples and the tags) and to `python3` (the edge's `ogg.py` parses the output); each
+of those tests is skipped when its tool is missing. Test reports:
+`core/build/reports/tests/test/index.html`.
+
+## Run the spike
+
+```sh
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n no.nyta.roomlog.spike/.MainActivity
+```
+
+Tap Start, grant the microphone, keep the screen on (the activity sets keep-screen-on while
+recording; there is no foreground service in the spike). The log shows the `AudioRecord`
+source and routing, the codec name, each codec-specific-data sighting (shape, pre-skip, delay),
+the `getTimestamp` latency every 60 s, late blocks and epochs, and one line per segment:
+`n_start`, `n_samples`, bytes, `sha8`, packet count and sizes, samples covered versus needed.
+The same lines go to logcat: `adb logcat -s roomlog`. Tap Stop to cut the shutdown segment.
+
+Segments land in the app's external files dir, in `unsynced/` because the spike has no clock
+probe (`clock_synced: false`):
+
+```sh
+mkdir -p ~/scratch
+adb pull /sdcard/Android/data/no.nyta.roomlog.spike/files/spool ~/scratch/spike-spool
+ls ~/scratch/spike-spool/unsynced/     # <start_utc compact>_<sha8>.opus + .json
+```
+
+## Validate with the server's decoder (P2 pass criteria)
+
+From the repo root, with the server's environment (PyAV):
+
+```sh
+cd server && uv run python - ~/scratch/spike-spool/unsynced/*.opus <<'EOF'
+import json, sys, hashlib, pathlib
+from roomlog_server.audio import decode_opus
+sys.path.insert(0, "../edge/src")
+from roomlog_edge import ogg
+for p in map(pathlib.Path, sys.argv[1:]):
+    meta = json.loads(p.with_suffix(".json").read_text())
+    data = p.read_bytes()
+    info = ogg.parse(data)
+    n = len(decode_opus(p))
+    print(p.name, meta["n_start"], meta["n_samples"], "decoded", n,
+          "OK" if n == meta["n_samples"] else "MISMATCH",
+          "sha", hashlib.sha256(data).hexdigest() == meta["sha256"],
+          "tags", info.tags.get("ROOMLOG_N_START") == str(meta["n_start"]))
+EOF
+```
+
+PyAV's resampler to 16 kHz returns nothing for streams under about 50 samples (3 ms) even
+though they decode exactly at 48 kHz; a tiny shutdown tail can show as a mismatch for that
+reason alone. Each full segment must decode to exactly 480000 samples, and within one `(run_id, epoch)`
+`n_start + n_samples` of a segment must equal the next `n_start`. Concatenating the decodes
+and cross-correlating against a known source (play a chirp near the phone) checks that the
+segment seams are sample-exact.

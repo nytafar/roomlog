@@ -5,3 +5,8 @@ __pycache__/
 dist/
 .pytest_cache/
 .claude/worktrees/
+android/build/
+android/*/build/
+android/.gradle/
+android/.kotlin/
+android/local.properties
