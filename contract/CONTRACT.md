@@ -23,7 +23,8 @@ See `sidecar.schema.json` (JSON Schema 2020-12) and `examples/`. Required fields
 continuous audio cut on the sample counter every 480 000 samples (30.0 s): no padding, no
 `vad` object, `n_start` and `n_samples` required, `n_samples == 480000` except for the last
 segment of an epoch or run, which is shorter. Full segments carry `cut_reason: "cap"`; the
-short last one carries `"discontinuity"` or `"shutdown"`. Within one `(run_id, epoch)`,
+short last one carries `"discontinuity"` or `"shutdown"`. `duration_s` equals
+`n_samples / 16000` within 1 ms. Within one `(run_id, epoch)`,
 `n_start + n_samples` of a segment equals `n_start` of the next. The server runs VAD and
 the chunker over raw segments itself (ADR 0005); speech chunks are what the Linux edge sends.
 
