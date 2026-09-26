@@ -69,8 +69,8 @@ def evaluate(cfg: Config, now_ns: int | None = None, ntp_state: bool | None = No
     up = read_status(cfg.uploader_status)
     last_upload_age = _age_s(up.get("last_success_utc_ns"), now_ns) if up else None
     m["roomlog_last_upload_age_s"] = last_upload_age if last_upload_age is not None else float("nan")
-    if st.pending_files:
-        oldest = min(e.opus.stat().st_mtime for e in spool.entries("pending"))
+    oldest = oldest_pending_mtime(spool)
+    if oldest is not None:
         oldest_age = max(0.0, now_ns / 1e9 - oldest)
         if oldest_age > h.upload_stall_s and (last_upload_age is None or last_upload_age > h.upload_stall_s):
             reasons.append(f"pending files for {oldest_age:.0f} s without a successful upload")
@@ -84,6 +84,19 @@ def evaluate(cfg: Config, now_ns: int | None = None, ntp_state: bool | None = No
     m["roomlog_clock_synced"] = 1 if synced else 0
     m["roomlog_healthy"] = 0 if reasons else 1
     return Report(not reasons, reasons, m)
+
+
+def oldest_pending_mtime(spool: Spool) -> float | None:
+    """mtime of the oldest complete pending chunk; None when there is none
+    (orphans and files the uploader deletes meanwhile are skipped)."""
+    oldest = None
+    for e in spool.entries("pending"):
+        try:
+            m = e.opus.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        oldest = m if oldest is None else min(oldest, m)
+    return oldest
 
 
 def render_prom(metrics: dict[str, float]) -> str:

@@ -81,11 +81,34 @@ class Spool:
     # -- writing -----------------------------------------------------------
 
     def cleanup_tmp(self) -> int:
+        """Remove leftovers in ``tmp/``. A crash between the two renames of
+        :meth:`write`/:meth:`rewrite_meta` leaves ``<stem>.opus`` in its
+        destination with ``<stem>.json.tmp`` still here: that pair is finished,
+        not deleted. Returns the number of files touched."""
         n = 0
-        for p in self.dir("tmp").iterdir():
-            if p.is_file():
+        for p in sorted(self.dir("tmp").iterdir()):
+            if not p.is_file():
+                continue
+            if p.name.endswith(".json.tmp"):
+                stem = p.name[:-len(".json.tmp")]
+                for dest in ("pending", "unsynced"):
+                    opus = self.dir(dest) / f"{stem}.opus"
+                    if opus.exists():
+                        os.replace(p, self.dir(dest) / f"{stem}.json")
+                        _fsync_dir(self.dir(dest))
+                        break
+                else:
+                    p.unlink()
+            else:
                 p.unlink()
-                n += 1
+            n += 1
+        # a sidecar whose audio is gone (rewrite_meta renamed the .opus away
+        # before the crash) is useless
+        for dest in ("pending", "unsynced"):
+            for js in self.dir(dest).glob("*.json"):
+                if not js.with_suffix(".opus").exists():
+                    js.unlink()
+                    n += 1
         return n
 
     @staticmethod
@@ -153,10 +176,14 @@ class Spool:
         def count(name):
             files = bytes_ = 0
             for p in self.dir(name).iterdir():
+                try:
+                    st = p.stat()
+                except FileNotFoundError:  # the uploader deleted it meanwhile
+                    continue
                 if p.is_file():
-                    if p.suffix == ".opus":
+                    if p.suffix == ".opus" and p.with_suffix(".json").exists():
                         files += 1
-                    bytes_ += p.stat().st_size
+                    bytes_ += st.st_size
             return files, bytes_
 
         pf, pb = count("pending")

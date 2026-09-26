@@ -87,6 +87,18 @@ def test_upload_stall(cfg):
     assert any("auth" in x for x in r.reasons)
 
 
+def test_health_survives_orphan_opus_and_empty_pending(cfg):
+    from roomlog_edge.spool import Spool
+
+    _capture_status(cfg)
+    _uploader_status(cfg)
+    sp = Spool(cfg.spool_dir)
+    (sp.dir("pending") / "20260926T000000000Z_deadbeef.opus").write_bytes(b"x")  # no .json
+    r = evaluate(cfg, ntp_state=True, disk_usage=OK_DISK)
+    assert r.healthy, r.reasons
+    assert r.metrics["roomlog_spool_files"] == 0
+
+
 def test_run_health_writes_prom(cfg, monkeypatch):
     monkeypatch.setattr(clocksync, "ntp_synchronized", lambda: True)
     _capture_status(cfg)

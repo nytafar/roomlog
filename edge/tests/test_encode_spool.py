@@ -105,6 +105,29 @@ def test_spool_rewrite_meta_restamps_and_renames(tmp_path):
     assert sp.entries("unsynced") == []
 
 
+def test_cleanup_tmp_finishes_half_renamed_pairs(tmp_path):
+    sp = Spool(tmp_path / "spool")
+    # crash after the .opus rename, before the .json rename
+    e = sp.write(b"audio", _meta())
+    os.replace(e.json, sp.dir("tmp") / f"{e.stem}.json.tmp")
+    assert sp.entries("pending") == []
+    assert sp.stats().pending_files == 0  # the orphan is not counted
+    sp.cleanup_tmp()
+    assert [x.stem for x in sp.entries("pending")] == [e.stem]
+    assert e.json.exists() and list(sp.dir("tmp").iterdir()) == []
+    # same for unsynced/
+    u = sp.write(b"held", _meta(clock_synced=False), dest="unsynced")
+    os.replace(u.json, sp.dir("tmp") / f"{u.stem}.json.tmp")
+    sp.cleanup_tmp()
+    assert [x.stem for x in sp.entries("unsynced")] == [u.stem]
+    # a sidecar without audio, and a lone .opus.tmp, are removed
+    (sp.dir("pending") / "20260101T000000000Z_00000000.json").write_bytes(b"{}")
+    (sp.dir("tmp") / "x.opus.tmp").write_bytes(b"junk")
+    (sp.dir("tmp") / "y.json.tmp").write_bytes(b"junk")
+    assert sp.cleanup_tmp() == 3
+    assert list(sp.dir("tmp").iterdir()) == []
+
+
 Usage = namedtuple("Usage", "total used free")
 
 
