@@ -424,3 +424,32 @@ def test_resegment_on_a_live_epoch_rederives_the_whole_tail_without_overlap(tmp_
         assert conn.execute("SELECT segmented_to_n FROM raw_progress").fetchone()[0] == mark
         conn.close()
 
+
+def test_failed_upload_is_not_played_for_a_chunk_from_its_good_re_upload(tmp_path):
+    cfg = make_config(tmp_path)
+    conn = dbmod.connect(cfg.db_path)
+    fake = FakeRaw(conn)
+    pattern = [("s", 5), ("t", 40), ("s", 15)]
+    plan = fake.plan(pcm_for(pattern))
+    for n, piece, reason in plan:
+        fake.store(n, piece, reason, RAW_T0)
+    broken = [Path(r[0]).name for r in conn.execute("SELECT path FROM raw_segments ORDER BY n_start")][1]
+    fake.pcm[broken] = fake.pcm[broken][:-5000]
+    res = segmenter(fake, cfg, RAW_T0 + 1000).run_once()
+    assert res.raw_failed == 1 and statuses(conn, "s22")[1] == "failed"
+    fake.store(*plan[1], RAW_T0 + 5000, salt="re-upload")  # the good file, a higher id
+    res = segmenter(fake, cfg, RAW_T0 + 6000).run_once()
+    assert res.errors == [] and res.chunks == 2  # the 40 s tone is cap-cut once
+    ivs = intervals(conn, "s22")
+    assert_disjoint(ivs)
+    assert_covers_tone(ivs, pattern)
+    segs = covering_segments(conn, "s22", fake.run_id, 0, 0, 2 * SEGMENT)  # 60 s: two spans, three rows
+    assert [(s.n_start, s.status) for s in segs] == [(0, "segmented"), (SEGMENT, "segmented")]
+    assert Path(segs[1].path).name != broken
+    worker = Worker(cfg, conn, Router([FakeBackend()], probe_ttl_s=0), decode=fake.decode)
+    for row in conn.execute("SELECT * FROM chunks"):
+        assert len(worker.audio_for(Chunk.from_row(row))) == row["n_samples"]
+    from roomlog_server.verify import verify_archive
+    report = verify_archive(conn, cfg.archive_dir)
+    assert report["derived"] == 2 and not [p for p in report["problems"] if "raw audio missing" in p]
+    conn.close()

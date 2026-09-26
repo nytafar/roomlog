@@ -183,9 +183,12 @@ def dedupe_overlaps(segs: list[RawSeg], on_drop: Callable[[RawSeg, RawSeg], None
 
 def covering_segments(conn: sqlite3.Connection, device_id: str, run_id: str, epoch: int,
                       n_start: int, n_end: int) -> list[RawSeg]:
+    """The rows the worker and `verify` play a derived chunk from: the same rows the
+    segmenter chained, so `failed` uploads are out even when a good re-upload came later."""
     rows = conn.execute(
         """SELECT * FROM raw_segments
            WHERE device_id = ? AND run_id = ? AND epoch = ? AND n_start < ? AND n_start + n_samples > ?
+             AND status != 'failed'
            ORDER BY n_start, id""",
         (device_id, run_id, epoch, n_end, n_start),
     ).fetchall()

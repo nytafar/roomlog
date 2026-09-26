@@ -31,6 +31,11 @@ decode to its `n_samples` (beyond 64 samples of codec priming) gets `status` `fa
 counted in `roomlog status`, and its neighbours continue as if it were a gap; `resegment`
 over its time puts it back to `pending` for another try.
 
+A gap inside an epoch (a network outage longer than `raw_idle_s` while the phone keeps
+recording) closes the chain before it as final. When the continuation arrives, speech that
+began less than 250 ms before that seam can be dropped as too short on the far side: at
+most about 250 ms per such seam, by design (the chunker's `min_speech`).
+
 `[segmenter] vad = "energy"` is an RMS gate for tests and for bootstrapping before
 `fetch-model`; it is not for production. The 30-day `purge-raw` deletes raw audio that
 overlaps no derived chunk, so with the energy gate it would delete on the gate's decisions.
