@@ -53,6 +53,7 @@ X-Roomlog-Meta: <sidecar JSON on one line, ASCII only (json.dumps(..., ensure_as
 | `409` | body sha ≠ URL sha, or ≠ `meta.sha256` | move to `spool/failed/`; never retry |
 | `413` | body larger than 8 MiB | move to `spool/failed/` |
 | `422` | sidecar fails the schema, or header missing/unparseable | move to `spool/failed/` |
+| `411` | missing `Content-Length` (chunked bodies not accepted) | keep; retry with backoff (client bug) |
 | `5xx`, timeout, connection error | server problem | keep; retry with backoff |
 
 Success body (both 200 and 201):
