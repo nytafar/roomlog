@@ -5,8 +5,8 @@ and ADRs 0005 to 0007, not here.
 
 | Module | What |
 |---|---|
-| `:core` | Pure Kotlin/JVM, no Android imports, JVM-tested. Each class mirrors an edge module so the pytest vectors port one to one: `Timeline` (`timeline.py`), `RawSegmenter` (fixed 30 s raw segments, ADR 0005), `OggOpusWriter` (inverse of `ogg.py`, `OpusCsd`, `OggCrc`), `Sidecar` (`sidecar.py`, plus a minimal `Json`), `Spool` (`spool.py`), `UploadPolicy` and `Uploader` (`uploader.py`), `ClockOffset` (`GET /v1/time`, ADR 0006), `Retention` (the edge's `_retain_from_n`), and `CaptureClock` (Android-specific: block capture time from `AudioRecord.getTimestamp`, loss from `framePosition` against frames read). |
-| `:app` | The P2 codec spike: one Compose screen and a microphone foreground service running `AudioRecord` → `CaptureClock` → `Timeline` → `RawSegmenter` → `MediaCodec` Opus → `OggOpusWriter` → `Spool`. It does not upload. `Http` (the `HttpURLConnection` side of `Uploader` and `ClockOffset`) is there for P3 and not wired in. `minSdk 29`, `targetSdk 35`. |
+| `:core` | Pure Kotlin/JVM, no Android imports, JVM-tested. Each class mirrors an edge module so the pytest vectors port one to one: `Timeline` (`timeline.py`), `RawSegmenter` (fixed 30 s raw segments, ADR 0005), `OggOpusWriter` (inverse of `ogg.py`, `OpusCsd`, `OggCrc`), `Sidecar` (`sidecar.py`, plus a minimal `Json`), `Spool` (`spool.py`), `UploadPolicy` and `Uploader` (`uploader.py`), `ClockOffset` (`GET /v1/time`, ADR 0006), `Retention` (the edge's `_retain_from_n`), `CaptureClock` (Android-specific: block capture time from `AudioRecord.getTimestamp`, loss from `framePosition` against frames read), and for P3 `UnsyncedHold` (the edge's unsynced hold and re-stamp, driven by the probe), `UploadLoop` (probe schedule, upload passes, backoff) and `Http` (`HttpURLConnection`, fixed-length PUT, `GET /v1/time`). |
+| `:app` | The P3 client: one Compose screen (device id, server URL, token, Start/Stop, log) and a microphone foreground service running `AudioRecord` → `CaptureClock` → `Timeline` → `RawSegmenter` → `MediaCodec` Opus → `OggOpusWriter` → `Spool`, plus an upload thread (`UploadLoop`) that probes `/v1/time` and PUTs `pending/` to the server. The package is still `no.nyta.roomlog.spike`, so an install keeps the spike's settings and spool. `minSdk 29`, `targetSdk 35`. |
 
 ## Build
 
@@ -22,37 +22,106 @@ export JAVA_HOME=~/.local/share/mise/installs/java/21.0.2     # or any JDK 17 to
 ./gradlew :app:assembleDebug    # app/build/outputs/apk/debug/app-debug.apk
 ```
 
-`:core:test` needs no device. The `OggOpusWriter` tests shell out to `ffmpeg`/`ffprobe` (they
+`:core:test` needs no device or network. `LiveIngestTest` runs only when pointed at a
+throwaway ingest (see "Test the upload path without the phone"). The `OggOpusWriter` tests shell out to `ffmpeg`/`ffprobe` (they
 re-mux packets from `encode.py`'s ffmpeg command line and check the decoded length, the
 decoded samples and the tags) and to `python3` (the edge's `ogg.py` parses the output); each
 of those tests is skipped when its tool is missing. Test reports:
 `core/build/reports/tests/test/index.html`.
 
-## Run the spike
+## Run on the device (P3)
 
 ```sh
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb install -r app/build/outputs/apk/debug/app-debug.apk    # versionCode 4, installs over rc1 (3)
 adb shell am start -n no.nyta.roomlog.spike/.MainActivity
 ```
 
-Set the device id (default `s22`, persisted; it goes into every sidecar and the
-`ROOMLOG_DEVICE_ID` tag, so it must match the server token's device), tap Start and grant the
-microphone and notifications.
+A debug build from another machine is signed with a different debug key; `adb install -r`
+then fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE` and only an uninstall helps, which
+deletes the spool. Pull `files/spool` first if it holds anything.
 
-Recording runs in a foreground service of type `microphone`, with an ongoing notification
-that has a Stop action. The screen may turn off and the activity may be closed or recreated
-without ending the run; this is how the overnight screen-off run of plan §4 P2 is done.
+Setup fields (persisted in app-private preferences; editable only while idle):
+
+| Field | Value |
+|---|---|
+| device id | `lass22` on the S22+. Goes into every sidecar and the `ROOMLOG_DEVICE_ID` tag; must be the device the token belongs to on the server (otherwise `403`) |
+| server URL | `https://oma.tailf63b9a.ts.net:8480` (the default; port 8480, see ADR 0007's amendment) |
+| token | the bearer token for that device from the server's `tokens.toml`. Paste it once; it is never shown or logged again (the label says `token: set`). Empty token = record only, nothing uploads |
+
+Tap Start and grant the microphone and notifications. Recording runs in a foreground
+service of type `microphone`, with an ongoing notification that has a Stop action. The
+screen may turn off and the activity may be closed or recreated without ending the run.
 Without the service Android hands a background app silence, with no error. If the system
 kills the process, the service is not restarted into recording (Android does not allow a
 background start to use the microphone); a "recording stopped" notification appears instead.
 
-The log shows the `AudioRecord` source, buffer and routing, the codec name, each
-codec-specific-data sighting (shape, pre-skip, delay), capture-clock events (first
-timestamp, re-bases, overruns and losses with the frame they start at), new epochs, a
-summary every 600 reads (maximum arrival-to-capture time, timestamp failures and outliers),
-and one line per segment: `n_start`, `n_samples`, bytes, `sha8`, packet count and sizes,
-samples covered versus needed. The same lines go to logcat: `adb logcat -s roomlog`. Tap Stop
-(screen or notification) to cut the shutdown segment.
+### What happens to a segment
+
+1. Every 30 s a segment closes. If a `/v1/time` probe succeeded in the last 10 minutes it is
+   stamped in the server's timebase with `clock_synced: true` and goes to `pending/`;
+   otherwise it is stamped from the last known offset (or the device clock before the first
+   probe) with `clock_synced: false` and held in `unsynced/` (ADR 0006).
+2. When a probe succeeds, the held segments of the current run are re-stamped through the
+   run's timeline (server offset, `clock_step: true` if the offset moved more than 50 ms
+   since they were stamped) and moved to `pending/`.
+3. The upload thread PUTs `pending/` oldest first. A segment is deleted only after a
+   `200`/`201` whose body carries the same sha256. `409`/`413`/`422` move it to `failed/`.
+   Anything else (no network, `401`, `403`, `5xx`) keeps it and backs off
+   `min(300 s, 2^k)` with full jitter; the queue waits behind it. Uploads run on any network.
+4. Probes run at start, every 5 minutes while they succeed, every 30 s while they fail; a
+   probe slower than 100 ms is followed at once by a second. Only the first probe's
+   midpoint is taken as the offset; after that the offset is kept unless a probe's round-trip
+   interval excludes it, and then it moves only to that interval's edge. A slow probe
+   therefore refreshes `clock_synced` without moving the timeline.
+5. Stop: the shutdown segment is cut; held segments that never saw a probe move to
+   `pending/` as stamped; the upload thread makes one last pass; the service ends. What is
+   still in `pending/` goes on the next Start. Nothing uploads while the app is stopped.
+
+On Start, `unsynced/` segments left by earlier runs (the P2 spike, or a run killed by
+force-stop) move to `pending/` as stamped, `clock_synced: false`: their run's timeline is
+gone, so they cannot be re-stamped. Segments whose `device_id` is not the current device id
+(for example spike runs recorded as `s22` before the id was set to `lass22`, or a
+record-only run under the default id) are never uploaded and never deleted, in `unsynced/`
+or `pending/` alike: the server would answer `403` forever and block the queue. The uploader
+passes over them. Setting the device id (and token) back to theirs uploads them; or pull them
+with `adb pull` and PUT them with the matching token.
+
+A re-stamp that cannot be written (a full disk) leaves the segments in `unsynced/`, logs
+`spool: RELEASE FAILED ...`, and recording continues; they move to `pending/` as stamped at
+Stop.
+
+### What the log shows (P3 lines)
+
+- `upload: to <url>` at Start, or `upload: no server URL or token set, recording only`.
+- `spool: <n> earlier unsynced segments moved to pending as-is (clock_synced false), <m> of
+  other device ids left in unsynced/, ...` once at Start, if there were any.
+- `clock probe ok: rtt <ms>, first probe, device clock <ms> off server`, then every 5 min
+  `offset moved <ms>`. `clock probe failed: <reason>` while the server is unreachable
+  (`401`/`403` in the reason = token or device id wrong).
+- `clock synced: re-stamping <n> held segments`, then `spool: <n> re-stamped to pending ...`.
+- Per segment: `seg <i> cap epoch=... synced=true ...` then `uploaded <stem>: 201`
+  (`200` = the server already had it).
+- During an outage: `upload <stem>: no response ConnectException ...; retry <k> in <s> s`, and
+  after 10 min without a probe `clock: no probe for 10 min, new segments held in unsynced/`.
+  When the server is back: a probe, the re-stamp line, and a burst of `uploaded` lines in order.
+- `upload <stem> REJECTED <status>: <body> (moved to failed/)` is a contract problem; report it.
+- `upload: <n> segments of other device ids skipped (kept in the spool, not this token's
+  device)` whenever that count changes.
+- The 600-read capture summary ends in `clock_synced <bool>, held <n>`.
+
+### Confirm on oma
+
+```sh
+~/services/apps/roomlog/server/.venv/bin/roomlog status
+```
+
+The `devices:` block has a `lass22` line with `raw=<n> raw_pending=<m> last_raw=<start_utc>`;
+`raw` grows by about two per minute while the phone records and uploads, and `last_raw`
+stays within a minute or so of now. The `raw` line above it shows `failed=0`. After
+`raw_idle_s` (120 s) the worker segments the backlog into speech chunks; `roomlog search`
+then finds what was said.
+
+## Capture details
 
 In the first lines of a run, look for the routing callback. Android usually reports the
 initial route once; that must appear as `routing callback: <device> id=<n> unchanged,
@@ -78,13 +147,32 @@ Known limits of the capture clock (`CaptureClock`'s class doc has the detail):
 - The smallest loss that opens an epoch is just over 10 ms when `framePosition` counts dropped
   frames and just over 5 ms when it does not.
 
-Segments land in the app's external files dir, in `unsynced/` because the spike has no clock
-probe (`clock_synced: false`):
+The spool is in the app's external files dir: `pending/` (waiting to upload, deleted on
+ack), `unsynced/` (held for a probe, or another device id's), `failed/` (rejected). To look:
 
 ```sh
 mkdir -p ~/scratch
 adb pull /sdcard/Android/data/no.nyta.roomlog.spike/files/spool ~/scratch/spike-spool
 ls ~/scratch/spike-spool/unsynced/     # <start_utc compact>_<sha8>.opus + .json
+```
+
+## Test the upload path without the phone
+
+`LiveIngestTest` drives `Http`, `UploadLoop` and `UnsyncedHold` against a real ingest:
+an outage (nothing listening), the first probe, re-stamping held segments, PUT, ack,
+delete, and an idempotent re-PUT. Run a throwaway ingest on another loopback port with its
+own data dir and token, never the production one:
+
+```sh
+L=$(mktemp -d); mkdir $L/data $L/segs
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > $L/token
+printf 's22 = "%s"\n' "$(cat $L/token)" > $L/tokens.toml     # the segments' device_id
+printf '[paths]\ndata_dir = "%s/data"\ntokens_file = "%s/tokens.toml"\n[segmenter]\nvad = "energy"\n' $L $L > $L/server.toml
+cp ~/scratch/spike-spool/unsynced/* $L/segs/                  # real raw segments of one run
+(cd ../server && ROOMLOG_CONFIG=$L/server.toml ROOMLOG_BIND=127.0.0.1:18480 uv run roomlog ingest &)
+ROOMLOG_LIVE_URL=http://127.0.0.1:18480 ROOMLOG_LIVE_TOKEN_FILE=$L/token ROOMLOG_LIVE_SEGMENTS=$L/segs \
+  ./gradlew :core:test --tests '*LiveIngest*' --rerun-tasks -i
+(cd ../server && ROOMLOG_CONFIG=$L/server.toml uv run roomlog status && ROOMLOG_CONFIG=$L/server.toml uv run roomlog segment)
 ```
 
 ## Validate with the server's decoder (P2 pass criteria)
@@ -126,7 +214,8 @@ P2 checklist, in addition to the decode checks above:
 
 ## Ingest one segment by hand (P2)
 
-The spike does not upload, so P2 checks ingest with one pulled `.opus`/`.json` pair. This needs
+The app uploads by itself since P3; this is for checking a pulled `.opus`/`.json` pair, or
+sending segments left in `unsynced/` under another device id with that device's token. This needs
 a server that has the raw-segment support (`kind: "raw"`, merged separately from this client)
 and a bearer token configured on the server for the device id the spike ran with, saved in a
 file `token` (secrets stay out of the repo, e.g. under `~/.config/roomlog*/`).

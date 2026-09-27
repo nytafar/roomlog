@@ -5,7 +5,8 @@ import kotlin.random.Random
 
 /** Status → action and backoff, as `edge/src/roomlog_edge/uploader.py` and the contract's table. */
 object UploadPolicy {
-    enum class Action { ACK, FAIL, RETRY }
+    /** [SKIP] is the client's own: a segment of another device id, never sent (see [Uploader]). */
+    enum class Action { ACK, FAIL, RETRY, SKIP }
 
     fun classify(status: Int): Action = when (status) {
         200, 201 -> Action.ACK
@@ -25,6 +26,11 @@ object UploadPolicy {
  * is injected as [put] `(opus, metaWire, sha256) -> (status, body)`, which
  * throws [IOException] on connection errors and timeouts; the `:app` side
  * implements it with `HttpURLConnection` and a fixed-length body.
+ *
+ * With [deviceId] set, a segment whose sidecar names another device is
+ * skipped and kept, wherever it sits in the queue: the token belongs to one
+ * device, so the server would answer 403 forever and, since a pass stops at
+ * the first retry, hold every later segment behind it.
  */
 class Uploader(
     private val spool: Spool,
@@ -33,8 +39,9 @@ class Uploader(
     val idlePollS: Double = 5.0,
     private val rng: Random = Random.Default,
     private val nowNs: () -> Long = { System.currentTimeMillis() * 1_000_000 },
+    val deviceId: String? = null,
 ) {
-    data class Outcome(val action: UploadPolicy.Action, val status: Int?, val detail: String)
+    data class Outcome(val action: UploadPolicy.Action, val status: Int?, val detail: String, val stem: String = "")
 
     var failures = 0
         private set
@@ -47,7 +54,13 @@ class Uploader(
     var failedTotal = 0
         private set
 
-    fun uploadOne(entry: Spool.Entry): Outcome {
+    /** Segments of other device ids passed over in the last [runOnce]. */
+    var skippedForeign = 0
+        private set
+
+    fun uploadOne(entry: Spool.Entry): Outcome = uploadOneInner(entry).copy(stem = entry.stem)
+
+    private fun uploadOneInner(entry: Spool.Entry): Outcome {
         val meta: Map<String, Any?>
         val opus: ByteArray
         try {
@@ -59,6 +72,9 @@ class Uploader(
         } catch (e: IllegalArgumentException) { // JSON parse error
             spool.move(entry, "failed")
             return Outcome(UploadPolicy.Action.FAIL, null, "unreadable: $e")
+        }
+        if (deviceId != null && meta["device_id"] != deviceId) {
+            return Outcome(UploadPolicy.Action.SKIP, null, "device_id ${meta["device_id"]}")
         }
         val sha = meta["sha256"] as? String ?: run {
             spool.move(entry, "failed")
@@ -82,17 +98,22 @@ class Uploader(
                 spool.delete(entry)
             }
             UploadPolicy.Action.FAIL -> spool.move(entry, "failed")
-            UploadPolicy.Action.RETRY -> Unit
+            UploadPolicy.Action.RETRY, UploadPolicy.Action.SKIP -> Unit
         }
         return Outcome(action, status, detail)
     }
 
-    /** Upload pending files in order until one needs a retry. */
+    /** Upload pending files in order until one needs a retry. Skipped files are not in the result. */
     fun runOnce(maxFiles: Int? = null): List<Outcome> {
         val outcomes = mutableListOf<Outcome>()
+        var skipped = 0
         for ((i, entry) in spool.entries("pending").withIndex()) {
             if (maxFiles != null && i >= maxFiles) break
             val o = uploadOne(entry)
+            if (o.action == UploadPolicy.Action.SKIP) {
+                skipped++
+                continue
+            }
             outcomes += o
             when (o.action) {
                 UploadPolicy.Action.ACK -> {
@@ -110,8 +131,10 @@ class Uploader(
                     lastError = "${o.status}: ${o.detail}"
                     break
                 }
+                UploadPolicy.Action.SKIP -> Unit
             }
         }
+        skippedForeign = skipped
         return outcomes
     }
 

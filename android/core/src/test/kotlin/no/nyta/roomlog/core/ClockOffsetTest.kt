@@ -53,6 +53,42 @@ class ClockOffsetTest {
     }
 
     @Test
+    fun aSlowProbeDoesNotMoveAnEstablishedOffset() {
+        val c = ClockOffset()
+        val o = 1_790_000_000 * s - 1000 * s
+        c.record(1000 * s, 1000 * s + 40_000_000, 1000 * s + 20_000_000 + o)
+        assertEquals(o, c.offsetNs)
+        // 4.9 s round trip (radio waking, DNS + TCP + TLS), the server stamped at its very end:
+        // the midpoint would be 2.45 s off. The true offset is only known to lie in the
+        // interval, which contains the current one, so nothing moves; `synced` is refreshed.
+        val t0 = 1300 * s
+        val t1 = t0 + 4_900_000_000L
+        val p = c.record(t0, t1, t1 + o)!!
+        assertEquals(o, p.offsetNs)
+        assertEquals(t1, p.atMonoNs)
+        // and a timeline fed with it takes no step
+        val tl = Timeline()
+        var mono = 2000 * s
+        repeat(10) { mono += 100_000_000; tl.feed(Timeline.Block(1600, mono, mono + o, 100_000_000)) }
+        assertNull(tl.observeOffset(mono + c.offsetNs!!, mono))
+    }
+
+    @Test
+    fun aRealStepMovesTheOffsetToTheProbesInterval() {
+        val c = ClockOffset()
+        val o = 5_000 * s
+        c.record(1000 * s, 1000 * s + 40_000_000, 1000 * s + 20_000_000 + o)
+        // the server's clock stepped 2 s forward: a fast probe proves the old offset wrong
+        c.record(1300 * s, 1300 * s + 40_000_000, 1300 * s + 20_000_000 + o + 2 * s)
+        val moved = c.offsetNs!! - o
+        assertTrue(moved in (2 * s - 20_000_000)..(2 * s + 20_000_000), "moved $moved")
+        // drift just past the interval moves only as far as its edge
+        val before = c.offsetNs!!
+        c.record(1600 * s, 1600 * s + 10_000_000, 1600 * s + before + 15_000_000) // interval [before+5ms, before+15ms]
+        assertEquals(before + 5_000_000, c.offsetNs)
+    }
+
+    @Test
     fun offsetDrivesTimelineStepOnResync() {
         // Unsynced start on the device clock, then a probe: observeOffset re-stamps held segments.
         val tl = Timeline()

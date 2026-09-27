@@ -186,6 +186,33 @@ class UploaderTest {
     }
 
     @Test
+    fun otherDeviceIdsAreSkippedNotUploadedAndNeverBlockTheQueue() {
+        // An s22 segment at the head of pending/ (recorded before the id was set to lass22):
+        // the lass22 token would get 403 forever; it must be kept and passed over.
+        val sp = Spool(File(tmp, "spool"))
+        for ((i, dev) in listOf("s22", "lass22", "s22", "lass22").withIndex()) {
+            sp.write(
+                "OggS-$dev-$i".toByteArray(),
+                Sidecar.build(
+                    deviceId = dev, sha256 = "0".repeat(64), utcNs = 1_790_000_000_000_000_000L + i * 30_000_000_000L,
+                    nStart = i * 480000L, nSamples = 480000, runId = run, epoch = 0, discontinuity = false,
+                    clockStep = false, clockSynced = false, cutReason = "cap", vad = null, edgeVersion = "t", kind = "raw",
+                ),
+            )
+        }
+        val srv = FakeIngest(listOf(201 to null))
+        val up = Uploader(sp, srv::put, rng = Random(0), deviceId = "lass22")
+        val outs = up.runOnce()
+        assertEquals(listOf("OggS-lass22-1", "OggS-lass22-3"), srv.requests.map { it.opus.decodeToString() })
+        assertEquals(listOf(ACK, ACK), outs.map { it.action })
+        assertEquals(2, up.skippedForeign)
+        assertEquals(listOf("s22", "s22"), sp.entries("pending").map { it.readMeta()["device_id"] }) // kept
+        assertEquals(0, up.failures)
+        assertEquals(up.idlePollS, up.nextDelayS(up.runOnce())) // nothing left to do: idle, not busy
+        assertEquals(2, up.skippedForeign)
+    }
+
+    @Test
     fun classifyUnknownStatusIsRetry() {
         assertTrue(UploadPolicy.classify(418) == RETRY && UploadPolicy.classify(302) == RETRY)
         assertEquals(RETRY, UploadPolicy.classify(411)) // server: missing Content-Length; never failed/

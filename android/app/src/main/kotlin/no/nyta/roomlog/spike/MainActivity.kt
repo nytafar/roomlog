@@ -30,11 +30,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * P2 spike screen: device id, Start/Stop and the live log. Recording runs in
+ * Setup (device id, server URL, token), Start/Stop and the live log. Recording runs in
  * [CaptureService] (foreground, type microphone), so it survives the activity
  * being recreated, backgrounded or the screen turning off; this screen only
  * starts and stops it and shows [SpikeState].
@@ -56,6 +57,8 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
                     var deviceId by remember { mutableStateOf(Prefs.deviceId(this)) }
+                    var serverUrl by remember { mutableStateOf(Prefs.serverUrl(this)) }
+                    var tokenSet by remember { mutableStateOf(Prefs.token(this).isNotBlank()) }
                     Screen(
                         recording = SpikeState.recording.value,
                         lines = SpikeState.lines,
@@ -63,6 +66,16 @@ class MainActivity : ComponentActivity() {
                         onDeviceId = {
                             deviceId = it
                             Prefs.setDeviceId(this, it)
+                        },
+                        serverUrl = serverUrl,
+                        onServerUrl = {
+                            serverUrl = it
+                            Prefs.setServerUrl(this, it)
+                        },
+                        tokenSet = tokenSet,
+                        onToken = {
+                            Prefs.setToken(this, it)
+                            tokenSet = it.isNotBlank()
                         },
                         onStart = ::requestStart,
                         onStop = { CaptureService.stop(this) },
@@ -99,6 +112,10 @@ private fun Screen(
     lines: List<String>,
     deviceId: String,
     onDeviceId: (String) -> Unit,
+    serverUrl: String,
+    onServerUrl: (String) -> Unit,
+    tokenSet: Boolean,
+    onToken: (String) -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
 ) {
@@ -107,12 +124,36 @@ private fun Screen(
         if (lines.isNotEmpty()) listState.scrollToItem(lines.size - 1)
     }
     val valid = Prefs.valid(deviceId)
+    val urlValid = Prefs.validUrl(serverUrl)
+    // the stored token is never shown; typing here replaces it
+    var tokenInput by remember { mutableStateOf("") }
     Column(Modifier.fillMaxSize().safeDrawingPadding().padding(8.dp)) {
         OutlinedTextField(
             value = deviceId,
             onValueChange = { onDeviceId(it.trim().lowercase()) },
             label = { Text(if (valid) "device id" else "device id: a-z, 0-9 and -, max 63") },
             isError = !valid,
+            enabled = !recording,
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = serverUrl,
+            onValueChange = { onServerUrl(it.trim()) },
+            label = { Text(if (urlValid) "server URL" else "server URL: https://host:port") },
+            isError = !urlValid,
+            enabled = !recording,
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = tokenInput,
+            onValueChange = {
+                tokenInput = it.trim()
+                onToken(tokenInput)
+            },
+            label = { Text(if (tokenSet) "token: set (type to replace)" else "token: not set, recording only") },
+            visualTransformation = PasswordVisualTransformation(),
             enabled = !recording,
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),

@@ -41,18 +41,40 @@ object SpikeState {
     fun spoolDir(context: Context): File = File(context.getExternalFilesDir(null) ?: context.filesDir, "spool")
 }
 
-/** The spike's one setting: the device id the sidecars and tags carry. */
+/**
+ * Settings, in app-private shared preferences: the device id the sidecars and
+ * tags carry, and the server URL and bearer token for uploads. The token is
+ * never logged or shown back; the plan's Keystore-wrapped storage is v2.
+ */
 object Prefs {
     const val DEFAULT_DEVICE_ID = "s22"
+    const val DEFAULT_SERVER_URL = "https://oma.tailf63b9a.ts.net:8480"
     private val DEVICE_RE = Regex("^[a-z0-9][a-z0-9-]{0,62}$")
+    private val URL_RE = Regex("^https?://[^/\\s]+(/\\S*)?$")
 
     fun valid(id: String) = DEVICE_RE.matches(id)
 
+    fun validUrl(url: String) = URL_RE.matches(url)
+
+    private fun prefs(context: Context) = context.getSharedPreferences("spike", Context.MODE_PRIVATE)
+
     fun deviceId(context: Context): String =
-        context.getSharedPreferences("spike", Context.MODE_PRIVATE).getString("device_id", null)
-            ?.takeIf(::valid) ?: DEFAULT_DEVICE_ID
+        prefs(context).getString("device_id", null)?.takeIf(::valid) ?: DEFAULT_DEVICE_ID
 
     fun setDeviceId(context: Context, id: String) {
-        if (valid(id)) context.getSharedPreferences("spike", Context.MODE_PRIVATE).edit().putString("device_id", id).apply()
+        if (valid(id)) prefs(context).edit().putString("device_id", id).apply()
+    }
+
+    fun serverUrl(context: Context): String = prefs(context).getString("server_url", null) ?: DEFAULT_SERVER_URL
+
+    fun setServerUrl(context: Context, url: String) {
+        prefs(context).edit().putString("server_url", url).apply()
+    }
+
+    /** Empty when unset. */
+    fun token(context: Context): String = prefs(context).getString("token", null) ?: ""
+
+    fun setToken(context: Context, token: String) {
+        prefs(context).edit().putString("token", token).apply()
     }
 }

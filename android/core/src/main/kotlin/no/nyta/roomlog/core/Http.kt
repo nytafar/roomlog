@@ -1,19 +1,24 @@
-package no.nyta.roomlog.spike
+package no.nyta.roomlog.core
 
-import no.nyta.roomlog.core.Json
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * The `:app` side of the upload contract, for `Uploader.put` and
- * `ClockOffset.probe`. `HttpURLConnection` with a fixed-length body, so
- * `Content-Length` is always explicit (the server answers 411 to chunked
- * bodies). Connection errors and timeouts surface as [IOException], which
- * the uploader treats as retry. Not wired into the P2 spike, which does not
- * upload; P3 uses it.
+ * The HTTP side of the upload contract, for [Uploader]'s `put` and the
+ * `/v1/time` probe of [UploadLoop]. `HttpURLConnection` with a fixed-length
+ * body, so `Content-Length` is always explicit (the server answers 411 to
+ * chunked bodies). Connection errors and timeouts surface as [IOException],
+ * which the uploader treats as retry. Plain `java.net`, so it lives in
+ * `:core` and runs on the JVM against a real ingest (`LiveIngestTest`).
+ * The token never appears in exceptions or logs.
  */
-class Http(baseUrl: String, private val token: String, private val timeoutMs: Int = 30_000) {
+class Http(
+    baseUrl: String,
+    private val token: String,
+    private val timeoutMs: Int = 30_000,
+    private val connectTimeoutMs: Int = 10_000,
+) {
     private val base = baseUrl.trimEnd('/')
 
     init {
@@ -53,7 +58,7 @@ class Http(baseUrl: String, private val token: String, private val timeoutMs: In
     private fun open(path: String, method: String): HttpURLConnection =
         (URL(base + path).openConnection() as HttpURLConnection).apply {
             requestMethod = method
-            connectTimeout = timeoutMs
+            connectTimeout = connectTimeoutMs
             readTimeout = timeoutMs
             useCaches = false
             instanceFollowRedirects = false

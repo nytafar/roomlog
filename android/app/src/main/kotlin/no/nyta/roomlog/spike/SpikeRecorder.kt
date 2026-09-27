@@ -5,6 +5,7 @@ import android.media.AudioRecord
 import android.os.Process
 import android.os.SystemClock
 import no.nyta.roomlog.core.CaptureClock
+import no.nyta.roomlog.core.ClockOffset
 import no.nyta.roomlog.core.OggOpusWriter
 import no.nyta.roomlog.core.OpusHead
 import no.nyta.roomlog.core.RawSegmenter
@@ -13,14 +14,16 @@ import no.nyta.roomlog.core.SampleRing
 import no.nyta.roomlog.core.Sidecar
 import no.nyta.roomlog.core.Spool
 import no.nyta.roomlog.core.Timeline
+import no.nyta.roomlog.core.UnsyncedHold
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import kotlin.random.Random
 
 /**
- * The P2 codec spike: AudioRecord → Timeline → RawSegmenter → MediaCodec
- * Opus → OggOpusWriter → Spool, no upload.
+ * AudioRecord → Timeline → RawSegmenter → MediaCodec Opus → OggOpusWriter →
+ * Spool. Uploading is [no.nyta.roomlog.core.UploadLoop]'s job, on its own
+ * thread; this class only stamps and spools.
  *
  * Two threads. The capture thread (urgent-audio priority) does 100 ms
  * blocking reads, feeds the timeline and the segmenter, stamps closed
@@ -28,9 +31,14 @@ import kotlin.random.Random
  * never blocks on the codec. The encode thread owns the `MediaCodec`, the
  * writer and the spool.
  *
- * Timing: `mono` is `elapsedRealtimeNanos()` (BOOTTIME), `real` the device
- * wall clock, so `clock_synced` is false and segments go to `unsynced/`
- * (the spike has no `/v1/time` probe). Each block's capture time comes from
+ * Timing: `mono` is `elapsedRealtimeNanos()` (BOOTTIME). `real` is `mono`
+ * plus the server offset of the last `/v1/time` probe ([clock], ADR 0006),
+ * or the device wall clock before the first probe. A segment closed while
+ * the last probe is under ten minutes old is `clock_synced: true` and goes
+ * to `pending/`; otherwise it goes to `unsynced/` and [UnsyncedHold]
+ * re-stamps it through this run's timeline when a probe succeeds. On start,
+ * `unsynced/` leftovers of earlier runs move to `pending/` as they are; on
+ * stop, this run's still-held segments do too. Each block's capture time comes from
  * `AudioRecord.getTimestamp(TIMEBASE_BOOTTIME)`, taken after every read,
  * through [CaptureClock]: a stalled read thread is not loss, and loss is
  * detected from `framePosition` against frames read (AudioRecord has no
@@ -42,11 +50,15 @@ class SpikeRecorder(
     /** Goes into every sidecar and the ROOMLOG_DEVICE_ID tag; must match the server token's device. */
     private val deviceId: String,
     private val log: (String) -> Unit,
+    /** The server's clock, probed by the upload thread; read here per block. */
+    private val clock: ClockOffset,
+    /** Called on the encode thread whenever something may have landed in `pending/`. */
+    private val onSpooled: () -> Unit = {},
     /** Called on the encode thread once the last segment is spooled (or capture failed). */
     private val onFinished: (SpikeRecorder) -> Unit = {},
 ) {
     val runId: String = UUID.randomUUID().toString()
-    private val edgeVersion = "android-0.1.0-spike"
+    private val edgeVersion = EDGE_VERSION
     private val blockFrames = 1600 // 100 ms
 
     @Volatile
@@ -57,14 +69,18 @@ class SpikeRecorder(
     private sealed interface Cmd {
         data class Open(val epoch: Int, val nStart: Long, val discontinuity: Boolean) : Cmd
         data class Pcm(val n: Long, val samples: ShortArray) : Cmd
-        data class Close(val seg: RawSegmenter.Segment, val utcNs: Long, val clockStep: Boolean) : Cmd
+        data class Close(val seg: RawSegmenter.Segment, val utcNs: Long, val clockStep: Boolean, val synced: Boolean) : Cmd
+        data class Release(val restamps: Map<Long, UnsyncedHold.Restamp>) : Cmd
         data object Stop : Cmd
     }
 
     private val queue = LinkedBlockingQueue<Cmd>()
 
-    /** In-flight and unsynced-held segments whose anchors the timeline must keep. */
+    /** In-flight segments whose anchors the timeline must keep. */
     private val retention = Retention()
+
+    /** Segments stamped before a probe; capture thread only. */
+    private val hold = UnsyncedHold()
 
     fun start() {
         check(!running)
@@ -93,7 +109,7 @@ class SpikeRecorder(
         val ring = SampleRing(3 * 16000)
         val source = AudioSource(context, log)
         val buf = ShortArray(blockFrames)
-        var clock: CaptureClock? = null
+        var cclock: CaptureClock? = null
         var forceNewEpoch = false
         var blocks = 0L
         var maxLatenessNs = 0L
@@ -101,17 +117,18 @@ class SpikeRecorder(
         var tsFailures = 0
         try {
             source.open()
-            clock = CaptureClock(source.bufferFrames)
+            cclock = CaptureClock(source.bufferFrames)
             log("capture clock: buffer ${source.bufferFrames} frames")
             while (running) {
-                val got = source.read(buf, clock!!.nextReadFrames(blockFrames))
+                val got = source.read(buf, cclock!!.nextReadFrames(blockFrames))
                 val mono = SystemClock.elapsedRealtimeNanos()
-                val real = System.currentTimeMillis() * 1_000_000
+                val serverOffset = clock.offsetNs
+                val real = if (serverOffset != null) mono + serverOffset else System.currentTimeMillis() * 1_000_000
                 if (got == AudioRecord.ERROR_DEAD_OBJECT) {
                     log("AudioRecord dead object: reopening, next block starts a new epoch")
                     source.close()
                     source.open()
-                    clock = CaptureClock(source.bufferFrames)
+                    cclock = CaptureClock(source.bufferFrames)
                     forceNewEpoch = true
                     continue
                 }
@@ -122,9 +139,9 @@ class SpikeRecorder(
                 if (got == 0) continue
                 val ts = source.timestamp()
                 if (ts == null) tsFailures++
-                val step = clock.onRead(got, mono, real, ts)
+                val step = cclock.onRead(got, mono, real, ts)
                 step.event?.let { log("capture clock: $it") }
-                if (blocks == 20L && !clock.usingTimestamps) {
+                if (blocks == 20L && !cclock.usingTimestamps) {
                     log("WARNING: no getTimestamp(BOOTTIME) in 20 reads; stamping from arrival, stalls will look like loss")
                 }
                 if (source.routingChanged) {
@@ -142,16 +159,23 @@ class SpikeRecorder(
                     log("new epoch ${res.epoch} at n=${res.epochStartN} (lateness ${res.latenessNs / 1_000_000} ms)")
                 }
                 res.clockStepNs?.let { log("clock step ${it / 1_000_000} ms at n=${res.nStart}") }
+                val wasSynced = hold.synced
+                hold.update(clock.synced(mono), timeline, mono, clock.offsetNs)?.let { restamps ->
+                    log("clock synced: re-stamping ${restamps.size} held segments")
+                    queue.put(Cmd.Release(restamps))
+                }
+                if (wasSynced && !hold.synced) log("clock: no probe for 10 min, new segments held in unsynced/")
                 if (res.latenessNs > timeline.latenessLimitNs && !res.newEpoch) {
                     log("late block at n=${res.nStart}: ${res.latenessNs / 1_000_000} ms (held)")
                 }
                 dispatch(segmenter.feed(res), ring, timeline)
-                timeline.retainFromN = retention.retainFromN(segmenter.retainFromN)
+                timeline.retainFromN = minOf(retention.retainFromN(segmenter.retainFromN), hold.minHeldN ?: Long.MAX_VALUE)
                 if (blocks % 600 == 0L) {
                     log(
                         "capture: $blocks reads, last 600: max lateness ${maxLatenessNs / 1_000_000} ms, " +
                             "max arrival-capture ${maxAdcNs / 1_000_000} ms, timestamp failures $tsFailures, " +
-                            "outliers ${clock.outliers}, losses ${clock.losses}, counted lost ${clock.countedLost}",
+                            "outliers ${cclock.outliers}, losses ${cclock.losses}, counted lost ${cclock.countedLost}, " +
+                            "clock_synced ${hold.synced}, held ${hold.heldCount}",
                     )
                     maxLatenessNs = 0
                     maxAdcNs = 0
@@ -181,7 +205,8 @@ class SpikeRecorder(
                 is RawSegmenter.Event.Close -> {
                     val s = e.segment
                     retention.startInflight(s.nStart)
-                    queue.put(Cmd.Close(s, timeline.utcNs(s.nStart, s.epoch), timeline.steppedIn(s.nStart, s.nEnd)))
+                    val synced = hold.onClose(s.nStart, s.epoch, timeline)
+                    queue.put(Cmd.Close(s, timeline.utcNs(s.nStart, s.epoch), timeline.steppedIn(s.nStart, s.nEnd), synced))
                 }
             }
         }
@@ -194,6 +219,21 @@ class SpikeRecorder(
         val spool = Spool(spoolDir, minFreeFraction = 0.002)
         val cleaned = spool.cleanupTmp()
         if (cleaned > 0) log("spool: cleaned $cleaned leftover files")
+        try {
+            // Earlier runs' unsynced/ segments: their timeline is gone, so they go as
+            // stamped (device clock, clock_synced false). Other devices' stay put.
+            val r = UnsyncedHold.release(spool, runId, deviceId)
+            if (r.moved + r.foreign + r.failed > 0) {
+                log(
+                    "spool: ${r.moved} earlier unsynced segments moved to pending as-is (clock_synced false), " +
+                        "${r.foreign} of other device ids left in unsynced/, ${r.failed} unreadable to failed/",
+                )
+            }
+            if (r.errors > 0) log("spool: ${r.errors} earlier unsynced segments could not be moved: ${r.firstError}")
+            onSpooled()
+        } catch (e: Exception) {
+            log("spool: releasing earlier unsynced segments failed: $e")
+        }
         var encoder: OpusEncoder? = null
         var packets = mutableListOf<ByteArray>()
         var open: Cmd.Open? = null
@@ -216,9 +256,12 @@ class SpikeRecorder(
                         }
                         open = null
                     }
+                    is Cmd.Release -> release(spool, c.restamps, releaseOwn = false)
                     Cmd.Stop -> break
                 }
             }
+            // held segments of this run that never saw a probe go as stamped
+            release(spool, emptyMap(), releaseOwn = true)
         } catch (e: Exception) {
             log("encode failed: $e")
             // keep draining so the capture thread never blocks on a full queue
@@ -229,6 +272,22 @@ class SpikeRecorder(
             log("spool: pending=${st.pendingFiles} unsynced=${st.unsyncedFiles} failed=${st.failedFiles} bytes=${st.totalBytes}")
             onFinished(this)
         }
+    }
+
+    /** Never throws: a failed release must not end encoding for the rest of the run. */
+    private fun release(spool: Spool, restamps: Map<Long, UnsyncedHold.Restamp>, releaseOwn: Boolean) {
+        try {
+            val r = UnsyncedHold.release(spool, runId, deviceId, restamps, releaseOwn)
+            if (r.restamped + r.moved + r.failed + r.errors > 0 || restamps.isNotEmpty()) {
+                log("spool: ${r.restamped} re-stamped to pending, ${r.moved} moved as-is, ${r.failed} unreadable, ${r.kept} still held")
+            }
+            if (r.errors > 0) {
+                log("spool: RELEASE FAILED for ${r.errors} segments, left in unsynced/ (moved as stamped at Stop): ${r.firstError}")
+            }
+        } catch (e: Exception) {
+            log("spool: RELEASE FAILED: $e; segments stay in unsynced/, recording continues")
+        }
+        onSpooled()
     }
 
     private fun finishSegment(
@@ -257,16 +316,15 @@ class SpikeRecorder(
         val meta = Sidecar.build(
             deviceId = deviceId, sha256 = "0".repeat(64), utcNs = c.utcNs, nStart = seg.nStart,
             nSamples = seg.nSamples, runId = runId, epoch = seg.epoch, discontinuity = seg.discontinuity,
-            clockStep = c.clockStep, clockSynced = false, cutReason = seg.reason.wire, vad = null,
+            clockStep = c.clockStep, clockSynced = c.synced, cutReason = seg.reason.wire, vad = null,
             edgeVersion = edgeVersion, kind = "raw",
         )
         if (!spool.diskOk()) {
             log("seg $index: spool full or disk low, segment dropped (nothing deleted)")
             return
         }
-        val entry = spool.write(bytes, meta, dest = "unsynced")
-        // re-stamped through this run's timeline when a /v1/time probe succeeds (P3)
-        retention.hold(entry.stem, seg.nStart)
+        val entry = spool.write(bytes, meta, dest = if (c.synced) "pending" else "unsynced")
+        onSpooled()
         val sha = Spool.sha256Hex(bytes)
         val problems = Sidecar.validate(entry.readMeta())
         log(
@@ -274,12 +332,14 @@ class SpikeRecorder(
                 "bytes=${bytes.size} sha8=${sha.take(8)} packets=${packets.size} " +
                 "(min ${sizes.minOrNull()} max ${sizes.maxOrNull()} B) cover48=${writer.totalSamples48} " +
                 "need48=${preSkip + 3 * seg.nSamples} preSkip=$preSkip pad=$pad disc=${seg.discontinuity} " +
-                "start=${Sidecar.formatUtc(c.utcNs)} close ${SystemClock.elapsedRealtime() - t0} ms" +
+                "start=${Sidecar.formatUtc(c.utcNs)} synced=${c.synced} close ${SystemClock.elapsedRealtime() - t0} ms" +
                 if (problems.isEmpty()) "" else " SIDECAR INVALID $problems",
         )
     }
 
     companion object {
+        const val EDGE_VERSION = "android-0.2.0"
+
         /** libopus's lookahead at 48 kHz (6.5 ms), used only if the codec reports no CSD. */
         const val DEFAULT_PRE_SKIP = 312
     }
