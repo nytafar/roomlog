@@ -34,7 +34,7 @@ class Uploader(
     private val rng: Random = Random.Default,
     private val nowNs: () -> Long = { System.currentTimeMillis() * 1_000_000 },
 ) {
-    data class Outcome(val action: UploadPolicy.Action, val status: Int?, val detail: String)
+    data class Outcome(val action: UploadPolicy.Action, val status: Int?, val detail: String, val stem: String = "")
 
     var failures = 0
         private set
@@ -47,7 +47,9 @@ class Uploader(
     var failedTotal = 0
         private set
 
-    fun uploadOne(entry: Spool.Entry): Outcome {
+    fun uploadOne(entry: Spool.Entry): Outcome = uploadOneInner(entry).copy(stem = entry.stem)
+
+    private fun uploadOneInner(entry: Spool.Entry): Outcome {
         val meta: Map<String, Any?>
         val opus: ByteArray
         try {

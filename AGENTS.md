@@ -10,7 +10,7 @@ Two independent Python packages plus a shared contract. Docs, ADRs and plans liv
 | `server/` | server track | `roomlog-server` package: ingest, DB, worker, sessions, CLI, MCP |
 | `deploy/edge/`, `deploy/server/` | same as above | install scripts, systemd units, example configs |
 | `tests/e2e/` | shared | edge → ingest → worker → search, in-process |
-| `android/` | android track | Gradle project: `:core` (pure Kotlin mirrors of timeline, sidecar, spool, uploader, plus the Ogg Opus writer and raw segmenter) and `:app` (Compose; currently the P2 codec spike). Gate, with JDK 21 as `JAVA_HOME`: `./gradlew :core:test :app:assembleDebug`; see `android/README.md` |
+| `android/` | android track | Gradle project: `:core` (pure Kotlin mirrors of timeline, sidecar, spool, uploader, plus the Ogg Opus writer, raw segmenter, unsynced hold and upload loop) and `:app` (Compose; the P3 client: records, spools and uploads). Gate, with JDK 21 as `JAVA_HOME`: `./gradlew :core:test :app:assembleDebug`; see `android/README.md` |
 
 Each package is a standalone uv project (`pyproject.toml`, `src/` layout, `tests/`,
 `requires-python >= 3.11`; the server pins 3.12 in `.python-version`). Gate before commit,

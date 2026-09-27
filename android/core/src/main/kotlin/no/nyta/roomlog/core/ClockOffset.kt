@@ -17,7 +17,8 @@ class ClockOffset(
 ) {
     data class Probe(val offsetNs: Long, val rttNs: Long, val atMonoNs: Long)
 
-    /** The last successful probe, if any. */
+    /** The last successful probe, if any. Written by the upload thread, read by the capture thread. */
+    @Volatile
     var last: Probe? = null
         private set
 

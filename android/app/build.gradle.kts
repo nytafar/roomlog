@@ -18,8 +18,8 @@ android {
         applicationId = "no.nyta.roomlog.spike"
         minSdk = 29
         targetSdk = 35
-        versionCode = System.getenv("ROOMLOG_VERSION_CODE")?.toIntOrNull() ?: 1
-        versionName = System.getenv("ROOMLOG_VERSION")?.takeIf { it.isNotBlank() } ?: "0.1.0-spike"
+        versionCode = System.getenv("ROOMLOG_VERSION_CODE")?.toIntOrNull() ?: 4
+        versionName = System.getenv("ROOMLOG_VERSION")?.takeIf { it.isNotBlank() } ?: "0.2.0-p3"
     }
 
     signingConfigs {
