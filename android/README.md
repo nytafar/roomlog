@@ -136,7 +136,7 @@ cd ~/scratch/spike-spool/unsynced
 f=20260926T101532417Z_9f2c1a3b        # one pair: $f.opus and $f.json
 sha=$(sha256sum "$f.opus" | cut -d' ' -f1)
 meta=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), ensure_ascii=True, separators=(",",":")))' "$f.json")
-curl -sS -w '\nHTTP %{http_code}\n' -X PUT "https://oma.tailf63b9a.ts.net/v1/chunks/$sha" \
+curl -sS -w '\nHTTP %{http_code}\n' -X PUT "https://oma.tailf63b9a.ts.net:8480/v1/chunks/$sha" \
   -H "Authorization: Bearer $(cat token)" \
   -H 'Content-Type: audio/ogg' \
   -H "X-Roomlog-Meta: $meta" \

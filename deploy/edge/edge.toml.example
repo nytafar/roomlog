@@ -3,7 +3,7 @@
 # System-mode install (the Pi):         /etc/roomlog/edge.toml
 
 device_id = "oma"                              # [a-z0-9-], matches the server's token entry
-server_url = "https://oma.tailf63b9a.ts.net"   # full base URL; HTTPS via tailscale serve (ADR 0007)
+server_url = "https://oma.tailf63b9a.ts.net:8480"   # full base URL; HTTPS via tailscale serve (ADR 0007; 8480 because 443 is taken on oma)
 
 token_file = "~/.config/roomlog-edge/token"    # bearer token, one line, mode 0600
 spool_dir = "~/.local/share/roomlog-edge/spool"
