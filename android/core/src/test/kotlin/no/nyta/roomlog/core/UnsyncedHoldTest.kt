@@ -119,4 +119,28 @@ class UnsyncedHoldTest {
         assertEquals(listOf("s22"), sp.entries("unsynced").map { it.readMeta()["device_id"] })
         assertEquals(3, sp.entries("pending").size)
     }
+
+    @Test
+    fun aFailedMoveLeavesTheSegmentHeldAndDoesNotThrow() {
+        val sp = Spool(File(tmp, "spool"))
+        seg(sp, run, 0)
+        seg(sp, run, 480000)
+        val pending = sp.dir("pending")
+        pending.setWritable(false) // stands in for a full disk
+        try {
+            val r = UnsyncedHold.release(
+                sp, run, "lass22",
+                mapOf(0L to UnsyncedHold.Restamp(1_790_000_100_000_000_000L, false), 480000L to UnsyncedHold.Restamp(1_790_000_130_000_000_000L, false)),
+            )
+            assertEquals(2, r.errors)
+            assertEquals(0, r.restamped)
+            assertEquals(2, sp.entries("unsynced").size) // audio untouched, still there
+        } finally {
+            pending.setWritable(true)
+        }
+        // released as stamped at shutdown once the disk has room again
+        assertEquals(2, UnsyncedHold.release(sp, run, "lass22", releaseOwn = true).moved)
+        sp.cleanupTmp()
+        assertEquals(2, sp.entries("pending").size)
+    }
 }

@@ -113,6 +113,29 @@ class UploadLoopTest {
     }
 
     @Test
+    fun foreignSegmentsAreLoggedOnceNotEveryPass() {
+        val sp = Spool(File(tmp, "spool"))
+        sp.write(
+            "OggS-s22".toByteArray(),
+            Sidecar.build(
+                deviceId = "s22", sha256 = "0".repeat(64), utcNs = serverOffset, nStart = 0, nSamples = 480000,
+                runId = "old", epoch = 0, discontinuity = false, clockStep = false, clockSynced = false,
+                cutReason = "cap", vad = null, edgeVersion = "t", kind = "raw",
+            ),
+        )
+        spoolSegment(sp)
+        val net = Net()
+        val l = UploadLoop(
+            Uploader(sp, net::put, deviceId = "lass22"), ClockOffset(),
+            fetchServerUtcNs = { mono + serverOffset }, monoNow = { mono }, log = { logs += it },
+        )
+        repeat(3) { assertFalse(l.step().backoff) }
+        assertEquals(listOf("OggS-seg-0"), net.puts)
+        assertEquals(1, logs.count { it.contains("other device ids") })
+        assertEquals(1, sp.stats().pendingFiles)
+    }
+
+    @Test
     fun probeSchedule() {
         val sp = Spool(File(tmp, "spool"))
         val net = Net()
@@ -133,6 +156,25 @@ class UploadLoopTest {
         mono += 1_000_000_000L
         l.step()
         assertEquals(3, net.probes) // failed probes retry every 30 s
+    }
+
+    @Test
+    fun aSlowProbeIsFollowedByASecondOnTheWarmConnection() {
+        val sp = Spool(File(tmp, "spool"))
+        val rtts = ArrayDeque(listOf(900_000_000L, 20_000_000L))
+        var fetches = 0
+        val clock = ClockOffset()
+        val l = UploadLoop(
+            Uploader(sp, Net()::put), clock,
+            fetchServerUtcNs = { fetches++; mono += rtts.removeFirst(); serverOffset + mono },
+            monoNow = { mono }, log = { logs += it },
+        )
+        val p = l.probe()!!
+        assertEquals(2, fetches)
+        assertEquals(20_000_000L, p.rttNs)
+        // the server stamped at the end of both round trips (true offset = serverOffset): the first
+        // probe's midpoint is 450 ms off, the second clamps it into its 20 ms wide interval
+        assertEquals(serverOffset + 20_000_000L, clock.offsetNs)
     }
 
     @Test

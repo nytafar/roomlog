@@ -61,7 +61,16 @@ class UnsyncedHold {
         return synced
     }
 
-    data class Released(val restamped: Int, val moved: Int, val foreign: Int, val failed: Int, val kept: Int)
+    data class Released(
+        val restamped: Int,
+        val moved: Int,
+        val foreign: Int,
+        val failed: Int,
+        val kept: Int,
+        /** Entries a rename or write failed for (a full disk): left where they are, not retried here. */
+        val errors: Int = 0,
+        val firstError: String? = null,
+    )
 
     companion object {
         /**
@@ -77,6 +86,11 @@ class UnsyncedHold {
          * - Entries whose `device_id` is not [deviceId] stay in `unsynced/`:
          *   the server would answer 403 forever and block the queue behind them.
          * - An unreadable sidecar moves the pair to `failed/`.
+         *
+         * An I/O error on one entry (a full disk) is counted in [Released.errors]
+         * and the entry is left where it is; the rest are still handled. A held
+         * entry that failed here is released as stamped at shutdown, and
+         * [Spool.cleanupTmp] finishes or removes a half-done rewrite.
          */
         fun release(
             spool: Spool,
@@ -90,6 +104,8 @@ class UnsyncedHold {
             var foreign = 0
             var failed = 0
             var kept = 0
+            var errors = 0
+            var firstError: String? = null
             for (entry in spool.entries("unsynced")) {
                 val meta = try {
                     entry.readMeta()
@@ -99,8 +115,13 @@ class UnsyncedHold {
                     null
                 }
                 if (meta == null) {
-                    spool.move(entry, "failed")
-                    failed++
+                    try {
+                        spool.move(entry, "failed")
+                        failed++
+                    } catch (e: IOException) {
+                        errors++
+                        if (firstError == null) firstError = "${entry.stem}: $e"
+                    }
                     continue
                 }
                 if (meta["device_id"] != deviceId) {
@@ -109,22 +130,27 @@ class UnsyncedHold {
                 }
                 val nStart = meta["n_start"] as? Long
                 val r = if (meta["run_id"] == runId && nStart != null) restamps[nStart] else null
-                when {
-                    r != null -> {
-                        meta["start_utc"] = Sidecar.formatUtc(r.utcNs)
-                        meta["clock_synced"] = true
-                        if (r.clockStep) meta["clock_step"] = true
-                        spool.rewriteMeta(entry, meta, "pending")
-                        restamped++
+                try {
+                    when {
+                        r != null -> {
+                            meta["start_utc"] = Sidecar.formatUtc(r.utcNs)
+                            meta["clock_synced"] = true
+                            if (r.clockStep) meta["clock_step"] = true
+                            spool.rewriteMeta(entry, meta, "pending")
+                            restamped++
+                        }
+                        meta["run_id"] == runId && !releaseOwn -> kept++
+                        else -> {
+                            spool.move(entry, "pending")
+                            moved++
+                        }
                     }
-                    meta["run_id"] == runId && !releaseOwn -> kept++
-                    else -> {
-                        spool.move(entry, "pending")
-                        moved++
-                    }
+                } catch (e: IOException) {
+                    errors++
+                    if (firstError == null) firstError = "${entry.stem}: $e"
                 }
             }
-            return Released(restamped, moved, foreign, failed, kept)
+            return Released(restamped, moved, foreign, failed, kept, errors, firstError)
         }
     }
 }

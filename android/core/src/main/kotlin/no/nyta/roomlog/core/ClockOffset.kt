@@ -8,6 +8,15 @@ package no.nyta.roomlog.core
  * server stamped `serverUtcNs` somewhere inside `[tSendMono, tRecvMono]`;
  * assuming the midpoint, `offset = serverUtc − (tSend + tRecv)/2` is the
  * `real − mono` term the timeline stamps with, accurate to ± rtt/2.
+ *
+ * Only the first probe takes the midpoint. After that a probe proves only
+ * that the true offset lies in `[serverUtc − tRecv, serverUtc − tSend]`, so
+ * the offset kept is the previous one clamped into that interval. A slow
+ * probe (a waking radio, a fresh TLS connection, a relayed path) gives a
+ * wide interval that contains the current offset, and nothing moves: before
+ * this rule, one 5 s round trip could step the whole timeline by 2.5 s. A
+ * real step or drift lies outside the interval, and the offset moves to its
+ * nearer edge, no further than the evidence requires.
  */
 class ClockOffset(
     /** A probe older than this no longer makes the clock "synced" (contract: ten minutes). */
@@ -29,8 +38,13 @@ class ClockOffset(
     fun record(tSendMono: Long, tRecvMono: Long, serverUtcNs: Long): Probe? {
         val rtt = tRecvMono - tSendMono
         if (rtt < 0 || rtt > maxRttNs) return null
-        val mid = tSendMono + rtt / 2
-        return Probe(serverUtcNs - mid, rtt, tRecvMono).also { last = it }
+        val prev = last
+        val offset = if (prev == null) {
+            serverUtcNs - (tSendMono + rtt / 2)
+        } else {
+            prev.offsetNs.coerceIn(serverUtcNs - tRecvMono, serverUtcNs - tSendMono)
+        }
+        return Probe(offset, rtt, tRecvMono).also { last = it }
     }
 
     /**

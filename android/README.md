@@ -68,7 +68,11 @@ background start to use the microphone); a "recording stopped" notification appe
    `200`/`201` whose body carries the same sha256. `409`/`413`/`422` move it to `failed/`.
    Anything else (no network, `401`, `403`, `5xx`) keeps it and backs off
    `min(300 s, 2^k)` with full jitter; the queue waits behind it. Uploads run on any network.
-4. Probes run at start, every 5 minutes while they succeed, every 30 s while they fail.
+4. Probes run at start, every 5 minutes while they succeed, every 30 s while they fail; a
+   probe slower than 100 ms is followed at once by a second. Only the first probe's
+   midpoint is taken as the offset; after that the offset is kept unless a probe's round-trip
+   interval excludes it, and then it moves only to that interval's edge. A slow probe
+   therefore refreshes `clock_synced` without moving the timeline.
 5. Stop: the shutdown segment is cut; held segments that never saw a probe move to
    `pending/` as stamped; the upload thread makes one last pass; the service ends. What is
    still in `pending/` goes on the next Start. Nothing uploads while the app is stopped.
@@ -76,9 +80,15 @@ background start to use the microphone); a "recording stopped" notification appe
 On Start, `unsynced/` segments left by earlier runs (the P2 spike, or a run killed by
 force-stop) move to `pending/` as stamped, `clock_synced: false`: their run's timeline is
 gone, so they cannot be re-stamped. Segments whose `device_id` is not the current device id
-(for example spike runs recorded as `s22` before the id was set to `lass22`) stay in
-`unsynced/` and are never uploaded, since the server would answer `403` forever and block
-the queue. Pull them with `adb pull` if they are wanted, and PUT them with the matching token.
+(for example spike runs recorded as `s22` before the id was set to `lass22`, or a
+record-only run under the default id) are never uploaded and never deleted, in `unsynced/`
+or `pending/` alike: the server would answer `403` forever and block the queue. The uploader
+passes over them. Setting the device id (and token) back to theirs uploads them; or pull them
+with `adb pull` and PUT them with the matching token.
+
+A re-stamp that cannot be written (a full disk) leaves the segments in `unsynced/`, logs
+`spool: RELEASE FAILED ...`, and recording continues; they move to `pending/` as stamped at
+Stop.
 
 ### What the log shows (P3 lines)
 
@@ -95,6 +105,8 @@ the queue. Pull them with `adb pull` if they are wanted, and PUT them with the m
   after 10 min without a probe `clock: no probe for 10 min, new segments held in unsynced/`.
   When the server is back: a probe, the re-stamp line, and a burst of `uploaded` lines in order.
 - `upload <stem> REJECTED <status>: <body> (moved to failed/)` is a contract problem; report it.
+- `upload: <n> segments of other device ids skipped (kept in the spool, not this token's
+  device)` whenever that count changes.
 - The 600-read capture summary ends in `clock_synced <bool>, held <n>`.
 
 ### Confirm on oma

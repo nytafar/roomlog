@@ -85,7 +85,7 @@ class CaptureService : Service() {
             return START_NOT_STICKY
         }
         val clock = ClockOffset()
-        val loop = startUploads(clock)
+        val loop = startUploads(clock, deviceId)
         val r = SpikeRecorder(
             applicationContext, SpikeState.spoolDir(this), deviceId, SpikeState::log, clock,
             onSpooled = { loop?.wake() },
@@ -99,7 +99,7 @@ class CaptureService : Service() {
     }
 
     /** The upload thread, if a server URL and token are set. */
-    private fun startUploads(clock: ClockOffset): UploadLoop? {
+    private fun startUploads(clock: ClockOffset, deviceId: String): UploadLoop? {
         val url = Prefs.serverUrl(this)
         val token = Prefs.token(this)
         if (token.isBlank() || !Prefs.validUrl(url)) {
@@ -114,7 +114,7 @@ class CaptureService : Service() {
         }
         val spool = Spool(SpikeState.spoolDir(this), minFreeFraction = 0.002)
         val loop = UploadLoop(
-            Uploader(spool, http::put, idlePollS = 60.0),
+            Uploader(spool, http::put, idlePollS = 60.0, deviceId = deviceId),
             clock,
             fetchServerUtcNs = http::serverUtcNs,
             monoNow = SystemClock::elapsedRealtimeNanos,

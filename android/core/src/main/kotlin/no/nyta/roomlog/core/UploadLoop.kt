@@ -8,7 +8,9 @@ import java.util.concurrent.TimeUnit
  * [Uploader] passes over `pending/`, with the uploader's backoff on retries.
  *
  * Probing: first pass at once, then every [probeIntervalNs] while probes
- * succeed and every [probeRetryNs] while they fail. [ClockOffset] keeps the
+ * succeed and every [probeRetryNs] while they fail. A probe slower than
+ * [burstAboveRttNs] is followed at once by a second, which usually rides the
+ * warm connection and narrows [ClockOffset]'s interval. [ClockOffset] keeps the
  * last success; the capture thread reads it (offset and `synced`) and does
  * the re-stamping itself, since it owns the timeline.
  *
@@ -30,11 +32,13 @@ class UploadLoop(
     private val realNow: (() -> Long)? = null,
     val probeIntervalNs: Long = 5 * 60 * NS,
     val probeRetryNs: Long = 30 * NS,
+    val burstAboveRttNs: Long = 100 * MS,
 ) {
     data class Next(val delayS: Double, val backoff: Boolean)
 
     private var lastAttemptNs: Long? = null
     private var lastOk = false
+    private var lastSkipped = 0
     private val signal = Semaphore(0)
 
     @Volatile
@@ -46,9 +50,15 @@ class UploadLoop(
         return nowMono - last >= if (lastOk) probeIntervalNs else probeRetryNs
     }
 
-    /** One probe, logged. Returns the accepted probe or null. */
+    /** One probe, plus a second if the first was slow; logged. Returns the last accepted probe or null. */
     fun probe(): ClockOffset.Probe? {
         val prev = clock.last
+        val first = probeOnce(prev) ?: return null
+        if (first.rttNs <= burstAboveRttNs) return first
+        return probeOnce(clock.last) ?: first
+    }
+
+    private fun probeOnce(prev: ClockOffset.Probe?): ClockOffset.Probe? {
         val t0 = monoNow()
         lastAttemptNs = t0
         val server = try {
@@ -81,8 +91,12 @@ class UploadLoop(
             when (o.action) {
                 UploadPolicy.Action.ACK -> log("uploaded ${o.stem}: ${o.status}")
                 UploadPolicy.Action.FAIL -> log("upload ${o.stem} REJECTED ${o.status}: ${o.detail} (moved to failed/)")
-                UploadPolicy.Action.RETRY -> Unit
+                UploadPolicy.Action.RETRY, UploadPolicy.Action.SKIP -> Unit
             }
+        }
+        if (uploader.skippedForeign != lastSkipped) {
+            lastSkipped = uploader.skippedForeign
+            log("upload: $lastSkipped segments of other device ids skipped (kept in the spool, not this token's device)")
         }
         val backoff = outs.lastOrNull()?.action == UploadPolicy.Action.RETRY
         val d = uploader.nextDelayS(outs)

@@ -229,6 +229,7 @@ class SpikeRecorder(
                         "${r.foreign} of other device ids left in unsynced/, ${r.failed} unreadable to failed/",
                 )
             }
+            if (r.errors > 0) log("spool: ${r.errors} earlier unsynced segments could not be moved: ${r.firstError}")
             onSpooled()
         } catch (e: Exception) {
             log("spool: releasing earlier unsynced segments failed: $e")
@@ -273,10 +274,18 @@ class SpikeRecorder(
         }
     }
 
+    /** Never throws: a failed release must not end encoding for the rest of the run. */
     private fun release(spool: Spool, restamps: Map<Long, UnsyncedHold.Restamp>, releaseOwn: Boolean) {
-        val r = UnsyncedHold.release(spool, runId, deviceId, restamps, releaseOwn)
-        if (r.restamped + r.moved + r.failed > 0 || restamps.isNotEmpty()) {
-            log("spool: ${r.restamped} re-stamped to pending, ${r.moved} moved as-is, ${r.failed} unreadable, ${r.kept} still held")
+        try {
+            val r = UnsyncedHold.release(spool, runId, deviceId, restamps, releaseOwn)
+            if (r.restamped + r.moved + r.failed + r.errors > 0 || restamps.isNotEmpty()) {
+                log("spool: ${r.restamped} re-stamped to pending, ${r.moved} moved as-is, ${r.failed} unreadable, ${r.kept} still held")
+            }
+            if (r.errors > 0) {
+                log("spool: RELEASE FAILED for ${r.errors} segments, left in unsynced/ (moved as stamped at Stop): ${r.firstError}")
+            }
+        } catch (e: Exception) {
+            log("spool: RELEASE FAILED: $e; segments stay in unsynced/, recording continues")
         }
         onSpooled()
     }
