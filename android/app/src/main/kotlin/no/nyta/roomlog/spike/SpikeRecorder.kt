@@ -190,7 +190,8 @@ class SpikeRecorder(
     // -- encode thread -------------------------------------------------------
 
     private fun encodeLoop() {
-        val spool = Spool(spoolDir)
+        // the edge's 5% floor is 11 GB on a 225 GB phone; 0.2% (~450 MB) still leaves room
+        val spool = Spool(spoolDir, minFreeFraction = 0.002)
         val cleaned = spool.cleanupTmp()
         if (cleaned > 0) log("spool: cleaned $cleaned leftover files")
         var encoder: OpusEncoder? = null
