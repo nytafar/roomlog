@@ -104,7 +104,7 @@ async function login(event) {
       0,
       ...info.sources.map((source) => source.last_known_ms || 0),
     );
-    if (last) state.date = localDate(Math.max(0, last - 1));
+    if (last) state.date = localDate(last);
     if (info.sources.length === 1) state.source = info.sources[0].device_id;
     $("#source").value = state.source;
     $("#login").hidden = true;
@@ -337,7 +337,7 @@ $("#latest").onclick = async () => {
     );
     navigate(
       state.level,
-      localDate(latest ? latest - 1 : Date.now()),
+      localDate(latest || Date.now()),
       state.source,
     );
   } catch (error) {

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { clipFromUnits, units } from "../adapter.mjs";
 import {
   groupBounds,
   selectionUnits,
@@ -76,4 +77,35 @@ test("range selections respect half-open edges and point events", () => {
     intersectsSelection({ ...all[1], start_utc_ms: 30, end_utc_ms: 30 }, range),
     false,
   );
+});
+
+test("point selections highlight only point units, keeping handle anchors on the quote", () => {
+  const row = {
+    device_id: "a",
+    segment_id: "point-and-word",
+    text: "A B",
+    timing: "word",
+    start_utc_ms: 10,
+    end_utc_ms: 20,
+    words: [
+      { text: "A", start_utc_ms: 10, end_utc_ms: 10 },
+      { text: "B", start_utc_ms: 10, end_utc_ms: 20 },
+    ],
+  };
+  const [point, word] = units(row);
+  const candidates = [point, word, { ...point, device_id: "b" }];
+  const clip = clipFromUnits(
+    selectionUnits(candidates, 0, 0, "a"),
+    [row],
+    100,
+  );
+  assert.equal(clip.quoted_text, "A");
+  assert.equal(clip.from_ms, clip.to_ms);
+  // Highlighting and IN/OUT handle anchors use the same predicate.
+  assert.deepEqual(
+    candidates.map((unit) => intersectsSelection(unit, clip)),
+    [true, false, false],
+  );
+  assert.equal(intersectsSelection({ ...point, start_utc_ms: 9 }, clip), false);
+  assert.equal(intersectsSelection(word, { ...clip, to_ms: 20 }), true);
 });

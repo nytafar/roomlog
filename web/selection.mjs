@@ -51,7 +51,10 @@ export function intersectsSelection(unit, selection) {
   if (!unit || !selection || unit.device_id !== selection.device_id)
     return false;
   if (selection.from_ms === selection.to_ms)
-    return unit.start_utc_ms === selection.from_ms;
+    return (
+      unit.start_utc_ms === selection.from_ms &&
+      unit.end_utc_ms === selection.to_ms
+    );
   return (
     unit.start_utc_ms < selection.to_ms &&
     (unit.end_utc_ms > selection.from_ms ||
