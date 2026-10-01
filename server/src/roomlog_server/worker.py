@@ -9,8 +9,10 @@ Dictation (ADR 0008): pending spans are applied before chunks are claimed (the s
 becomes a `channel=dictation` row; STT rows already written for that time are marked
 superseded). A chunk is claimed only once its end is `dictation_hold_s` old, so the span
 usually wins. Audio inside a span is zeroed before STT, and a chunk with under
-`MIN_UNCOVERED_S` of audio left skips STT altogether. Cancelled or empty spans leave the
-audio to STT but put its rows on the dictation channel.
+`MIN_UNCOVERED_S` of audio left skips STT altogether. STT output that still overlaps a span
+is written superseded by it, cut at the span's edges when the backend gave word times, so
+ambient speech next to a dictation is kept and nothing is dropped. Cancelled or empty spans
+leave the audio to STT but put its rows on the dictation channel.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -87,11 +89,6 @@ class Cover:
 
     def masked_s(self) -> float:
         return sum(b - a for a, b in self.masked) / SAMPLE_RATE
-
-    def holds(self, start_utc_ms: int, end_utc_ms: int) -> bool:
-        """True when the midpoint of [start, end) lies inside a span with text."""
-        mid = (start_utc_ms + end_utc_ms) / 2
-        return any(sp["start_utc_ms"] <= mid < sp["end_utc_ms"] for sp in self.text_spans)
 
 
 @dataclass
@@ -177,14 +174,48 @@ def _piece(sp: Span, start: float, end: float, text: str, words: list[Word] | No
     )
 
 
-def _join_words(words: list[Word]) -> str:
+def _join_tokens(tokens: list[str]) -> str:
     out = ""
-    for w in words:
-        tok = w.word
+    for tok in tokens:
         if out and not tok.startswith(" ") and not out.endswith(" "):
             out += " "
         out += tok
     return out.strip()
+
+
+def _join_words(words: list[Word]) -> str:
+    return _join_tokens([w.word for w in words])
+
+
+def split_by_spans(m: Mapped, spans: list[sqlite3.Row]) -> list[tuple[Mapped, int | None]]:
+    """`m` as pieces, each with the id of the dictation span that supersedes it, or None.
+
+    With word timestamps the row is cut at the span edges: words outside every span stay one
+    ambient piece, words inside a span become a piece superseded by it (the span's own text
+    is the transcript there). Without words the whole row is superseded when it overlaps.
+    """
+    hits = [sp for sp in spans if m.start_utc_ms < sp["end_utc_ms"] and m.end_utc_ms > sp["start_utc_ms"]]
+    if not hits:
+        return [(m, None)]
+    if not m.words:
+        return [(m, int(hits[0]["id"]))]
+    groups: list[tuple[int | None, list[dict]]] = []
+    for w in m.words:
+        mid = m.chunk.start_utc_ms + (w["s"] + w["e"]) / 2
+        sid = next((int(sp["id"]) for sp in hits if sp["start_utc_ms"] <= mid < sp["end_utc_ms"]), None)
+        if groups and groups[-1][0] == sid:
+            groups[-1][1].append(w)
+        else:
+            groups.append((sid, [w]))
+    if len(groups) == 1:
+        return [(m, groups[0][0])]
+    out: list[tuple[Mapped, int | None]] = []
+    for sid, words in groups:
+        piece = replace(m, start_utc_ms=m.chunk.start_utc_ms + words[0]["s"],
+                        end_utc_ms=m.chunk.start_utc_ms + words[-1]["e"], offset_ms=words[0]["s"],
+                        text=_join_tokens([w["w"] for w in words]), words=words)
+        out.append((piece, sid))
+    return out
 
 
 def map_transcript(transcript: Transcript, spans: list[Span]) -> list[Mapped]:
@@ -457,7 +488,8 @@ class Worker:
     def write_window(self, window: list[Chunk], mapped: list[Mapped], dropped: dict[int, int],
                      backend_by_chunk: dict[int, Backend], covers: dict[int, Cover] | None = None) -> None:
         """Replace each chunk's segments for the backend that produced them and mark it done.
-        Rows inside a cancelled span go on the dictation channel (`covers`)."""
+        Rows overlapping a span with text are written superseded by it, cut at its edges when
+        there are word times; rows inside a cancelled span go on the dictation channel (`covers`)."""
         by_chunk: dict[int, list[Mapped]] = {c.id: [] for c in window}
         for m in mapped:
             by_chunk[m.chunk.id].append(m)
@@ -469,21 +501,23 @@ class Worker:
                 backend = backend_by_chunk[c.id]
                 self.conn.execute("DELETE FROM segments WHERE chunk_id = ? AND model_id = ? AND span_id IS NULL",
                                   (c.id, backend.model_id))
-                pieces = sorted(by_chunk[c.id], key=lambda m: (m.start_utc_ms, m.end_utc_ms))
-                for idx, m in enumerate(pieces):
+                cover = covers.get(c.id, Cover())
+                pieces = [p for m in by_chunk[c.id] for p in split_by_spans(m, cover.text_spans) if p[0].text]
+                pieces.sort(key=lambda p: (p[0].start_utc_ms, p[0].end_utc_ms))
+                for idx, (m, superseded_by) in enumerate(pieces):
                     cur = self.conn.execute(
                         """INSERT INTO segments (chunk_id, device_id, idx, start_utc_ms, end_utc_ms, offset_ms,
                                text, lang, avg_logprob, no_speech_prob, compression_ratio,
-                               words_json, model_id, model_revision)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               words_json, model_id, model_revision, superseded_by)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (c.id, c.device_id, idx, m.start_utc_ms, m.end_utc_ms, m.offset_ms, m.text,
                          m.lang or self.cfg.language or "und",
                          m.avg_logprob, m.no_speech_prob, m.compression_ratio,
                          json.dumps(m.words, ensure_ascii=False) if m.words else None,
-                         backend.model_id, backend.model_revision),
+                         backend.model_id, backend.model_revision, superseded_by),
                     )
                     seg_id = int(cur.lastrowid)
-                    for sp in covers.get(c.id, Cover()).cancelled_spans:
+                    for sp in cover.cancelled_spans:
                         if m.start_utc_ms < sp["end_utc_ms"] and m.end_utc_ms > sp["start_utc_ms"]:
                             self._tag_dictation(seg_id, sp, ts)
                 self.conn.execute(
@@ -588,8 +622,6 @@ class Worker:
             sdnotify.notify("WATCHDOG=1")  # a 50-chunk backlog can outlast WatchdogSec
             try:
                 mapped, by_chunk = self.transcribe_window(window, audio, backend)
-                # STT leaking across a zeroed span: whatever lands inside it is the span's
-                mapped = [m for m in mapped if not covers[m.chunk.id].holds(m.start_utc_ms, m.end_utc_ms)]
                 kept, dropped = apply_filters(mapped, self.cfg.filters)
                 self.write_window(window, kept, dropped, by_chunk, covers)
                 res.done += len(window)

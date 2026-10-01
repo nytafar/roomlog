@@ -204,10 +204,48 @@ def test_partially_covered_chunk_has_its_span_audio_zeroed(tmp_path):
     assert (res.covered, res.done) == (0, 1)
     a = seen["audio"]
     assert np.all(a[2 * SR:5 * SR] == 0) and np.all(a[:2 * SR] != 0) and np.all(a[5 * SR:] != 0)
-    texts = [(r["text"], r["span_id"] is not None) for r in fx.segments(c)]
-    assert ("ghost", False) not in texts  # inside the span: the span's text stands
-    assert ("hallo", False) in texts and ("restart the worker", True) in texts
+    rows = {r["text"]: r for r in fx.segments(c)}
+    # inside the span the span's text stands: the leaked STT row is kept but superseded
+    assert rows["ghost"]["superseded_by"] == 1 and rows["ghost"]["span_id"] is None
+    assert rows["hallo"]["superseded_by"] is None and rows["restart the worker"]["span_id"] == 1
     assert fx.chunk(c)["model_id"] == "fake-model"
+    assert [h["text"] for h in search(fx.conn, "ghost", fuzzy=True, include_dictation=True)] == []
+
+
+def test_stt_row_crossing_a_span_edge_is_cut_at_the_edge(tmp_path):
+    """Finding 5: a Whisper segment that straddles the span edge keeps its ambient words and
+    only the words inside the span are superseded; without word times the row is superseded
+    whole, never dropped."""
+    from roomlog_server.backends import Segment, Transcript, Word
+    fx = Fixture(tmp_path)
+    c = fx.add(T0, 10, device_id="nyta")
+    post_span(fx.conn, "nyta", span_body(4, 8))
+
+    def script(audio, language):
+        return Transcript(segments=[
+            Segment(2.0, 5.0, " hei der inne", [Word(2.0, 2.8, " hei", 0.9), Word(3.0, 3.8, " der", 0.9),
+                                                  Word(4.2, 5.0, " inne", 0.9)], avg_logprob=-0.2),
+            Segment(7.5, 9.5, " ute igjen", [Word(7.5, 7.9, " ute", 0.9), Word(8.4, 9.5, " igjen", 0.9)]),
+        ], language="no")
+
+    assert fx.worker(FakeBackend(script=script)).run_once().done == 1
+    rows = [(r["text"], r["start_utc_ms"] - T0, r["end_utc_ms"] - T0, r["superseded_by"])
+            for r in fx.segments(c) if r["span_id"] is None]
+    assert rows == [("hei der", 2000, 3800, None), ("inne", 4200, 5000, 1), ("ute", 7500, 7900, 1),
+                    ("igjen", 8400, 9500, None)]
+    assert [h["text"] for h in search(fx.conn, "hei", fuzzy=True)] == ["hei der"]
+    assert [h["text"] for h in search(fx.conn, "igjen", fuzzy=True)] == ["igjen"]
+    assert search(fx.conn, "inne", fuzzy=True, include_dictation=True) == []  # superseded: hidden, kept
+
+    # no word times: the whole row is superseded when it overlaps, not dropped
+    fx2 = Fixture(tmp_path / "b")
+    c2 = fx2.add(T0, 10, device_id="nyta")
+    post_span(fx2.conn, "nyta", span_body(4, 8))
+    nowords = FakeBackend(script=lambda a, l: Transcript(segments=[Segment(2.0, 5.0, "hei der inne", None)],
+                                                           language="no"), supports_words=False)
+    assert fx2.worker(nowords).run_once().done == 1
+    stt = [r for r in fx2.segments(c2) if r["span_id"] is None]
+    assert len(stt) == 1 and stt[0]["text"] == "hei der inne" and stt[0]["superseded_by"] == 1
 
 
 def test_late_span_supersedes_stt_rows_and_joins_the_audio(tmp_path):
@@ -275,6 +313,36 @@ def test_cancelled_span_keeps_stt_on_the_dictation_channel(tmp_path):
     assert len(search(fx.conn, "ord", fuzzy=True, include_dictation=True)) == len(fx.segments(before)) + len(fx.segments(late))
 
 
+def test_span_row_survives_its_chunk_being_deleted_and_rejoins_new_audio(tmp_path):
+    """Finding 4: `roomlog resegment` deletes derived chunks; the span row is detached, not
+    cascaded away, and joins the re-derived chunk."""
+    fx = Fixture(tmp_path)
+    c = fx.add(T0, 10, device_id="nyta")
+    span_id = post_span(fx.conn, "nyta", span_body(1, 4))
+    w = fx.worker(FakeBackend())
+    assert w.run_once().done == 1
+    row = fx.conn.execute("SELECT * FROM segments WHERE span_id = ?", (span_id,)).fetchone()
+    assert row["chunk_id"] == c
+    fx.conn.execute("DELETE FROM chunks WHERE id = ?", (c,))  # what reset_segmentation does
+    rows = fx.conn.execute("SELECT * FROM segments").fetchall()
+    assert [(r["span_id"], r["chunk_id"], r["text"]) for r in rows] == [(span_id, None, "restart the worker")]
+    assert fx.conn.execute("SELECT segment_id FROM dictation_spans WHERE id = ?", (span_id,)).fetchone()[0] == row["id"]
+    assert search(fx.conn, "restart", include_dictation=True)[0]["session_id"] is None
+    c2 = fx.add(T0, 10, device_id="nyta")
+    assert w.run_once().done == 1
+    row = fx.conn.execute("SELECT * FROM segments WHERE span_id = ?", (span_id,)).fetchone()
+    assert row["chunk_id"] == c2 and row["offset_ms"] == 1000
+    assert all(r["superseded_by"] is None for r in fx.segments(c2) if r["span_id"] is None)
+
+
+def test_cancelled_span_is_clamped_to_ten_minutes():
+    """Finding 2: a client that never saw the end guesses; the server bounds the guess."""
+    s = validate_span(span_body(0, 1800, text="", cancelled=True))
+    assert s["cancelled"] and s["end_utc_ms"] - s["start_utc_ms"] == 600_000
+    s = validate_span(span_body(0, 1800, text="a real half hour"))
+    assert not s["cancelled"] and s["end_utc_ms"] - s["start_utc_ms"] == 1_800_000
+
+
 def test_hold_delays_fresh_chunks_until_a_span_can_arrive(tmp_path):
     fx = Fixture(tmp_path)
     c = fx.add(T0, 10, device_id="nyta")
@@ -330,6 +398,27 @@ def test_default_queries_hide_dictation_and_include_flag_shows_it(tmp_path):
     assert list_spans(fx.conn, device_id="other") == []
 
 
+def test_channel_is_the_latest_deterministic_tag_and_the_filter_agrees(tmp_path):
+    """Finding 6: one rule. A later model tag does not override a deterministic one; a
+    model-only tag counts; a row whose deterministic channel says ambient is listed even if
+    an older tag said dictation."""
+    fx, c = seed_mixed(tmp_path)
+    amb = search(fx.conn, "budsjettet")[0]
+    add_tag(fx.conn, "channel", "dictation", "classifier/0.1", source="model", segment_id=amb["segment_id"])
+    assert search(fx.conn, "budsjettet") == []  # a model tag alone decides
+    assert search(fx.conn, "budsjettet", include_dictation=True)[0]["channel"] == "dictation"
+    add_tag(fx.conn, "channel", "ambient", "dictation-span/2", segment_id=amb["segment_id"])
+    assert search(fx.conn, "budsjettet")[0]["channel"] == "ambient"  # deterministic wins over the model
+    add_tag(fx.conn, "channel", "dictation", "classifier/0.2", source="model", segment_id=amb["segment_id"])
+    assert search(fx.conn, "budsjettet")[0]["channel"] == "ambient"  # a later model tag changes nothing
+    dic = search(fx.conn, "budget", include_dictation=True)[0]
+    add_tag(fx.conn, "channel", "ambient", "operator/1", segment_id=dic["segment_id"])
+    assert search(fx.conn, "budget")[0]["channel"] == "ambient"  # latest deterministic tag wins
+    sid = fx.chunk(c)["session_id"]
+    assert {s["channel"] for s in session_segments(fx.conn, sid)} == {"ambient"}
+    assert len(session_segments(fx.conn, sid)) == len(session_segments(fx.conn, sid, include_dictation=True))
+
+
 def test_cli_and_mcp_expose_lang_channel_and_the_include_flag(tmp_path, capsys):
     fx, c = seed_mixed(tmp_path)
     toml = fx.cfg.config_dir / "server.toml"
@@ -374,6 +463,27 @@ def test_cli_and_mcp_expose_lang_channel_and_the_include_flag(tmp_path, capsys):
 # ------------------------------------------------------------- migration
 
 
+def test_migration_keeps_the_segment_id_counter(tmp_path):
+    """Finding 7: the v4 rebuild must not let a deleted row's id come back."""
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    dbmod.migrate(conn, target=3)
+    body = b"y" * 10
+    meta = make_sidecar(body, device_id="lass22", start_utc=ms_to_iso(T0), duration_s=10)
+    cid = insert_chunk_row(conn, meta, json.dumps(meta), hashlib.sha256(body).hexdigest(), "2026/09/26/y.opus")
+    for i in range(3):
+        conn.execute("INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, lang, model_id) "
+                     "VALUES (?, ?, ?, ?, 0, ?, 'no', 'm1')", (cid, i, T0 + i * 1000, T0 + i * 1000 + 1000, f"rad {i}"))
+    conn.execute("DELETE FROM segments WHERE id = 3")
+    conn.close()
+    conn = dbmod.connect(path)
+    conn.execute("INSERT INTO segments (chunk_id, device_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) "
+                 "VALUES (?, 'lass22', 3, 0, 1, 0, 'ny rad', 'm1')", (cid,))
+    assert conn.execute("SELECT max(id) FROM segments").fetchone()[0] == 4
+    conn.close()
+
+
 def test_migration_v3_to_v4_keeps_rows_and_backfills_lang(tmp_path):
     path = tmp_path / "old.db"
     conn = sqlite3.connect(str(path), isolation_level=None)
@@ -393,7 +503,7 @@ def test_migration_v3_to_v4_keeps_rows_and_backfills_lang(tmp_path):
     conn.close()
 
     conn = dbmod.connect(path)
-    assert dbmod.user_version(conn) == 4
+    assert dbmod.user_version(conn) == 5
     rows = conn.execute("SELECT * FROM segments ORDER BY id").fetchall()
     assert [(r["text"], r["lang"], r["device_id"], r["chunk_id"], r["span_id"], r["superseded_by"]) for r in rows] == [
         ("gammel rad", "no", "lass22", cid, None, None), ("engelsk rad", "en", "lass22", cid, None, None)]

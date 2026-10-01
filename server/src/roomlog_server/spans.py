@@ -19,6 +19,7 @@ from .times import iso_to_ms, now_ms
 MODES = ("raw", "cleanup", "edit-instruction")
 MAX_TEXT_CHARS = 20_000
 MAX_SPAN_MS = 3_600_000  # one hour: longer is a client bug, not a dictation
+MAX_CANCELLED_MS = 600_000  # a cancelled span is clamped to ten minutes: its end was guessed
 CHANNEL_DICTATION = "dictation"
 CHANNEL_DEFAULT = "ambient"
 
@@ -79,6 +80,12 @@ def validate_span(body: Any) -> dict[str, Any]:
     app = _str(target, "app", required=False)
     window = _str(target, "window", required=False, max_len=500)
     device_id = _str(body, "device_id", required=False, max_len=64)
+    # an empty dictation is a cancelled one: nothing was acted on (ADR 0008)
+    cancelled = bool(cancelled or not text.strip())
+    if cancelled and end_ms - start_ms > MAX_CANCELLED_MS:
+        # the client never saw this one end and guessed; an absurd guess would hide
+        # ambient speech under the dictation channel
+        end_ms = start_ms + MAX_CANCELLED_MS
     return {
         "device_id": device_id,
         "start_utc_ms": start_ms,
@@ -89,8 +96,7 @@ def validate_span(body: Any) -> dict[str, Any]:
         "mode": mode,
         "app": app,
         "window": window,
-        # an empty dictation is a cancelled one: nothing was acted on (ADR 0008)
-        "cancelled": bool(cancelled or not text.strip()),
+        "cancelled": cancelled,
         "origin": origin,
     }
 

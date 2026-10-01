@@ -106,14 +106,17 @@ Content-Length: <n>                      (at most 65 536 bytes)
 ```
 
 - `start_utc`, `end_utc`: the sidecar timestamp form; `end_utc >= start_utc`, at most one hour apart.
-- `text`: what the engine produced, before any LLM rewrite; empty when nothing was heard.
+- `text`: what the engine produced, with the client's own fixed vocabulary corrections if it
+  has any, before any LLM rewrite or edit; empty when nothing was heard.
 - `lang`: the language the engine was run with, which becomes the row's `lang`.
 - `engine`: free text naming the STT engine and model.
 - `mode`: `raw`, `cleanup` (the text was then rewritten by an LLM before it was typed) or
   `edit-instruction` (the text is a spoken instruction applied to a selection).
 - `target`: optional; `app` is tagged on the row, `window` is kept on the span only.
 - `cancelled`: the dictation was discarded; an empty `text` counts as cancelled too. The audio
-  of a cancelled span is transcribed normally but its rows stay on the dictation channel.
+  of a cancelled span is transcribed normally but its rows stay on the dictation channel. A
+  client that never saw the dictation end should bound `end_utc` (a minute from the start is
+  the dictation tool's own limit); the server clamps a cancelled span to ten minutes.
 - `origin`: the tool and version that produced the span; it becomes every tag's `origin`.
 - `device_id`: optional; when present it must equal the token's device.
 
@@ -130,9 +133,13 @@ Content-Length: <n>                      (at most 65 536 bytes)
 
 Success body: `{"id": <span id>, "status": "created" | "exists", "device_id": "<id>"}`.
 
-The client must never let this call hold up the dictation itself: post after the text has
-been delivered, with a short timeout, and spool failures for a later retry. A span posted
-late still wins: STT rows written for its time are marked superseded, not deleted.
+The client must never let this call hold up the dictation itself: post from a detached
+process (or after the text has been delivered), with a short timeout, and spool failures for
+a retry with backoff that does not wait for the next dictation. A span posted late still
+wins: STT rows written for its time are marked superseded, not deleted. The time stamps
+should bracket the recording (stamp the start before the engine starts and the end after it
+stops, or pad it); STT output that still crosses a span edge is cut at the edge when the
+backend gives word times, the part inside being superseded by the span.
 
 ## Auth and transport
 

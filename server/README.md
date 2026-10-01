@@ -54,13 +54,20 @@ The room mic is also the dictation mic. The dictation tool posts one span per di
 - claims a chunk only once its end is `[worker] dictation_hold_s` (20 s) old, so the span
   usually arrives first; audio inside a span is zeroed before STT, and a chunk with under
   1 s left outside spans is marked done with `model_id = "dictation"` and no STT call;
+  STT output that still overlaps a span is written superseded by it, cut at the span's edges
+  when the backend gave word times, so ambient words next to a dictation stay and nothing
+  is dropped;
 - leaves the audio of a cancelled or empty span to STT but tags its rows
-  `channel=dictation`, `cancelled=true`, so it is never read as an open command.
+  `channel=dictation`, `cancelled=true`, so it is never read as an open command; a cancelled
+  span longer than ten minutes is clamped at ingest (its end was the client's guess);
+- keeps a span's row when its chunk is deleted (`roomlog resegment`): a trigger detaches it,
+  and it joins the re-derived chunk.
 
 Tags are `{target, key, value, source, origin}`: `target` is a transcript row (`segment_id`)
 or a device time span (`device_id`, `start_utc_ms`, `end_utc_ms`); `source` is
 `deterministic` or `model`; `origin` names the tool. A row's `channel` is its latest
-`channel` tag, `ambient` when it has none. Search, session transcripts, context and export
+deterministic `channel` tag, else its latest model one, `ambient` when it has none; the
+default filter applies the same rule. Search, session transcripts, context and export
 hide superseded rows always and dictation rows unless asked (`--include-dictation`,
 `include_dictation=true`); every row reports `lang` and `channel`. `roomlog spans` and the
 `list_spans` tool show the spans as received.

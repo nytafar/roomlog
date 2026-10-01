@@ -8,6 +8,9 @@ v4 (ADR 0008): `dictation_spans` (what the dictation tool said happened on a dev
 two instants), `tags` (facts with a `source` on a transcript row or a device time span) and
 `segments` rebuilt with `device_id`, a nullable `chunk_id` (a span with no overlapping audio
 still becomes a row), `span_id`, `superseded_by` and `lang NOT NULL`.
+
+v5: a trigger that detaches a span's row from a chunk being deleted (`resegment`), so the
+dictation text outlives the chunk and joins the re-derived one.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from pathlib import Path
 
 log = logging.getLogger("roomlog.db")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _MIGRATIONS: dict[int, str] = {
     1: """
@@ -259,6 +262,11 @@ INSERT INTO segments_v4 (id, chunk_id, device_id, idx, start_utc_ms, end_utc_ms,
            s.text, COALESCE(s.lang, 'no'), s.avg_logprob, s.no_speech_prob, s.compression_ratio,
            s.words_json, s.speaker, s.model_id, s.model_revision
     FROM segments s LEFT JOIN chunks c ON c.id = s.chunk_id;
+-- keep the old table's AUTOINCREMENT counter, so ids of deleted rows are never reused
+INSERT INTO sqlite_sequence (name, seq) SELECT 'segments_v4', 0
+    WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'segments_v4');
+UPDATE sqlite_sequence SET seq = max(seq, COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'segments'), 0))
+    WHERE name = 'segments_v4';
 DROP TABLE segments;
 ALTER TABLE segments_v4 RENAME TO segments;
 CREATE INDEX segments_start ON segments (start_utc_ms);
@@ -295,6 +303,11 @@ CREATE TRIGGER segments_au AFTER UPDATE ON segments BEGIN
     INSERT INTO segments_tri(segments_tri, rowid, text) VALUES ('delete', old.id, old.text);
     INSERT INTO segments_fts(rowid, text) VALUES (new.id, new.text);
     INSERT INTO segments_tri(rowid, text) VALUES (new.id, new.text);
+END;
+""",
+    5: """
+CREATE TRIGGER chunks_bd_detach_spans BEFORE DELETE ON chunks BEGIN
+    UPDATE segments SET chunk_id = NULL WHERE chunk_id = old.id AND span_id IS NOT NULL;
 END;
 """,
 }

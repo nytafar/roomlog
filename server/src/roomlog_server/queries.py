@@ -2,7 +2,8 @@
 
 Default filter set (ADR 0008): rows superseded by a dictation span are never listed, and
 rows on the dictation channel are left out unless the caller asks for `include_dictation`.
-Every row reports its `lang` and `channel` (the `channel` tag, `ambient` when untagged).
+Every row reports its `lang` and `channel` (its latest deterministic `channel` tag, else its
+latest model one, `ambient` when untagged); the filter uses the same rule.
 """
 
 from __future__ import annotations
@@ -15,13 +16,15 @@ from .db import fts_query
 from .spans import CHANNEL_DEFAULT, CHANNEL_DICTATION, span_json
 from .times import ms_to_hms, ms_to_iso, now_ms
 
+# A row's channel: its latest deterministic `channel` tag, else its latest model one, else
+# ambient. One rule for what a row reports and for what the default filter hides.
 _CHANNEL = f"""COALESCE((SELECT t.value FROM tags t WHERE t.target = 'segment' AND t.segment_id = s.id
-                      AND t.key = 'channel' ORDER BY t.id DESC LIMIT 1), '{CHANNEL_DEFAULT}')"""
+                      AND t.key = 'channel' ORDER BY (t.source = 'deterministic') DESC, t.id DESC LIMIT 1),
+                 '{CHANNEL_DEFAULT}')"""
 _SEG_COLS = f"""s.id, s.chunk_id, s.start_utc_ms, s.end_utc_ms, s.text, s.lang, s.model_id,
                 s.device_id, s.span_id, c.session_id, {_CHANNEL} AS channel"""
 _SEG_FROM = "LEFT JOIN chunks c ON c.id = s.chunk_id"
-_NOT_DICTATION = f"""NOT EXISTS (SELECT 1 FROM tags t WHERE t.target = 'segment' AND t.segment_id = s.id
-                                 AND t.key = 'channel' AND t.value = '{CHANNEL_DICTATION}')"""
+_NOT_DICTATION = f"{_CHANNEL} != '{CHANNEL_DICTATION}'"
 
 
 def _default_where(include_dictation: bool) -> list[str]:
