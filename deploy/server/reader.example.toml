@@ -1,0 +1,7 @@
+bind = "127.0.0.1:8540"
+db_path = "~/.local/share/roomlog/roomlog.db"
+tokens_file = "~/.config/roomlog-reader/tokens.toml"
+static_root = "/home/lasse/services/apps/roomlog-reader/web"
+[sources.nyta]
+label = "Kitchen"
+display_as = "room"

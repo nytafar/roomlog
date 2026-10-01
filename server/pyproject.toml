@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 roomlog = "roomlog_server.cli:main"
+roomlog-reader = "roomlog_server.reader_http:main"
 roomlog-mcp = "roomlog_server.mcp_server:main"
 
 [build-system]

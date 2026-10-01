@@ -1,0 +1,21 @@
+{
+  "as_of_ms": 1790850010000,
+  "tz": "Europe/Oslo",
+  "bucket": "hour",
+  "rows": [
+    {
+      "device_id": "nyta",
+      "from_ms": 1790850000000,
+      "to_ms": 1790853600000,
+      "text_ms": 0,
+      "n_segments": 0,
+      "evidence": {
+        "captured_ms": 0,
+        "pending_ms": 0,
+        "failed_ms": 0,
+        "no_detected_speech_ms": 0,
+        "unknown_ms": 3600000
+      }
+    }
+  ]
+}

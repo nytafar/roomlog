@@ -18,9 +18,7 @@ from .times import ms_to_hms, ms_to_iso, now_ms
 
 # A row's channel: its latest deterministic `channel` tag, else its latest model one, else
 # ambient. One rule for what a row reports and for what the default filter hides.
-_CHANNEL = f"""COALESCE((SELECT t.value FROM tags t WHERE t.target = 'segment' AND t.segment_id = s.id
-                      AND t.key = 'channel' ORDER BY (t.source = 'deterministic') DESC, t.id DESC LIMIT 1),
-                 '{CHANNEL_DEFAULT}')"""
+from .query_policy import CHANNEL as _CHANNEL
 _SEG_COLS = f"""s.id, s.chunk_id, s.start_utc_ms, s.end_utc_ms, s.text, s.lang, s.model_id,
                 s.device_id, s.span_id, c.session_id, {_CHANNEL} AS channel"""
 _SEG_FROM = "LEFT JOIN chunks c ON c.id = s.chunk_id"

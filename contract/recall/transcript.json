@@ -1,0 +1,105 @@
+{
+  "as_of_ms": 1790850010000,
+  "items": [
+    {
+      "segment_id": "1",
+      "device_id": "nyta",
+      "start_utc_ms": 1790850000000,
+      "end_utc_ms": 1790850002000,
+      "text": "Hei verden.",
+      "lang": "no",
+      "channel": "ambient",
+      "session_id": "session-1",
+      "chunk_id": "1",
+      "span_id": null,
+      "producer": {
+        "kind": "stt",
+        "model_id": "fixture-model",
+        "model_revision": null
+      },
+      "speaker": null,
+      "timing": "word",
+      "words": [
+        {
+          "text": "Hei",
+          "start_utc_ms": 1790850000000,
+          "end_utc_ms": 1790850000800,
+          "probability": 0.9
+        },
+        {
+          "text": " verden.",
+          "start_utc_ms": 1790850000900,
+          "end_utc_ms": 1790850002000,
+          "probability": null
+        }
+      ],
+      "tags": []
+    },
+    {
+      "segment_id": "2",
+      "device_id": "phone",
+      "start_utc_ms": 1790850001000,
+      "end_utc_ms": 1790850003000,
+      "text": "Skriv dette.",
+      "lang": "no",
+      "channel": "dictation",
+      "session_id": null,
+      "chunk_id": null,
+      "span_id": "10",
+      "producer": {
+        "kind": "dictation",
+        "model_id": "fixture-model",
+        "model_revision": null
+      },
+      "speaker": null,
+      "timing": "segment",
+      "words": null,
+      "tags": [
+        {
+          "key": "channel",
+          "value": "dictation",
+          "source": "deterministic",
+          "origin": "dictation",
+          "effective": true
+        },
+        {
+          "key": "app",
+          "value": "codex",
+          "source": "deterministic",
+          "origin": "dictation",
+          "effective": true
+        }
+      ]
+    },
+    {
+      "segment_id": "3",
+      "device_id": "nyta",
+      "start_utc_ms": 1790850004000,
+      "end_utc_ms": 1790850005000,
+      "text": "Avbrutt diktering.",
+      "lang": "no",
+      "channel": "dictation",
+      "session_id": "session-1",
+      "chunk_id": "1",
+      "span_id": null,
+      "producer": {
+        "kind": "stt",
+        "model_id": "fixture-model",
+        "model_revision": null
+      },
+      "speaker": null,
+      "timing": "segment",
+      "words": null,
+      "tags": [
+        {
+          "key": "channel",
+          "value": "dictation",
+          "source": "deterministic",
+          "origin": "cancelled-report",
+          "effective": true
+        }
+      ]
+    }
+  ],
+  "next_cursor": null
+}

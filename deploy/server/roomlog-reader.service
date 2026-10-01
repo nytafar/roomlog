@@ -1,0 +1,15 @@
+[Unit]
+Description=Room Log read-only recall HTTP
+After=network.target
+[Service]
+Type=simple
+WorkingDirectory=%h/services/apps/roomlog-reader
+ExecStart=%h/services/apps/roomlog-reader/server/.venv/bin/roomlog-reader --config %h/.config/roomlog-reader/reader.toml
+Restart=on-failure
+RestartSec=3
+MemoryMax=256M
+CPUQuota=50%
+TasksMax=32
+NoNewPrivileges=true
+[Install]
+WantedBy=default.target
