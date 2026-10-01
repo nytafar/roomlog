@@ -924,18 +924,20 @@ function indexAt(x, y, device) {
     return Number(hit.dataset.unit);
   let best = null,
     distance = Infinity;
-  for (const node of document.querySelectorAll("[data-unit]")) {
-    const unit = allUnits[Number(node.dataset.unit)];
-    if (device && unit.device_id !== device) continue;
-    const bounds = node.getBoundingClientRect();
+  for (const turn of document.querySelectorAll(".turn")) {
+    if (device && turn.dataset.device !== device) continue;
+    // Read row geometry first: measuring skipped word subtrees forces their layout.
+    const bounds = turn.getBoundingClientRect();
     if (bounds.bottom < 0 || bounds.top > innerHeight) continue;
-    for (const r of node.getClientRects()) {
-      const dy = Math.max(r.top - y, 0, y - r.bottom),
-        dx = Math.max(r.left - x, 0, x - r.right),
-        d = dy * 4 + dx;
-      if (d < distance) {
-        distance = d;
-        best = Number(node.dataset.unit);
+    for (const node of turn.querySelectorAll("[data-unit]")) {
+      for (const r of node.getClientRects()) {
+        const dy = Math.max(r.top - y, 0, y - r.bottom),
+          dx = Math.max(r.left - x, 0, x - r.right),
+          d = dy * 4 + dx;
+        if (d < distance) {
+          distance = d;
+          best = Number(node.dataset.unit);
+        }
       }
     }
   }

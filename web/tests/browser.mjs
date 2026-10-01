@@ -274,8 +274,9 @@ try {
   await waitFor(`document.querySelectorAll("[data-unit]").length===2&&!document.querySelector("#status").textContent.includes("Loading")`);
   // Select the real timed word through a browser pointer event.
   const xy = await evaluate(
-    `(()=>{const n=document.querySelector('[data-unit="1"]');n.scrollIntoView({block:'center'});const r=n.getBoundingClientRect();return [r.right-2,r.top+r.height/2];})()`,
+    `(()=>{const n=document.querySelector('[data-unit="1"]');n.scrollIntoView({block:'center'});const r=n.getBoundingClientRect();return [n.closest(".turn").getBoundingClientRect().right-2,r.top+r.height/2];})()`,
   );
+  assert.equal(await evaluate(`document.elementFromPoint(${xy[0]},${xy[1]})?.closest("[data-unit]")==null`),true,"gutter selection exercises visible-row hit testing");
   await cmd("Input.dispatchMouseEvent", {
     type: "mousePressed",
     x: xy[0],
