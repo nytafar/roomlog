@@ -101,7 +101,9 @@ Content-Length: <n>                      (at most 65 536 bytes)
 
 {"start_utc": "2026-10-01T12:00:00.000Z", "end_utc": "2026-10-01T12:00:06.250Z",
  "text": "restart the worker", "lang": "en", "engine": "voxtype/parakeet-tdt-0.6b-v3-int8",
- "mode": "raw", "target": {"app": "ghostty", "window": "~/code/roomlog"},
+ "mode": "raw", "target": {"app": "com.mitchellh.ghostty", "window": "oma: Room",
+            "workspace": "wK", "pane": "wK:p6", "program": "claude",
+            "session_id": "0355bb14-a8cb-4310-b697-ab5a8db35593"},
  "cancelled": false, "origin": "dictation-span/1"}
 ```
 
@@ -112,7 +114,16 @@ Content-Length: <n>                      (at most 65 536 bytes)
 - `engine`: free text naming the STT engine and model.
 - `mode`: `raw`, `cleanup` (the text was then rewritten by an LLM before it was typed) or
   `edit-instruction` (the text is a spoken instruction applied to a selection).
-- `target`: optional; `app` is tagged on the row, `window` is kept on the span only.
+- `target`: optional object captured at recording start. Recognized string fields are
+  `app` (terminal/window app class), `window` (window title, max 500 characters), `workspace`
+  and `pane` (Herdr IDs), `program` (foreground program, `shell` for an interactive shell),
+  and `session_id` (the recipient program's conversation ID, distinct from roomlog's audio
+  session). All except `window` have a 200-character limit. Unknown fields are preserved
+  in the raw body but ignored. Omit facts that cannot be verified; do not infer a program
+  from a title or choose a conversation by newest file. Each recognized nonempty field
+  becomes a deterministic tag on the time span and its transcript rows, with the request's
+  `origin`. Existing clients with only app/window remain valid. `roomlog spans` and MCP
+  `list_spans` expose the stored deterministic tags as `tags`; the CLI prints them too.
 - `cancelled`: the dictation was discarded; an empty `text` counts as cancelled too. The audio
   of a cancelled span is transcribed normally but its rows stay on the dictation channel. A
   client that never saw the dictation end should bound `end_utc` (a minute from the start is

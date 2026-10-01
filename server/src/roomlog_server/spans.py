@@ -22,6 +22,13 @@ MAX_SPAN_MS = 3_600_000  # one hour: longer is a client bug, not a dictation
 MAX_CANCELLED_MS = 600_000  # a cancelled span is clamped to ten minutes: its end was guessed
 CHANNEL_DICTATION = "dictation"
 CHANNEL_DEFAULT = "ambient"
+TARGET_LIMITS = {"app": 200, "window": 500, "workspace": 200, "pane": 200,
+                 "program": 200, "session_id": 200}
+
+
+def target_facts(target):
+    return {key: value for key, limit in TARGET_LIMITS.items()
+            if (value := _str(target, key, required=False, max_len=limit))}
 
 
 class SpanError(ValueError):
@@ -77,8 +84,9 @@ def validate_span(body: Any) -> dict[str, Any]:
     target = body.get("target") or {}
     if not isinstance(target, dict):
         raise SpanError("target must be an object")
-    app = _str(target, "app", required=False)
-    window = _str(target, "window", required=False, max_len=500)
+    facts = target_facts(target)
+    app = facts.get("app")
+    window = facts.get("window")
     device_id = _str(body, "device_id", required=False, max_len=64)
     # an empty dictation is a cancelled one: nothing was acted on (ADR 0008)
     cancelled = bool(cancelled or not text.strip())
@@ -87,6 +95,7 @@ def validate_span(body: Any) -> dict[str, Any]:
         # ambient speech under the dictation channel
         end_ms = start_ms + MAX_CANCELLED_MS
     return {
+        "target": facts,
         "device_id": device_id,
         "start_utc_ms": start_ms,
         "end_utc_ms": end_ms,
@@ -125,8 +134,14 @@ def add_tag(conn: sqlite3.Connection, key: str, value: str, origin: str, *, sour
 def span_tags(span: sqlite3.Row | dict[str, Any]) -> list[tuple[str, str]]:
     """The deterministic facts a span carries, as (key, value) pairs."""
     out = [("channel", CHANNEL_DICTATION), ("mode", span["mode"])]
-    if span["app"]:
-        out.append(("app", span["app"]))
+    # body_json already persists the additive target fields, so no schema change is
+    # needed. Revalidate the whitelist when the worker reads a stored body.
+    if "body_json" in span.keys():
+        facts = target_facts(json.loads(span["body_json"]).get("target") or {})
+    else:
+        facts = span.get("target", {})
+    facts = {**facts, **{k: span[k] for k in ("app", "window") if span[k]}}
+    out.extend(facts.items())
     if span["cancelled"]:
         out.append(("cancelled", "true"))
     return out

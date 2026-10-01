@@ -101,6 +101,7 @@ def test_store_span_is_idempotent_and_tags_the_time_span(conn):
         ("channel", "dictation", "deterministic", "dictation-span/1"),
         ("mode", "raw", "deterministic", "dictation-span/1"),
         ("app", "ghostty", "deterministic", "dictation-span/1"),
+        ("window", "~/code/roomlog", "deterministic", "dictation-span/1"),
     ]
     assert all((t["device_id"], t["start_utc_ms"], t["end_utc_ms"]) == ("nyta", T0, T0 + 6000) for t in tags)
     with pytest.raises(ValueError):
@@ -177,7 +178,7 @@ def test_span_before_audio_replaces_stt_for_its_window(tmp_path):
     assert row["text"] == "restart the worker" and row["lang"] == "en" and row["device_id"] == "nyta"
     assert row["model_id"] == "voxtype/parakeet-tdt-0.6b-v3-int8" and row["span_id"] is not None
     assert row["offset_ms"] == 0 and row["start_utc_ms"] == T0 - 1000
-    assert tags_of(fx.conn, row["id"]) == {"channel": "dictation", "mode": "raw", "app": "ghostty"}
+    assert tags_of(fx.conn, row["id"]) == {"channel": "dictation", "mode": "raw", "app": "ghostty", "window": "~/code/roomlog"}
     assert all(r["lang"] == "no" for r in fx.segments(b))
     span = fx.conn.execute("SELECT * FROM dictation_spans").fetchone()
     assert span["status"] == "applied" and span["segment_id"] == row["id"]
@@ -530,3 +531,30 @@ def test_migration_v3_to_v4_keeps_rows_and_backfills_lang(tmp_path):
     names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"dictation_spans", "tags"} <= names
     conn.close()
+
+
+def test_addressee_tags_survive_storage_and_reach_the_transcript(tmp_path, capsys):
+    fx = Fixture(tmp_path)
+    target = {'app': 'ghostty', 'window': 'Room', 'workspace': 'wK', 'pane': 'wK:p6',
+              'program': 'claude', 'session_id': '0355bb14-a8cb-4310-b697-ab5a8db35593'}
+    sid = post_span(fx.conn, 'nyta', span_body(0, 5, target={**target, 'unknown': 'ignored'}))
+    assert fx.worker(FakeBackend()).run_once().spans_applied == 1
+    row = fx.conn.execute('SELECT segment_id FROM dictation_spans WHERE id = ?', (sid,)).fetchone()
+    expected = {'channel': 'dictation', 'mode': 'raw', **target}
+    assert tags_of(fx.conn, row['segment_id']) == expected
+    tags = fx.conn.execute("SELECT key, value, source FROM tags WHERE target = 'span'").fetchall()
+    assert {r['key']: r['value'] for r in tags} == expected
+    assert all(r['source'] == 'deterministic' for r in tags)
+    assert list_spans(fx.conn, device_id='nyta')[0]['tags'] == expected
+    toml = fx.cfg.config_dir / 'server.toml'
+    toml.write_text(f'[paths]\ndata_dir = "{fx.cfg.data_dir}"\n')
+    main(['-c', str(toml), 'spans', '--device', 'nyta'])
+    output = capsys.readouterr().out
+    assert 'program="claude"' in output and f'session_id="{target["session_id"]}"' in output
+
+
+@pytest.mark.parametrize('key', ['workspace', 'pane', 'program', 'session_id'])
+@pytest.mark.parametrize('value', [42, 'x' * 201])
+def test_addressee_fields_are_validated(key, value):
+    with pytest.raises(SpanError):
+        validate_span(span_body(0, 1, target={key: value}))

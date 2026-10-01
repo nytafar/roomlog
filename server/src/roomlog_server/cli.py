@@ -178,7 +178,8 @@ def cmd_spans(cfg: Config, args: argparse.Namespace) -> int:
                       args.device_id, args.limit)
     text = "".join(
         f"{r['id']:>5}  {r['device_id']}  {r['start_utc']} → {r['end_utc']}  {r['lang']} {r['mode']}"
-        f"{' cancelled' if r['cancelled'] else ''}  {r['status']}  {r['text'][:80]}\n"
+        f"{' cancelled' if r['cancelled'] else ''}  {r['status']}  {r['text'][:80]}"
+        f"  {' '.join(k + '=' + json.dumps(v, ensure_ascii=False) for k, v in r['tags'].items())}\n"
         for r in rows
     )
     _out(args, rows, text)

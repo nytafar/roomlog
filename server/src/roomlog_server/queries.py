@@ -298,6 +298,11 @@ def list_spans(conn: sqlite3.Connection, from_ms: int | None = None, to_ms: int 
     out = []
     for r in rows:
         d = span_json(r)
+        d["tags"] = {t["key"]: t["value"] for t in conn.execute(
+            """SELECT key, value FROM tags WHERE target = 'span' AND device_id = ?
+               AND start_utc_ms = ? AND end_utc_ms = ? AND source = 'deterministic' ORDER BY id""",
+            (r["device_id"], r["start_utc_ms"], r["end_utc_ms"]),
+        )}
         d["start_utc"] = ms_to_iso(r["start_utc_ms"])
         d["end_utc"] = ms_to_iso(r["end_utc_ms"])
         d["cancelled"] = bool(r["cancelled"])
