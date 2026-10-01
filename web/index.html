@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0f1012" />
+    <title>roomlog · recall</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <form id="login">
+      <h1>roomlog · recall</h1>
+      <p>Read your speech history by time and source.</p>
+      <label for="token">Owner read token</label
+      ><input id="token" type="password" autocomplete="off" required /><button>
+        Open history
+      </button>
+      <p>The token stays in memory. Reloading requires login again.</p>
+      <p id="login-error" role="alert"></p>
+    </form>
+    <div id="app" hidden>
+      <header id="top">
+        <div class="row1">
+          <div id="where"><b>roomlog · recall</b><span>Europe/Oslo</span></div>
+          <button class="ib" id="refresh" title="Refresh">↻</button
+          ><button class="ib" id="help-button" title="Help">?</button
+          ><button class="ib" id="logout" title="Log out">⇥</button>
+        </div>
+        <nav id="pills" aria-label="Zoom">
+          <button data-level="week">week</button
+          ><button data-level="day">day</button
+          ><button data-level="session">sessions</button
+          ><button data-level="text">text</button>
+        </nav>
+        <div id="controls">
+          <button class="ib" id="prev" aria-label="Previous period">‹</button
+          ><input id="date" type="date" aria-label="Date" /><button
+            class="ib"
+            id="next"
+            aria-label="Next period"
+          >
+            ›</button
+          ><button class="ib" id="latest" title="Latest history">↓</button
+          ><span id="range-label" class="counts"></span>
+        </div>
+        <div id="filters">
+          <select id="source" aria-label="Source">
+            <option value="">All sources</option></select
+          ><select id="channel" aria-label="Channel">
+            <option value="ambient">Ambient</option>
+            <option value="dictation">Dictation</option>
+            <option value="all">All channels</option></select
+          ><input
+            id="lang"
+            placeholder="Language code"
+            aria-label="Exact language code"
+            maxlength="30"
+          />
+        </div>
+        <details id="advanced">
+          <summary>Recipient filters</summary>
+          <div class="recipient-fields">
+            <input
+              data-filter="recipient_app"
+              placeholder="App"
+              maxlength="500"
+              aria-label="Recipient app"
+            /><input
+              data-filter="recipient_window"
+              placeholder="Window"
+              maxlength="500"
+              aria-label="Recipient window"
+            /><input
+              data-filter="recipient_workspace"
+              placeholder="Workspace"
+              maxlength="500"
+              aria-label="Recipient workspace"
+            /><input
+              data-filter="recipient_pane"
+              placeholder="Pane"
+              maxlength="500"
+              aria-label="Recipient pane"
+            /><input
+              data-filter="recipient_program"
+              placeholder="Program"
+              maxlength="500"
+              aria-label="Recipient program"
+            /><input
+              data-filter="recipient_session_id"
+              placeholder="Program conversation ID"
+              maxlength="500"
+              aria-label="Recipient program conversation ID"
+            />
+          </div>
+        </details>
+        <form id="searchform">
+          <input
+            id="query"
+            type="search"
+            placeholder="Find in this week"
+            maxlength="512"
+            aria-label="Search words"
+          /><select id="search-mode" aria-label="Search mode">
+            <option value="literal">All terms</option>
+            <option value="fuzzy">Fragments</option></select
+          ><button class="ib" title="Search">⌕</button
+          ><button
+            class="ib"
+            id="clear-search"
+            type="button"
+            title="Clear search"
+          >
+            ×
+          </button>
+        </form>
+        <div id="status" role="status" aria-live="polite"></div>
+      </header>
+      <main id="vp">
+        <div id="gearhint">
+          week ◀ · day · sessions · text ▶ · hold text to select
+        </div>
+        <div id="view"></div>
+      </main>
+      <button
+        id="mark-in"
+        class="bracket"
+        data-handle="in"
+        hidden
+        aria-label="Adjust selection start"
+      >
+        IN · drag to adjust</button
+      ><button
+        id="mark-out"
+        class="bracket"
+        data-handle="out"
+        hidden
+        aria-label="Adjust selection end"
+      >
+        OUT · drag to adjust
+      </button>
+      <div id="clipbar" hidden>
+        <div class="h" id="clip-label"></div>
+        <div class="acts">
+          <button id="copy" class="pri">Copy</button
+          ><button id="save-clip">To tray</button
+          ><button id="clear-selection">Clear</button>
+        </div>
+        <div class="hint">
+          Selection stays within one source. Quotes are preserved at selection
+          time.
+        </div>
+      </div>
+      <div id="tray" aria-label="Local clip tray"></div>
+      <div id="scrim"></div>
+      <section
+        id="sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Details"
+      ></section>
+      <div id="toast" role="status"></div>
+    </div>
+    <script type="module" src="app.mjs"></script>
+  </body>
+</html>

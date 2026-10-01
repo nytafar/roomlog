@@ -1,1 +1,9 @@
-{"name":"roomlog-recall","private":true,"type":"module","scripts":{"test":"node --test tests/*.test.mjs"}}
+{
+  "name": "roomlog-recall",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "test:browser": "node tests/browser.mjs"
+  }
+}
