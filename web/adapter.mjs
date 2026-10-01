@@ -119,23 +119,51 @@ export async function boundedPages(
   }
   return { items: [...items.values()], as_of_ms };
 }
-// One successful bounded window replaces the old one; incomplete refreshes never leak.
+// Complete windows replace old snapshots. Navigation may reuse them; refresh always reads.
 export class WindowStore {
-  constructor(adapter, { capacity = 8 } = {}) {
+  constructor(adapter, { capacity = 8, maxBytes = 16 * 1024 * 1024 } = {}) {
     this.adapter = adapter;
     this.capacity = capacity;
+    this.maxBytes = maxBytes;
     this.cache = new Map();
+    this.sizes = new Map();
+    this.errors = new Map();
+    this.bytes = 0;
     this.generation = 0;
   }
   cancel() {
     this.generation++;
     this.controller?.abort();
   }
-  async load(key, loader) {
+  remove(key) {
+    this.bytes -= this.sizes.get(key) || 0;
+    this.sizes.delete(key);
+    this.errors.delete(key);
+    this.cache.delete(key);
+  }
+  lookup(key, reuse) {
+    if (this.cache.has(key))
+      return { key, value: this.cache.get(key), error: this.errors.get(key) };
+    if (reuse) {
+      for (const [candidate, value] of [...this.cache].reverse()) {
+        const projected = reuse(candidate, value, key);
+        if (projected !== undefined)
+          return { key: candidate, value: projected, error: this.errors.get(candidate) };
+      }
+    }
+  }
+  async load(key, loader, { refresh = true, reuse, invalidates } = {}) {
     this.cancel();
     const generation = this.generation;
+    const prior = this.lookup(key, reuse);
+    if (!refresh && prior) {
+      // Touch the original covering window, without storing duplicated subranges.
+      const value = this.cache.get(prior.key);
+      this.cache.delete(prior.key);
+      this.cache.set(prior.key, value);
+      return { value: prior.value, cached: true, stale: !!prior.error, error: prior.error };
+    }
     const controller = (this.controller = new AbortController());
-    const prior = this.cache.get(key);
     try {
       let value;
       try {
@@ -145,15 +173,22 @@ export class WindowStore {
         value = await loader(this.adapter, controller.signal);
       }
       if (generation !== this.generation) return { obsolete: true };
-      this.cache.delete(key);
+      if (invalidates)
+        for (const candidate of [...this.cache.keys()])
+          if (invalidates(candidate, key)) this.remove(candidate);
+      this.remove(key);
+      const size = new TextEncoder().encode(JSON.stringify(value)).byteLength;
       this.cache.set(key, value);
-      while (this.cache.size > this.capacity)
-        this.cache.delete(this.cache.keys().next().value);
+      this.sizes.set(key, size);
+      this.bytes += size;
+      while (this.cache.size > this.capacity || this.bytes > this.maxBytes)
+        this.remove(this.cache.keys().next().value);
       return { value, stale: false };
     } catch (error) {
       if (generation !== this.generation || error.name === "AbortError")
         return { obsolete: true };
-      return { value: prior, stale: true, error };
+      if (prior) this.errors.set(prior.key, error);
+      return { value: prior?.value, stale: true, error };
     }
   }
 }

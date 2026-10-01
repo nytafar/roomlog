@@ -256,6 +256,20 @@ try {
     0,
     "credentials and transcripts not persisted",
   );
+  // Loaded day detail is reusable at session/text zoom and focused ranges.
+  const warmReadCount = requests.length;
+  for (const level of ["session", "text"]) {
+    await evaluate(`document.querySelector('[data-level="${level}"]').click()`);
+    await waitFor(`document.querySelector('[data-level="${level}"]').classList.contains('cur')&&!document.querySelector('#status').textContent.includes('Loading')`);
+  }
+  assert.equal(requests.length, warmReadCount, "warm zoom never waits on HTTP");
+  await evaluate(`document.querySelector('[data-level="session"]').click()`);
+  await waitFor(`document.querySelector('.blk')!==null&&!document.querySelector('#status').textContent.includes('Loading')`);
+  await evaluate(`document.querySelector('.blk').click()`);
+  await waitFor(`document.querySelector('[data-level="text"]').classList.contains('cur')&&!document.querySelector('#status').textContent.includes('Loading')`);
+  assert.equal(requests.length, warmReadCount, "focused session uses covering day detail");
+  await change("#source", "");
+  await waitFor(`document.querySelectorAll("[data-unit]").length===2&&!document.querySelector("#status").textContent.includes("Loading")`);
   // Select the real timed word through a browser pointer event.
   const xy = await evaluate(
     `(()=>{const n=document.querySelector('[data-unit="1"]');n.scrollIntoView({block:'center'});const r=n.getBoundingClientRect();return [r.right-2,r.top+r.height/2];})()`,
@@ -329,6 +343,8 @@ try {
     `document.querySelectorAll('.turn').length===0&&!document.querySelector('#status').textContent.includes('Loading')`,
   );
   current = fixture.items;
+  await evaluate(`document.querySelector("#refresh").click()`);
+  await waitFor(`document.querySelectorAll(".turn").length>0&&!document.querySelector("#status").textContent.includes("Loading")`);
   await evaluate(`document.querySelector('[data-level="week"]').click()`);
   await waitFor(`document.querySelectorAll('.day').length===7`);
   await evaluate(

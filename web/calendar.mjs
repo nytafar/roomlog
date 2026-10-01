@@ -47,18 +47,15 @@ export function weekDates(date) {
   const start = shiftDate(date, -((weekday + 6) % 7));
   return Array.from({ length: 7 }, (_, i) => shiftDate(start, i));
 }
+const timeFormatter = new Intl.DateTimeFormat("en-GB", {
+  timeZone: TIMEZONE, hour: "2-digit", minute: "2-digit",
+});
+const dateFormatter = new Intl.DateTimeFormat("en-GB", {
+  timeZone: TIMEZONE, weekday: "short", day: "numeric", month: "short",
+});
 export function time(ms) {
-  return new Intl.DateTimeFormat("en-GB", {
-    timeZone: TIMEZONE,
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(ms);
+  return timeFormatter.format(ms);
 }
 export function dateLabel(date) {
-  return new Intl.DateTimeFormat("en-GB", {
-    timeZone: TIMEZONE,
-    weekday: "short",
-    day: "numeric",
-    month: "short",
-  }).format(midnight(date));
+  return dateFormatter.format(midnight(date));
 }

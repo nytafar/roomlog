@@ -21,6 +21,7 @@ import {
   selectionUnits,
   intersectsSelection,
 } from "./selection.mjs";
+import { historyKey, reuseHistory, overlapsHistory } from "./history-window.mjs";
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, text, className) => {
   const node = document.createElement(tag);
@@ -157,11 +158,11 @@ function requestedRange() {
     };
   return day;
 }
-async function load() {
+async function load(refresh = false) {
   if (!store) return;
   const mine = ++generation;
-  const range = requestedRange();
-  const params = { ...range, ...filters() };
+  let range = requestedRange();
+  let params = { ...range, ...filters() };
   const snapshot = { ...state, recipients: { ...state.recipients } };
   $("#date").value = state.date;
   document
@@ -177,19 +178,23 @@ async function load() {
   status("Loading…");
   let nextInfo = info;
   const searchMode = $("#search-mode").value;
-  const key = JSON.stringify({
-    level: state.level,
-    query: state.query,
-    mode: searchMode,
-    params,
-  });
+  const requestedKey = historyKey(state.level, params, state.query, searchMode);
+  const prior = store.lookup(requestedKey, reuseHistory);
+  // Refresh the covering snapshot, so a focused zoom does not invalidate its loaded day.
+  const key = refresh && prior ? prior.key : requestedKey;
+  const request = JSON.parse(key);
+  params = request.params;
+  range = { from_ms: params.from_ms, to_ms: params.to_ms };
+  snapshot.source = params.device_id || "";
+  const cachedDay = store.lookup(historyKey("day", params), reuseHistory);
   const result = await store.load(key, async (client, signal) => {
-    nextInfo = await client.read("info", {}, signal);
+    if (refresh) nextInfo = await client.read("info", {}, signal);
+    const pageParams = (p) => ({ ...p, limit: nextInfo.limits?.max_limit || 500 });
     const detail = (route, p) =>
       boundedPages(
         client,
         route,
-        p,
+        pageParams(p),
         signal,
         nextInfo.limits?.[route + "_window_ms"] || 86400000,
       );
@@ -198,11 +203,11 @@ async function load() {
         search: await pages(
           client,
           "search",
-          { ...params, q: snapshot.query, mode: searchMode },
+          pageParams({ ...params, q: snapshot.query, mode: searchMode }),
           signal,
         ),
       };
-    if (snapshot.level === "week")
+    if (request.kind === "week")
       return {
         timeline: await client.read(
           "timeline",
@@ -213,8 +218,10 @@ async function load() {
     const sources = snapshot.source
       ? [snapshot.source]
       : nextInfo.sources.map((source) => source.device_id);
-    const sessionsPromise = pages(client, "sessions", params, signal);
-    if (snapshot.level === "day") {
+    const sessionsPromise = !refresh && cachedDay
+      ? Promise.resolve(cachedDay.value.sessions)
+      : pages(client, "sessions", pageParams(params), signal);
+    if (request.kind === "day") {
       const reportsPromise =
         snapshot.channel === "ambient"
           ? Promise.resolve([])
@@ -262,13 +269,14 @@ async function load() {
       reports: reports.flatMap((page) => page.items),
       as_of_ms: Math.max(0, ...transcripts.map((page) => page.as_of_ms)),
     };
-  });
+  }, { refresh, reuse: reuseHistory, invalidates: refresh ? overlapsHistory : undefined });
   if (mine !== generation || result.obsolete) return;
   loading = false;
   if (result.value) {
     info = nextInfo;
     sourceOptions();
-    data = result.value;
+    data = key === requestedKey ? result.value :
+      reuseHistory(key, result.value, requestedKey) || result.value;
     render();
   } else {
     data = null;
@@ -282,7 +290,7 @@ async function load() {
     );
     if (result.error.status === 401 || result.error.status === 403)
       toast("Read access rejected. Log out and enter the owner read token.");
-  } else status(`Updated ${time(Date.now())}`);
+  } else status(`${result.cached ? "Loaded history" : "Updated " + time(Date.now())}`);
 }
 // One request per category at a time stays within the reader's concurrency budget.
 async function readSources(sources, read) {
@@ -344,7 +352,7 @@ $("#latest").onclick = async () => {
     status(error.message);
   }
 };
-$("#refresh").onclick = () => load();
+$("#refresh").onclick = () => load(true);
 for (const id of ["source", "channel", "lang"])
   $("#" + id).onchange = () => {
     state[id] = $("#" + id).value.trim();
@@ -375,24 +383,14 @@ $("#clear-search").onclick = () => {
   load();
 };
 function render() {
-  const view = $("#view");
-  view.replaceChildren();
+  const view = document.createDocumentFragment();
   rows = [];
   allUnits = [];
-  paintSelection();
-  if (data.search) {
-    renderSearch(view);
-    return;
-  }
-  if (data.timeline) {
-    renderWeek(view);
-    return;
-  }
-  if (state.level === "day") {
-    renderDay(view);
-    return;
-  }
-  renderText(view, state.level === "session");
+  if (data.search) renderSearch(view);
+  else if (data.timeline) renderWeek(view);
+  else if (state.level === "day") renderDay(view);
+  else renderText(view, state.level === "session");
+  $("#view").replaceChildren(view);
   paintSelection();
 }
 function renderWeek(view) {
@@ -767,6 +765,12 @@ $("#help-button").onclick = () =>
   ]);
 
 function paintSelection() {
+  if (!state.selection) {
+    document.querySelectorAll(".w.sel").forEach((node) => node.classList.remove("sel"));
+    $("#clipbar").hidden = true;
+    positionMarkers([]);
+    return;
+  }
   const selected = [];
   document.querySelectorAll("[data-unit]").forEach((node) => {
     const match = intersectsSelection(
@@ -1075,11 +1079,11 @@ setInterval(() => {
     !gesture &&
     !$("#sheet").classList.contains("open")
   )
-    load();
+    load(true);
 }, 10000);
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && adapter && !loading && !gesture) load();
+  if (!document.hidden && adapter && !loading && !gesture) load(true);
 });
 window.addEventListener("focus", () => {
-  if (adapter && !loading && !gesture) load();
+  if (adapter && !loading && !gesture) load(true);
 });
