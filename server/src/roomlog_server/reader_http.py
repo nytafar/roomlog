@@ -32,6 +32,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(data)
     def do_GET(self):
         try:
+            if len(self.path)>8192: raise RecallError(400,'invalid_parameter','Request URL too long')
             u=urlsplit(self.path)
             if u.path=='/healthz':
                 with closing(self.server.reader.connection()) as conn: conn.execute('SELECT 1')
@@ -39,7 +40,7 @@ class Handler(BaseHTTPRequestHandler):
             if not u.path.startswith('/v1/recall/'): self.static(u.path); return
             auth=self.headers.get_all('Authorization',[])
             token=auth[0][7:] if len(auth)==1 and auth[0].startswith('Bearer ') else ''
-            role=next((role for key,role in self.server.tokens.items() if hmac.compare_digest(key,token)),None)
+            role=next((role for key,role in self.server.tokens.items() if hmac.compare_digest(key.encode(),token.encode())),None)
             if role is None: raise RecallError(401,'unauthorized','Read credential required')
             if role!='owner': raise RecallError(403,'forbidden','Credential has no read role')
             route=u.path.removeprefix('/v1/recall/')

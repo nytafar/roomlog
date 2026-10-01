@@ -33,43 +33,8 @@
           "probability": null
         }
       ],
-      "tags": []
-    },
-    {
-      "segment_id": "2",
-      "device_id": "phone",
-      "start_utc_ms": 1790850001000,
-      "end_utc_ms": 1790850003000,
-      "text": "Skriv dette.",
-      "lang": "no",
-      "channel": "dictation",
-      "session_id": null,
-      "chunk_id": null,
-      "span_id": "10",
-      "producer": {
-        "kind": "dictation",
-        "model_id": "fixture-model",
-        "model_revision": null
-      },
-      "speaker": null,
-      "timing": "segment",
-      "words": null,
-      "tags": [
-        {
-          "key": "channel",
-          "value": "dictation",
-          "source": "deterministic",
-          "origin": "dictation",
-          "effective": true
-        },
-        {
-          "key": "app",
-          "value": "codex",
-          "source": "deterministic",
-          "origin": "dictation",
-          "effective": true
-        }
-      ]
+      "tags": [],
+      "processing_state": "done"
     },
     {
       "segment_id": "3",
@@ -98,7 +63,8 @@
           "origin": "cancelled-report",
           "effective": true
         }
-      ]
+      ],
+      "processing_state": "done"
     }
   ],
   "next_cursor": null

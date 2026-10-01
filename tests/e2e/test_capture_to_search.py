@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import math
+import json
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 import shutil
 import threading
 import wave
@@ -23,6 +26,8 @@ from roomlog_server.cli import main as roomlog_cli
 from roomlog_server.config import BackendConfig, Config as ServerConfig
 from roomlog_server.ingest import make_server
 from roomlog_server.queries import search
+from roomlog_server.recall import Reader
+from roomlog_server.reader_http import ReaderServer
 from roomlog_server.verify import verify_archive
 from roomlog_server.worker import Worker
 
@@ -99,6 +104,31 @@ def test_wav_capture_reaches_search(tmp_path, capsys):
             assert verify_archive(conn, server_cfg.archive_dir)["ok"]
         finally:
             conn.close()
+
+        # The browser's actual HTTP seam reads the worker result without opening
+        # ingest's app or touching its lifecycle.
+        recall = ReaderServer(("127.0.0.1", 0), Reader(server_cfg.db_path), {"owner-test": "owner"})
+        recall_thread = threading.Thread(target=recall.serve_forever, daemon=True)
+        recall_thread.start()
+        try:
+            address = f"http://127.0.0.1:{recall.server_port}/v1/recall/"
+            headers = {"Authorization": "Bearer owner-test"}
+            with urlopen(Request(address + "info", headers=headers)) as response:
+                source = json.load(response)["sources"][0]
+            params = dict(device_id=device_id, from_ms=source["first_known_ms"], to_ms=source["last_known_ms"])
+            with urlopen(Request(address + "transcript?" + urlencode(params), headers=headers)) as response:
+                text = json.load(response)["items"]
+            assert len(text) == 1 and "ord00" in text[0]["text"]
+            assert text[0]["producer"]["kind"] == "stt"
+            with urlopen(Request(address + "search?" + urlencode(dict(params, q="ord00")), headers=headers)) as response:
+                hits = json.load(response)["items"]
+            assert hits[0]["segment_id"] == text[0]["segment_id"]
+        finally:
+            recall.shutdown()
+            recall.server_close()
+            recall_thread.join(timeout=5)
+        with urlopen(f"http://{host}:{port}/healthz") as response:
+            assert response.status == 200
 
         config_file = tmp_path / "server.toml"
         config_file.write_text(f'[paths]\ndata_dir = "{server_cfg.data_dir}"\n')
