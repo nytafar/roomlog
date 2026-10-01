@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { WindowStore } from "../adapter.mjs";
-import { historyKey, reuseHistory, overlapsHistory } from "../history-window.mjs";
+import { historyKey, reuseHistory, overlapsHistory, coveringDetailKey } from "../history-window.mjs";
 const params = { from_ms: 0, to_ms: 100, channel: "ambient" };
 const row = { device_id: "a", segment_id: "1", start_utc_ms: 10, end_utc_ms: 20, text: "first" };
 const value = {
@@ -64,4 +64,22 @@ test("cache evicts by byte budget as well as entry count", async () => {
   assert.equal(store.cache.size, 0);
   assert.equal(store.bytes, 0);
   assert.equal(store.errors.size, 0);
+});
+
+test("day and focused refresh prefer complete loaded detail over an exact preview/subrange", async () => {
+  const store = new WindowStore({});
+  const day = historyKey("day", params);
+  const focus = historyKey("text", { ...params, device_id: "a", from_ms: 10, to_ms: 30 });
+  await store.load(day, async () => value);
+  await store.load(focus, async () => value);
+  await store.load(detail, async () => value);
+  assert.equal(store.lookup(day, reuseHistory).key, day);
+  assert.equal(coveringDetailKey(store.cache, day), detail);
+  assert.equal(coveringDetailKey(store.cache, focus), detail);
+  const refreshed = { ...value, transcript: [] };
+  await store.load(coveringDetailKey(store.cache, day), async () => refreshed, { invalidates: overlapsHistory });
+  assert.equal(store.cache.size, 1);
+  assert.deepEqual(store.lookup(focus, reuseHistory).value.transcript, []);
+  assert.deepEqual(store.lookup(day, reuseHistory).value.transcript, []);
+  assert.equal(coveringDetailKey(store.cache, historyKey("week", params)), undefined);
 });

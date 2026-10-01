@@ -258,11 +258,13 @@ try {
   );
   // Loaded day detail is reusable at session/text zoom and focused ranges.
   const warmReadCount = requests.length;
+  await evaluate(`window.warmFirstTurn=document.querySelector(".turn")`);
   for (const level of ["session", "text"]) {
     await evaluate(`document.querySelector('[data-level="${level}"]').click()`);
     await waitFor(`document.querySelector('[data-level="${level}"]').classList.contains('cur')&&!document.querySelector('#status').textContent.includes('Loading')`);
   }
   assert.equal(requests.length, warmReadCount, "warm zoom never waits on HTTP");
+  assert.equal(await evaluate(`document.querySelector(".turn")===window.warmFirstTurn`),true,"warm zoom retains the rendered transcript tree");
   await evaluate(`document.querySelector('[data-level="session"]').click()`);
   await waitFor(`document.querySelector('.blk')!==null&&!document.querySelector('#status').textContent.includes('Loading')`);
   await evaluate(`document.querySelector('.blk').click()`);
@@ -378,8 +380,10 @@ try {
   await evaluate(`document.querySelector('#logout').click()`);
   await evaluate(`document.querySelector('#token').value='browser-test';document.querySelector('#login').requestSubmit()`);
   await waitFor(`document.querySelector('.turn p')?.textContent==='Midnight point'`);
+  current = [{...current[0], text: "Fresh midnight point"}];
+  latestKnown = midnight + 1;
   await evaluate(`document.querySelector('#latest').click()`);
-  await waitFor(`document.querySelector('.turn p')?.textContent==='Midnight point'&&!document.querySelector('#status').textContent.includes('Loading')`);
+  await waitFor(`document.querySelector('.turn p')?.textContent==='Fresh midnight point'&&!document.querySelector('#status').textContent.includes('Loading')`);
   await evaluate(`document.querySelector('#logout').click()`);
   assert.equal(
     await evaluate(

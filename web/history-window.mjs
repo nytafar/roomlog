@@ -38,3 +38,23 @@ export function overlapsHistory(candidateKey, refreshedKey) {
   return a.from_ms < b.to_ms && a.to_ms > b.from_ms &&
     (!a.device_id || !b.device_id || a.device_id === b.device_id);
 }
+
+// Keep the widest loaded detail available when polling from a coarser/focused view.
+export function coveringDetailKey(cache, requestKey) {
+  const request = JSON.parse(requestKey);
+  if (!["day", "detail"].includes(request.kind)) return;
+  let best, width = -1, allSources = false;
+  for (const [candidateKey, value] of cache) {
+    const candidate = JSON.parse(candidateKey);
+    if (candidate.kind !== "detail" ||
+        reuseHistory(candidateKey, value, requestKey) === undefined) continue;
+    const duration = candidate.params.to_ms - candidate.params.from_ms;
+    const all = !candidate.params.device_id;
+    if (duration > width || (duration === width && all && !allSources)) {
+      best = candidateKey;
+      width = duration;
+      allSources = all;
+    }
+  }
+  return best;
+}

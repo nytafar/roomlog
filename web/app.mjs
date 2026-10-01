@@ -21,7 +21,7 @@ import {
   selectionUnits,
   intersectsSelection,
 } from "./selection.mjs";
-import { historyKey, reuseHistory, overlapsHistory } from "./history-window.mjs";
+import { historyKey, reuseHistory, overlapsHistory, coveringDetailKey } from "./history-window.mjs";
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, text, className) => {
   const node = document.createElement(tag);
@@ -50,7 +50,8 @@ const state = {
   activeClip: null,
 };
 let allUnits = [],
-  rows = [];
+  rows = [],
+  textRender = null;
 function sourceLabel(id) {
   return info?.sources.find((source) => source.device_id === id)?.label || id;
 }
@@ -130,6 +131,7 @@ $("#logout").onclick = () => {
   state.focus = null;
   rows = [];
   allUnits = [];
+  textRender = null;
   renderTray();
   paintSelection();
   closeSheet();
@@ -181,7 +183,9 @@ async function load(refresh = false) {
   const requestedKey = historyKey(state.level, params, state.query, searchMode);
   const prior = store.lookup(requestedKey, reuseHistory);
   // Refresh the covering snapshot, so a focused zoom does not invalidate its loaded day.
-  const key = refresh && prior ? prior.key : requestedKey;
+  const key = refresh
+    ? coveringDetailKey(store.cache, requestedKey) || prior?.key || requestedKey
+    : requestedKey;
   const request = JSON.parse(key);
   params = request.params;
   range = { from_ms: params.from_ms, to_ms: params.to_ms };
@@ -303,6 +307,7 @@ function navigate(
   date = state.date,
   source = state.source,
   focus = null,
+  refresh = false,
 ) {
   state.level = level;
   state.date = date;
@@ -311,7 +316,7 @@ function navigate(
   state.query = "";
   $("#query").value = "";
   $("#source").value = source;
-  load();
+  load(refresh);
   window.scrollTo({ top: 0 });
 }
 document
@@ -347,6 +352,8 @@ $("#latest").onclick = async () => {
       state.level,
       localDate(latest || Date.now()),
       state.source,
+      null,
+      true,
     );
   } catch (error) {
     status(error.message);
@@ -544,11 +551,22 @@ function renderText(view, expanded) {
       ),
     );
   }
+  const reports = state.channel !== "ambient" ? data.reports || [] : [];
+  const sameRows = (a, b) => a.length === b.length && a.every((row, i) => row === b[i]);
+  // Retain one text tree across overview and text/session zoom. Changed snapshots
+  // or focused ranges rebuild it; retaining one tree bounds extra DOM memory.
+  if (textRender && sameRows(textRender.rows, visible) && sameRows(textRender.reports, reports)) {
+    rows = textRender.rows;
+    allUnits = textRender.units;
+    view.append(textRender.node);
+    return;
+  }
+  const content = el("div");
   rows = visible;
   let lastSource, lastSession;
   for (const row of visible) {
     if (row.device_id !== lastSource || row.session_id !== lastSession) {
-      view.append(
+      content.append(
         el(
           "div",
           `${sourceLabel(row.device_id)} · ${row.session_id ? "Session" : "Ungrouped dictation"}`,
@@ -588,16 +606,18 @@ function renderText(view, expanded) {
         el("div", "Segment selection · word timing unavailable", "counts"),
       );
     turn.append(body);
-    view.append(turn);
+    content.append(turn);
   }
   if (!visible.length)
-    view.append(
+    content.append(
       el("p", "No matching text. Capture history may be incomplete.", "empty"),
     );
   if (state.channel !== "ambient" && data.reports?.length) {
-    view.append(el("h3", "Original dictation reports", "dayh"));
-    for (const report of data.reports) view.append(reportBlock(report));
+    content.append(el("h3", "Original dictation reports", "dayh"));
+    for (const report of data.reports) content.append(reportBlock(report));
   }
+  textRender = { node: content, rows, reports, units: allUnits };
+  view.append(content);
 }
 function reportBlock(report, open = false) {
   const block = el("article", null, "report");
