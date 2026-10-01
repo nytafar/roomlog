@@ -1,5 +1,7 @@
 """Separate HTTP reader and same-origin static host."""
 import argparse
+import gzip
+import socket
 from contextlib import closing
 import logging
 import sqlite3
@@ -21,12 +23,37 @@ class ReaderServer(ThreadingHTTPServer):
         self.slots=threading.BoundedSemaphore(LIMITS['concurrent_reads'])
         super().__init__(address,Handler)
 
+def accepts_gzip(header):
+    encodings = {}
+    for part in header.split(','):
+        name, *parameters = part.strip().lower().split(';')
+        quality = 1.0
+        for parameter in parameters:
+            if parameter.strip().startswith('q='):
+                try: quality = float(parameter.strip()[2:])
+                except ValueError: quality = 0.0
+        encodings[name] = quality
+    return 0 < encodings.get('gzip', encodings.get('*', 0)) <= 1
+
+
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(10)
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    def body_headers(self, data):
+        if len(data) >= 1024 and accepts_gzip(self.headers.get('Accept-Encoding', '')):
+            data = gzip.compress(data, compresslevel=1)
+            self.send_header('Content-Encoding', 'gzip')
+        self.send_header('Vary', 'Accept-Encoding')
+        self.send_header('Content-Length', str(len(data)))
+        return data
     def log_message(self,*args): pass
     def send(self,status,value):
         data=json.dumps(value,ensure_ascii=False,allow_nan=False).encode()
         self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8')
-        self.send_header('Cache-Control','private, no-store'); self.send_header('Content-Length',str(len(data)))
+        self.send_header('Cache-Control','private, no-store'); data=self.body_headers(data)
         if status==503: self.send_header('Retry-After','1')
         if status==401: self.send_header('WWW-Authenticate','Bearer')
         self.end_headers(); self.wfile.write(data)
@@ -68,7 +95,7 @@ class Handler(BaseHTTPRequestHandler):
         if not target.is_file(): raise RecallError(404,'not_found','File not found')
         data=target.read_bytes(); self.send_response(200)
         self.send_header('Content-Type',mimetypes.guess_type(target.name)[0] or 'application/octet-stream')
-        self.send_header('Content-Length',str(len(data))); self.send_header('Cache-Control','no-store')
+        data=self.body_headers(data); self.send_header('Cache-Control','no-store')
         self.send_header('X-Content-Type-Options','nosniff'); self.end_headers(); self.wfile.write(data)
 
 def main(argv=None):
