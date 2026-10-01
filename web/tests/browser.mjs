@@ -11,6 +11,11 @@ const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const fixture = JSON.parse(
   await readFile(join(root, "../contract/recall/transcript.json"), "utf8"),
 );
+const standalone = JSON.parse(
+  await readFile(join(root, "../contract/recall/standalone-dictation.json"), "utf8"),
+);
+fixture.items.push(...standalone.items);
+fixture.items.sort((a, b) => a.start_utc_ms - b.start_utc_ms);
 const timeline = JSON.parse(
   await readFile(
     join(root, "../contract/recall/unknown-timeline.json"),
@@ -18,6 +23,7 @@ const timeline = JSON.parse(
   ),
 );
 const base = fixture.items[0].start_utc_ms;
+let latestKnown = base + 5000;
 let current = fixture.items,
   fail = false,
   requests = [];
@@ -55,7 +61,8 @@ const server = createServer(async (req, res) => {
       const selected = current.filter(
         (row) =>
           row.start_utc_ms < Number(p.get("to_ms")) &&
-          row.end_utc_ms > Number(p.get("from_ms")) &&
+          (row.end_utc_ms > Number(p.get("from_ms")) ||
+            (row.end_utc_ms === row.start_utc_ms && row.start_utc_ms >= Number(p.get("from_ms")))) &&
           (!p.get("device_id") || row.device_id === p.get("device_id")) &&
           (!p.get("channel") ||
             p.get("channel") === "all" ||
@@ -72,7 +79,7 @@ const server = createServer(async (req, res) => {
             label: id === "nyta" ? "Office" : "Phone",
             display_as: id === "nyta" ? "room" : "device",
             first_known_ms: base,
-            last_known_ms: base + 5000,
+            last_known_ms: latestKnown,
           })),
         };
       else if (route === "transcript" || route === "search")
@@ -347,6 +354,16 @@ try {
       ),
     );
   }
+  // A latest point at Oslo midnight belongs to the new day.
+  const midnight = Date.parse("2026-10-02T00:00:00+02:00");
+  latestKnown = midnight;
+  current = [{...fixture.items[0], start_utc_ms: midnight, end_utc_ms: midnight,
+    text: "Midnight point", timing: "segment", words: null}];
+  await evaluate(`document.querySelector('#logout').click()`);
+  await evaluate(`document.querySelector('#token').value='browser-test';document.querySelector('#login').requestSubmit()`);
+  await waitFor(`document.querySelector('.turn p')?.textContent==='Midnight point'`);
+  await evaluate(`document.querySelector('#latest').click()`);
+  await waitFor(`document.querySelector('.turn p')?.textContent==='Midnight point'&&!document.querySelector('#status').textContent.includes('Loading')`);
   await evaluate(`document.querySelector('#logout').click()`);
   assert.equal(
     await evaluate(
