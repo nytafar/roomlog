@@ -22,11 +22,20 @@ def seed_chunk(conn, device_id="oma", start_utc="2026-09-26T10:00:00.000Z", dura
 
 
 def insert_segment(conn, chunk_id, idx, text, model_id="m1", start=0, end=1000):
-    cur = conn.execute(
-        """INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (chunk_id, idx, start, end, 0, text, model_id),
-    )
+    """Works on every schema version: `device_id` exists from v4 on."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(segments)")}
+    if "device_id" in cols:
+        cur = conn.execute(
+            """INSERT INTO segments (chunk_id, device_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id)
+               VALUES (?, 'oma', ?, ?, ?, ?, ?, ?)""",
+            (chunk_id, idx, start, end, 0, text, model_id),
+        )
+    else:
+        cur = conn.execute(
+            """INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (chunk_id, idx, start, end, 0, text, model_id),
+        )
     return cur.lastrowid
 
 
@@ -152,7 +161,7 @@ def test_migration_v2_to_v3_keeps_rows(tmp_path):
     conn.close()
 
     conn = dbmod.connect(path)
-    assert dbmod.user_version(conn) == 3
+    assert dbmod.user_version(conn) == dbmod.SCHEMA_VERSION
     row = conn.execute("SELECT * FROM chunks WHERE id = ?", (cid,)).fetchone()
     assert row["kind"] == "speech"
     assert row["path"] == "2026/09/26/x.opus"
@@ -179,6 +188,13 @@ def test_migration_v2_to_v3_keeps_rows(tmp_path):
            VALUES ('ab', 'derived', 'oma', 0, 1000, 1000, NULL, 0, 16000, '{}', 'r', 0, 0)"""
     )
     conn.close()
+    # stopping at v3 still gives the v3 shape
+    conn = sqlite3.connect(str(tmp_path / "v3.db"), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    dbmod.migrate(conn, target=3)
+    assert dbmod.user_version(conn) == 3
+    assert "device_id" not in {r[1] for r in conn.execute("PRAGMA table_info(segments)")}
+    conn.close()
 
 
 def test_migration_tolerates_preexisting_dangling_rows_and_rolls_back_new_ones(tmp_path, caplog):
@@ -198,30 +214,31 @@ def test_migration_tolerates_preexisting_dangling_rows_and_rolls_back_new_ones(t
     # a dangling row from before is not the migration's fault: the first start succeeds like the second
     with caplog.at_level(logging.WARNING, logger="roomlog.db"):
         conn = dbmod.connect(path)
-    assert dbmod.user_version(conn) == 3
+    assert dbmod.user_version(conn) == dbmod.SCHEMA_VERSION
     assert "dangling foreign key" in caplog.text
     assert len(conn.execute("PRAGMA foreign_key_check").fetchall()) == 1
     assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 2
     conn.close()
     conn = dbmod.connect(path)
-    assert dbmod.user_version(conn) == 3
+    assert dbmod.user_version(conn) == dbmod.SCHEMA_VERSION
     conn.close()
 
     # a step that itself leaves a dangling reference is rolled back whole and raised
     import pytest
-    bad = ("INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) "
-           "VALUES (998, 0, 0, 1, 0, 'ny foreldrelaus', 'm');")
+    bad = ("INSERT INTO segments (chunk_id, device_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) "
+           "VALUES (998, 'oma', 0, 0, 1, 0, 'ny foreldrelaus', 'm');")
     conn = sqlite3.connect(str(path), isolation_level=None)
     conn.row_factory = sqlite3.Row
     saved = dict(dbmod._MIGRATIONS)
-    dbmod._MIGRATIONS[4] = bad
+    nxt = dbmod.SCHEMA_VERSION + 1
+    dbmod._MIGRATIONS[nxt] = bad
     try:
-        with pytest.raises(RuntimeError, match="v4 left 1 dangling"):
-            dbmod.migrate(conn, target=4)
+        with pytest.raises(RuntimeError, match=f"v{nxt} left 1 dangling"):
+            dbmod.migrate(conn, target=nxt)
     finally:
         dbmod._MIGRATIONS.clear()
         dbmod._MIGRATIONS.update(saved)
-    assert dbmod.user_version(conn) == 3
+    assert dbmod.user_version(conn) == dbmod.SCHEMA_VERSION
     assert not conn.in_transaction
     assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 2
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1

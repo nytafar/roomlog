@@ -3,6 +3,11 @@
 Plain `sqlite3`. Two external-content FTS5 tables over `segments.text`:
 `segments_fts` (unicode61, diacritics kept, so `går` ≠ `gar`) for bm25 search and
 `segments_tri` (trigram) for fuzzy search, both kept in sync by triggers.
+
+v4 (ADR 0008): `dictation_spans` (what the dictation tool said happened on a device between
+two instants), `tags` (facts with a `source` on a transcript row or a device time span) and
+`segments` rebuilt with `device_id`, a nullable `chunk_id` (a span with no overlapping audio
+still becomes a row), `span_id`, `superseded_by` and `lang NOT NULL`.
 """
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ from pathlib import Path
 
 log = logging.getLogger("roomlog.db")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _MIGRATIONS: dict[int, str] = {
     1: """
@@ -198,6 +203,100 @@ CREATE TABLE raw_progress (
     PRIMARY KEY (device_id, run_id, epoch)
 );
 """,
+    # ADR 0008. `segments` is rebuilt (SQLite cannot drop NOT NULL on chunk_id in place); the
+    # external-content FTS tables keep their index because row ids and text are unchanged,
+    # only the triggers have to come back. Existing rows get `device_id` from their chunk
+    # (dangling rows from before keep an empty device) and `lang` backfilled to `no`: every
+    # row so far came from NB-Whisper with the worker's `language = "no"`.
+    4: """
+CREATE TABLE dictation_spans (
+    id                  INTEGER PRIMARY KEY,
+    device_id           TEXT NOT NULL,
+    start_utc_ms        INTEGER NOT NULL,
+    end_utc_ms          INTEGER NOT NULL,
+    text                TEXT NOT NULL,
+    lang                TEXT NOT NULL,
+    engine              TEXT NOT NULL,
+    mode                TEXT NOT NULL CHECK (mode IN ('raw', 'cleanup', 'edit-instruction')),
+    app                 TEXT,
+    window              TEXT,
+    cancelled           INTEGER NOT NULL DEFAULT 0,
+    origin              TEXT NOT NULL,
+    body_json           TEXT NOT NULL,
+    received_utc_ms     INTEGER NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied')),
+    applied_utc_ms      INTEGER,
+    segment_id          INTEGER,
+    UNIQUE (device_id, start_utc_ms)
+);
+CREATE INDEX dictation_spans_device_time ON dictation_spans (device_id, start_utc_ms, end_utc_ms);
+CREATE INDEX dictation_spans_status ON dictation_spans (status);
+
+CREATE TABLE segments_v4 (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    chunk_id            INTEGER REFERENCES chunks(id) ON DELETE CASCADE,
+    device_id           TEXT NOT NULL,
+    span_id             INTEGER REFERENCES dictation_spans(id) ON DELETE CASCADE,
+    superseded_by       INTEGER REFERENCES dictation_spans(id) ON DELETE SET NULL,
+    idx                 INTEGER NOT NULL,
+    start_utc_ms        INTEGER NOT NULL,
+    end_utc_ms          INTEGER NOT NULL,
+    offset_ms           INTEGER NOT NULL,
+    text                TEXT NOT NULL,
+    lang                TEXT NOT NULL DEFAULT 'no',
+    avg_logprob         REAL,
+    no_speech_prob      REAL,
+    compression_ratio   REAL,
+    words_json          TEXT,
+    speaker             TEXT,
+    model_id            TEXT NOT NULL,
+    model_revision      TEXT
+);
+INSERT INTO segments_v4 (id, chunk_id, device_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, lang,
+                         avg_logprob, no_speech_prob, compression_ratio, words_json, speaker,
+                         model_id, model_revision)
+    SELECT s.id, s.chunk_id, COALESCE(c.device_id, ''), s.idx, s.start_utc_ms, s.end_utc_ms, s.offset_ms,
+           s.text, COALESCE(s.lang, 'no'), s.avg_logprob, s.no_speech_prob, s.compression_ratio,
+           s.words_json, s.speaker, s.model_id, s.model_revision
+    FROM segments s LEFT JOIN chunks c ON c.id = s.chunk_id;
+DROP TABLE segments;
+ALTER TABLE segments_v4 RENAME TO segments;
+CREATE INDEX segments_start ON segments (start_utc_ms);
+CREATE INDEX segments_chunk ON segments (chunk_id, idx);
+CREATE INDEX segments_device_start ON segments (device_id, start_utc_ms);
+CREATE INDEX segments_span ON segments (span_id);
+
+CREATE TABLE tags (
+    id                  INTEGER PRIMARY KEY,
+    target              TEXT NOT NULL CHECK (target IN ('segment', 'span')),
+    segment_id          INTEGER REFERENCES segments(id) ON DELETE CASCADE,
+    device_id           TEXT,
+    start_utc_ms        INTEGER,
+    end_utc_ms          INTEGER,
+    key                 TEXT NOT NULL,
+    value               TEXT NOT NULL,
+    source              TEXT NOT NULL CHECK (source IN ('deterministic', 'model')),
+    origin              TEXT NOT NULL,
+    created_utc_ms      INTEGER NOT NULL
+);
+CREATE INDEX tags_segment ON tags (segment_id, key);
+CREATE INDEX tags_span ON tags (device_id, start_utc_ms, end_utc_ms, key);
+
+CREATE TRIGGER segments_ai AFTER INSERT ON segments BEGIN
+    INSERT INTO segments_fts(rowid, text) VALUES (new.id, new.text);
+    INSERT INTO segments_tri(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER segments_ad AFTER DELETE ON segments BEGIN
+    INSERT INTO segments_fts(segments_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO segments_tri(segments_tri, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+CREATE TRIGGER segments_au AFTER UPDATE ON segments BEGIN
+    INSERT INTO segments_fts(segments_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO segments_tri(segments_tri, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO segments_fts(rowid, text) VALUES (new.id, new.text);
+    INSERT INTO segments_tri(rowid, text) VALUES (new.id, new.text);
+END;
+""",
 }
 
 
@@ -233,6 +332,12 @@ def connect(path: str | Path, readonly: bool = False) -> sqlite3.Connection:
     return conn
 
 
+def _dangling(conn: sqlite3.Connection) -> set[tuple]:
+    """Rows failing a foreign key, as (table, rowid, parent). The constraint index that
+    `foreign_key_check` also reports is left out: a table rebuild renumbers it."""
+    return {(r[0], r[1], r[2]) for r in conn.execute("PRAGMA foreign_key_check").fetchall()}
+
+
 def user_version(conn: sqlite3.Connection) -> int:
     return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
@@ -252,14 +357,14 @@ def migrate(conn: sqlite3.Connection, target: int = SCHEMA_VERSION) -> None:
     # so a start never fails on them.
     conn.execute("PRAGMA foreign_keys=OFF")
     try:
-        before = set(map(tuple, conn.execute("PRAGMA foreign_key_check").fetchall()))
+        before = _dangling(conn)
         if before:
             log.warning("database has %d dangling foreign key row(s) before migration", len(before))
         for version in range(current + 1, target + 1):
             script = f"BEGIN;\n{_MIGRATIONS[version]}\nPRAGMA user_version={version};"
             try:
                 conn.executescript(script)
-                after = set(map(tuple, conn.execute("PRAGMA foreign_key_check").fetchall()))
+                after = _dangling(conn)
                 added = after - before
                 if added:
                     raise RuntimeError(

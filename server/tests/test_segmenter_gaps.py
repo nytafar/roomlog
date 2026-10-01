@@ -288,8 +288,8 @@ def test_resegment_range_in_the_middle_of_a_run_touches_only_that_extent(tmp_pat
     assert len(before) == 29 and statuses(conn, "s22") == ["segmented"] * 10
     conn.execute("UPDATE chunks SET status = 'done'")
     for c in before:
-        conn.execute("INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) "
-                     "VALUES (?, 0, 0, 1, 0, 'x', 'm')", (c["id"],))
+        conn.execute("INSERT INTO segments (chunk_id, device_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) "
+                     "VALUES (?, 's22', 0, 0, 1, 0, 'x', 'm')", (c["id"],))
 
     # segments starting in [100 s, 130 s): only the one at 120 s. Its tones: 125-131 (straddles the
     # seam at 150 s? no: 145-151 does), and the 115-121 tone straddles 120 s.

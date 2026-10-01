@@ -4,6 +4,7 @@
     GET /healthz              no auth
     GET /v1/whoami            bearer token → {"device_id": ...}
     GET /v1/time              bearer token → {"utc_ns": ...}
+    POST /v1/spans            bearer token, JSON body = one dictation span (ADR 0008)
 
 `kind: "raw"` segments (ADR 0005) take the same route and codes; they land under
 `archive/raw/` and in `raw_segments` instead of `chunks`.
@@ -29,10 +30,12 @@ from . import db as dbmod
 from .archive import scan_orphans, store_chunk
 from .config import Config, load_tokens
 from .sidecar import SidecarError, validate_sidecar
+from .spans import SpanError, parse_body, store_span, validate_span
 
 log = logging.getLogger("roomlog.ingest")
 
 _CHUNK_PATH = re.compile(r"^/v1/chunks/([0-9a-f]{64})$")
+MAX_SPAN_BODY = 64 * 1024
 
 
 class IngestApp:
@@ -221,6 +224,45 @@ class IngestHandler(BaseHTTPRequestHandler):
                 "path": result.path,
             },
         )
+
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/v1/spans":
+            self._reject(404, "not found")
+            return
+        device_id = self.app.device_for_token(self.headers.get("Authorization"))
+        if device_id is None:
+            self._reject(401, "missing or unknown token")
+            return
+        length = self._content_length()
+        if length is None:
+            self.close_connection = True
+            self._error(411, "Content-Length required")
+            return
+        if length > MAX_SPAN_BODY:
+            self._reject(413, f"body larger than {MAX_SPAN_BODY} bytes", length)
+            return
+        body = self.rfile.read(length) if length else b""
+        if len(body) != length:
+            self.close_connection = True
+            self._error(400, "short body")
+            return
+        try:
+            span = validate_span(parse_body(body))
+        except (ValueError, SpanError) as e:
+            self._error(422, f"span invalid: {e}")
+            return
+        if span["device_id"] not in (None, device_id):
+            self._error(403, "token belongs to a different device")
+            return
+        try:
+            span_id, created = store_span(self.app.conn(), device_id, span, body.decode("utf-8"))
+        except Exception as e:
+            log.exception("span store failed")
+            self._error(500, f"store failed: {e.__class__.__name__}")
+            return
+        self._send(201 if created else 200,
+                   {"id": span_id, "status": "created" if created else "exists", "device_id": device_id})
 
 
 def make_server(cfg: Config, bind: str | None = None,

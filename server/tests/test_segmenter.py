@@ -256,7 +256,7 @@ def test_missing_model_is_reported_not_raised(tmp_path):
 
 
 def test_worker_transcribes_derived_chunk_with_absolute_times(tmp_path):
-    cfg = make_config(tmp_path)
+    cfg = make_config(tmp_path, dictation_hold_s=0)  # the clock here is 1 s past the audio
     conn = dbmod.connect(cfg.db_path)
     fx = RawSegments(cfg, conn)
     fx.store_all(pattern_pcm([("s", 25), ("t", 15), ("s", 35)]), last_cut="shutdown")
@@ -313,8 +313,8 @@ def test_reset_segmentation_rederives_the_same_chunks(tmp_path):
     before = derived(conn)
     assert len(before) == 2
     conn.execute("UPDATE chunks SET status = 'done'")
-    conn.execute("INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) "
-                 "VALUES (?, 0, 0, 1, 0, 'x', 'm')", (before[0]["id"],))
+    conn.execute("INSERT INTO segments (chunk_id, device_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) "
+                 "VALUES (?, 's22', 0, 0, 1, 0, 'x', 'm')", (before[0]["id"],))
 
     out = reset_segmentation(conn, "s22")
     assert out == {"epochs": 1, "raw_reset": 3, "chunks_deleted": 2}

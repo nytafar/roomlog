@@ -65,6 +65,9 @@ class Config:
     window_gap_s: float = 0.3
     max_attempts: int = 3
     language: str | None = "no"
+    # ADR 0008: a chunk waits this long after its end before STT, so a dictation span for
+    # the same audio (posted when the dictation finishes) usually arrives first
+    dictation_hold_s: float = 20.0
     session_gap_s: float = 300.0
     filters: Filters = field(default_factory=Filters)
     backends: list[BackendConfig] = field(default_factory=list)
@@ -140,6 +143,8 @@ def config_from_dict(raw: dict[str, Any], config_dir: Path | None = None) -> Con
     for key in ("poll_s", "batch_size", "window_s", "window_gap_s", "max_attempts"):
         if key in worker:
             kwargs[key] = worker[key]
+    if "dictation_hold_s" in worker:
+        kwargs["dictation_hold_s"] = float(worker["dictation_hold_s"])
     if "language" in worker:
         lang = worker["language"]
         kwargs["language"] = None if lang in ("", "auto", None) else lang

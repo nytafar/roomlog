@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--limit", type=int, default=10)
     s.add_argument("--offset", type=int, default=0)
     s.add_argument("--fuzzy", action="store_true", help="trigram substring match")
+    s.add_argument("--include-dictation", action="store_true",
+                   help="also rows on the dictation channel (left out by default)")
 
     s = sub.add_parser("sessions", help="list sessions")
     _add_time_filters(s)
@@ -46,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("session", help="print one session's transcript")
     s.add_argument("session_id")
+    s.add_argument("--include-dictation", action="store_true", help="also rows on the dictation channel")
+
+    s = sub.add_parser("spans", help="list dictation spans as received (ADR 0008)")
+    _add_time_filters(s)
+    s.add_argument("--limit", type=int, default=50)
 
     s = sub.add_parser("export", help="write one markdown file per session")
     s.add_argument("--vault", required=True, help="target directory")
@@ -113,7 +120,7 @@ def cmd_worker(cfg: Config, args: argparse.Namespace) -> int:
     if args.once:
         res = w.run_once()
         print(f"claimed={res.claimed} done={res.done} failed={res.failed} windows={res.windows} "
-              f"segmented={res.segmented_chunks}")
+              f"segmented={res.segmented_chunks} spans={res.spans_applied} covered={res.covered}")
         for e in res.errors:
             print(f"  {e}")
         return 0 if not res.errors else 1
@@ -157,8 +164,23 @@ def cmd_search(cfg: Config, args: argparse.Namespace) -> int:
     from .queries import search
     conn = _ro(cfg)
     rows = search(conn, args.query, parse_user_time(args.from_utc), parse_user_time(args.to_utc),
-                  args.device_id, args.limit, args.offset, args.fuzzy)
-    text = "".join(f"{r['session_id'] or '-'}  {r['start_utc']}  {r['text']}\n" for r in rows)
+                  args.device_id, args.limit, args.offset, args.fuzzy, args.include_dictation)
+    text = "".join(f"{r['session_id'] or '-'}  {r['start_utc']}  {r['lang']} {r['channel']}  {r['text']}\n"
+                   for r in rows)
+    _out(args, rows, text)
+    return 0
+
+
+def cmd_spans(cfg: Config, args: argparse.Namespace) -> int:
+    from .queries import list_spans
+    conn = _ro(cfg)
+    rows = list_spans(conn, parse_user_time(args.from_utc), parse_user_time(args.to_utc),
+                      args.device_id, args.limit)
+    text = "".join(
+        f"{r['id']:>5}  {r['device_id']}  {r['start_utc']} → {r['end_utc']}  {r['lang']} {r['mode']}"
+        f"{' cancelled' if r['cancelled'] else ''}  {r['status']}  {r['text'][:80]}\n"
+        for r in rows
+    )
     _out(args, rows, text)
     return 0
 
@@ -180,7 +202,7 @@ def cmd_sessions(cfg: Config, args: argparse.Namespace) -> int:
 def cmd_session(cfg: Config, args: argparse.Namespace) -> int:
     from .queries import get_session, transcript_lines
     conn = _ro(cfg)
-    s = get_session(conn, args.session_id)
+    s = get_session(conn, args.session_id, args.include_dictation)
     if s is None:
         print(f"no session {args.session_id}", file=sys.stderr)
         return 1
@@ -270,6 +292,7 @@ COMMANDS = {
     "search": cmd_search,
     "sessions": cmd_sessions,
     "session": cmd_session,
+    "spans": cmd_spans,
     "export": cmd_export,
     "status": cmd_status,
     "verify": cmd_verify,

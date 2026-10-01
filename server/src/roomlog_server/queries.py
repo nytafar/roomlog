@@ -1,4 +1,9 @@
-"""Read-only queries shared by the CLI and the MCP tools (§4.6). No raw SQL leaves this file."""
+"""Read-only queries shared by the CLI and the MCP tools (§4.6). No raw SQL leaves this file.
+
+Default filter set (ADR 0008): rows superseded by a dictation span are never listed, and
+rows on the dictation channel are left out unless the caller asks for `include_dictation`.
+Every row reports its `lang` and `channel` (the `channel` tag, `ambient` when untagged).
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,23 @@ from pathlib import Path
 from typing import Any
 
 from .db import fts_query
+from .spans import CHANNEL_DEFAULT, CHANNEL_DICTATION, span_json
 from .times import ms_to_hms, ms_to_iso, now_ms
+
+_CHANNEL = f"""COALESCE((SELECT t.value FROM tags t WHERE t.target = 'segment' AND t.segment_id = s.id
+                      AND t.key = 'channel' ORDER BY t.id DESC LIMIT 1), '{CHANNEL_DEFAULT}')"""
+_SEG_COLS = f"""s.id, s.chunk_id, s.start_utc_ms, s.end_utc_ms, s.text, s.lang, s.model_id,
+                s.device_id, s.span_id, c.session_id, {_CHANNEL} AS channel"""
+_SEG_FROM = "LEFT JOIN chunks c ON c.id = s.chunk_id"
+_NOT_DICTATION = f"""NOT EXISTS (SELECT 1 FROM tags t WHERE t.target = 'segment' AND t.segment_id = s.id
+                                 AND t.key = 'channel' AND t.value = '{CHANNEL_DICTATION}')"""
+
+
+def _default_where(include_dictation: bool) -> list[str]:
+    where = ["s.superseded_by IS NULL"]
+    if not include_dictation:
+        where.append(_NOT_DICTATION)
+    return where
 
 
 def _segment_row(r: sqlite3.Row, score: float | None = None) -> dict[str, Any]:
@@ -22,8 +43,11 @@ def _segment_row(r: sqlite3.Row, score: float | None = None) -> dict[str, Any]:
         "end_utc_ms": r["end_utc_ms"],
         "text": r["text"],
         "lang": r["lang"],
+        "channel": r["channel"],
         "model_id": r["model_id"],
     }
+    if r["span_id"] is not None:
+        d["span_id"] = r["span_id"]
     if score is not None:
         d["score"] = score
     return d
@@ -31,12 +55,13 @@ def _segment_row(r: sqlite3.Row, score: float | None = None) -> dict[str, Any]:
 
 def search(conn: sqlite3.Connection, query: str, from_ms: int | None = None, to_ms: int | None = None,
            device_id: str | None = None, limit: int = 10, offset: int = 0,
-           fuzzy: bool = False) -> list[dict[str, Any]]:
+           fuzzy: bool = False, include_dictation: bool = False) -> list[dict[str, Any]]:
     """bm25 over `segments_fts`, or trigram substring match over `segments_tri` with `fuzzy`.
 
     The trigram index cannot see terms shorter than three characters, so with `fuzzy` those
     terms (`ok`, `må`) are applied as case-folded substring tests on the candidate rows
     instead of being dropped; a query of only short terms scans without the index.
+    Dictation rows are left out unless `include_dictation`.
     """
     terms = query.split()
     if not terms:
@@ -66,8 +91,9 @@ def search(conn: sqlite3.Connection, query: str, from_ms: int | None = None, to_
         where.append("s.start_utc_ms < ?")
         params.append(to_ms)
     if device_id:
-        where.append("c.device_id = ?")
+        where.append("s.device_id = ?")
         params.append(device_id)
+    where += _default_where(include_dictation)
     if table is not None:
         source = f"FROM {table} f JOIN segments s ON s.id = f.rowid"
         score = f"bm25({table})"
@@ -77,11 +103,10 @@ def search(conn: sqlite3.Connection, query: str, from_ms: int | None = None, to_
         score = "NULL"
         order = "s.start_utc_ms DESC"
     sql = f"""
-        SELECT s.id, s.chunk_id, s.start_utc_ms, s.end_utc_ms, s.text, s.lang, s.model_id,
-               c.device_id, c.session_id, {score} AS score
+        SELECT {_SEG_COLS}, {score} AS score
         {source}
-        JOIN chunks c ON c.id = s.chunk_id
-        WHERE {" AND ".join(where) if where else "1=1"}
+        {_SEG_FROM}
+        WHERE {" AND ".join(where)}
         ORDER BY {order}
         LIMIT ? OFFSET ?
     """
@@ -182,29 +207,35 @@ def list_devices(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return [devices[k] for k in sorted(devices)]
 
 
-def session_segments(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
+def session_segments(conn: sqlite3.Connection, session_id: str,
+                     include_dictation: bool = False) -> list[dict[str, Any]]:
+    where = ["c.session_id = ?"] + _default_where(include_dictation)
     rows = conn.execute(
-        """SELECT s.id, s.chunk_id, s.start_utc_ms, s.end_utc_ms, s.text, s.lang, s.model_id,
-                  c.device_id, c.session_id
-           FROM segments s JOIN chunks c ON c.id = s.chunk_id
-           WHERE c.session_id = ?
-           ORDER BY s.start_utc_ms, s.chunk_id, s.idx""",
+        f"""SELECT {_SEG_COLS} FROM segments s {_SEG_FROM}
+            WHERE {" AND ".join(where)}
+            ORDER BY s.start_utc_ms, s.chunk_id, s.idx""",
         (session_id,),
     ).fetchall()
     return [_segment_row(r) for r in rows]
 
 
-def get_session(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
+def get_session(conn: sqlite3.Connection, session_id: str,
+                include_dictation: bool = False) -> dict[str, Any] | None:
     r = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
     if r is None:
         return None
     d = _session_row(r)
-    d["segments"] = session_segments(conn, session_id)
+    d["segments"] = session_segments(conn, session_id, include_dictation)
     return d
 
 
 def transcript_lines(segments: list[dict[str, Any]]) -> list[str]:
-    return [f"[{ms_to_hms(s['start_utc_ms'])}] {s['text']}" for s in segments]
+    """`[HH:MM:SS] text`; a row off the ambient channel says so: `[HH:MM:SS] (dictation en) text`."""
+    out = []
+    for s in segments:
+        mark = "" if s.get("channel", CHANNEL_DEFAULT) == CHANNEL_DEFAULT else f"({s['channel']} {s['lang']}) "
+        out.append(f"[{ms_to_hms(s['start_utc_ms'])}] {mark}{s['text']}")
+    return out
 
 
 def middle_truncate(text: str, max_chars: int) -> str:
@@ -217,22 +248,21 @@ def middle_truncate(text: str, max_chars: int) -> str:
     return text[:head] + marker + (text[-tail:] if tail else "")
 
 
-def get_segment_context(conn: sqlite3.Connection, segment_id: int, window_s: float = 60.0) -> dict[str, Any] | None:
+def get_segment_context(conn: sqlite3.Connection, segment_id: int, window_s: float = 60.0,
+                        include_dictation: bool = False) -> dict[str, Any] | None:
+    """The rows around one row (same device). The anchor is returned whatever its channel;
+    the context applies the default filters unless `include_dictation`."""
     r = conn.execute(
-        """SELECT s.id, s.chunk_id, s.start_utc_ms, s.end_utc_ms, s.text, s.lang, s.model_id,
-                  c.device_id, c.session_id
-           FROM segments s JOIN chunks c ON c.id = s.chunk_id WHERE s.id = ?""",
-        (segment_id,),
+        f"SELECT {_SEG_COLS} FROM segments s {_SEG_FROM} WHERE s.id = ?", (segment_id,),
     ).fetchone()
     if r is None:
         return None
     w = int(window_s * 1000)
+    where = ["s.device_id = ?", "s.end_utc_ms >= ?", "s.start_utc_ms <= ?"] + _default_where(include_dictation)
     rows = conn.execute(
-        """SELECT s.id, s.chunk_id, s.start_utc_ms, s.end_utc_ms, s.text, s.lang, s.model_id,
-                  c.device_id, c.session_id
-           FROM segments s JOIN chunks c ON c.id = s.chunk_id
-           WHERE c.device_id = ? AND s.end_utc_ms >= ? AND s.start_utc_ms <= ?
-           ORDER BY s.start_utc_ms, s.chunk_id, s.idx""",
+        f"""SELECT {_SEG_COLS} FROM segments s {_SEG_FROM}
+            WHERE {" AND ".join(where)}
+            ORDER BY s.start_utc_ms, s.chunk_id, s.idx""",
         (r["device_id"], r["start_utc_ms"] - w, r["end_utc_ms"] + w),
     ).fetchall()
     return {
@@ -241,6 +271,35 @@ def get_segment_context(conn: sqlite3.Connection, segment_id: int, window_s: flo
         "context": [_segment_row(x) for x in rows],
         "text": "\n".join(transcript_lines([_segment_row(x) for x in rows])),
     }
+
+
+def list_spans(conn: sqlite3.Connection, from_ms: int | None = None, to_ms: int | None = None,
+               device_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    """Dictation spans as received, newest first, with their worker status."""
+    where = ["1=1"]
+    params: list[Any] = []
+    if from_ms is not None:
+        where.append("end_utc_ms >= ?")
+        params.append(from_ms)
+    if to_ms is not None:
+        where.append("start_utc_ms < ?")
+        params.append(to_ms)
+    if device_id:
+        where.append("device_id = ?")
+        params.append(device_id)
+    params.append(max(1, min(int(limit), 1000)))
+    rows = conn.execute(
+        f"SELECT * FROM dictation_spans WHERE {' AND '.join(where)} ORDER BY start_utc_ms DESC, id DESC LIMIT ?",
+        params,
+    ).fetchall()
+    out = []
+    for r in rows:
+        d = span_json(r)
+        d["start_utc"] = ms_to_iso(r["start_utc_ms"])
+        d["end_utc"] = ms_to_iso(r["end_utc_ms"])
+        d["cancelled"] = bool(r["cancelled"])
+        out.append(d)
+    return out
 
 
 def status(conn: sqlite3.Connection, archive_dir: Path | None = None, now: int | None = None) -> dict[str, Any]:
@@ -271,6 +330,12 @@ def status(conn: sqlite3.Connection, archive_dir: Path | None = None, now: int |
             "bytes": raw_bytes,
         },
         "segments": conn.execute("SELECT count(*) FROM segments").fetchone()[0],
+        "spans": {
+            "pending": conn.execute("SELECT count(*) FROM dictation_spans WHERE status = 'pending'").fetchone()[0],
+            "applied": conn.execute("SELECT count(*) FROM dictation_spans WHERE status = 'applied'").fetchone()[0],
+            "superseded_segments": conn.execute(
+                "SELECT count(*) FROM segments WHERE superseded_by IS NOT NULL").fetchone()[0],
+        },
         "sessions": conn.execute("SELECT count(*) FROM sessions").fetchone()[0],
         "open_sessions": conn.execute("SELECT count(*) FROM sessions WHERE closed = 0").fetchone()[0],
         "pending_oldest_age_s": round((now - oldest) / 1000, 1) if oldest else 0.0,

@@ -121,7 +121,7 @@ def test_session_with_more_chunks_than_sqlite_variables(conn):
            run_id, epoch, discontinuity, clock_synced, received_utc_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         rows,
     )
-    conn.execute("INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) VALUES (1, 0, ?, ?, 0, 'x', 'm')", (T0, T0 + 100))
+    conn.execute("INSERT INTO segments (chunk_id, device_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) VALUES (1, 'oma', 0, ?, ?, 0, 'x', 'm')", (T0, T0 + 100))
     assert rebuild_sessions(conn, 300, now=T0) == 1
     s = conn.execute("SELECT n_chunks, n_segments FROM sessions").fetchone()
     assert (s["n_chunks"], s["n_segments"]) == (n, 1)

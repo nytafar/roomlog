@@ -38,8 +38,8 @@ def seed(cfg) -> dict:
         conn.execute("UPDATE chunks SET status='done', model_id='fake', transcribed_utc_ms=? WHERE id=?", (start_ms + 5000, cid))
         for i, (off, text) in enumerate(texts):
             conn.execute(
-                "INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, lang, model_id) VALUES (?,?,?,?,?,?,?,?)",
-                (cid, i, start_ms + off, start_ms + off + 1500, off, text, "no", "fake"),
+                "INSERT INTO segments (chunk_id, device_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, lang, model_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                (cid, device, i, start_ms + off, start_ms + off + 1500, off, text, "no", "fake"),
             )
         ids[key] = cid
         return cid
@@ -77,7 +77,7 @@ def test_cli_help_lists_subcommands(capsys):
         main(["--help"])
     assert e.value.code == 0
     out = capsys.readouterr().out
-    for cmd in ("ingest", "worker", "search", "sessions", "session", "export", "status",
+    for cmd in ("ingest", "worker", "search", "sessions", "session", "spans", "export", "status",
                 "verify", "sessionize", "fetch-model", "selftest"):
         assert cmd in out
 
@@ -92,7 +92,7 @@ def test_cli_search(seeded, capsys):
     assert lines[0].startswith(("oma_20260926T100000000Z", "pi-work_20260926T100140000Z"))
     assert "2026-09-26T10:00:00.000Z" in out
     rc, out, _ = run(base + ["search", "går", "--device", "pi-work"], capsys)
-    assert out.strip().splitlines() == ["pi-work_20260926T100140000Z  2026-09-26T10:01:40.100Z  Vi går til lunsj"]
+    assert out.strip().splitlines() == ["pi-work_20260926T100140000Z  2026-09-26T10:01:40.100Z  no ambient  Vi går til lunsj"]
     rc, out, _ = run(base + ["search", "gar"], capsys)
     assert out.strip() == ""
     rc, out, _ = run(base + ["search", "intellig", "--fuzzy"], capsys)
@@ -289,10 +289,10 @@ def test_mcp_server_registers_tools_and_calls_them(seeded):
     server = build_server(cfg)
     tools = asyncio.run(server.list_tools())
     names = {t.name for t in tools}
-    assert names == {"search", "list_sessions", "list_devices", "get_session", "get_segment_context"}
+    assert names == {"search", "list_sessions", "list_devices", "get_session", "get_segment_context", "list_spans"}
     search_tool = next(t for t in tools if t.name == "search")
     props = getattr(search_tool, "input_schema", getattr(search_tool, "inputSchema", None))["properties"]
-    assert set(props) == {"query", "from_utc", "to_utc", "device_id", "limit", "offset", "fuzzy"}
+    assert set(props) == {"query", "from_utc", "to_utc", "device_id", "limit", "offset", "fuzzy", "include_dictation"}
 
     def payload_of(result):
         sc = getattr(result, "structured_content", None)

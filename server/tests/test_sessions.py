@@ -94,7 +94,7 @@ def test_closing_rule(conn):
 
 def test_rebuild_counts_segments_and_keeps_titles(conn):
     cid = add_chunk(conn, T0, 10)
-    conn.execute("INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) VALUES (?,0,?,?,0,'hei','m')", (cid, T0, T0 + 1000))
+    conn.execute("INSERT INTO segments (chunk_id, device_id, idx, start_utc_ms, end_utc_ms, offset_ms, text, model_id) VALUES (?,'oma',0,?,?,0,'hei','m')", (cid, T0, T0 + 1000))
     rebuild_sessions(conn, 300, now=T0)
     conn.execute("UPDATE sessions SET title='Morgenmøte'")
     rebuild_sessions(conn, 300, now=T0)

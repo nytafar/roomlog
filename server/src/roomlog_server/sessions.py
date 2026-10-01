@@ -78,7 +78,8 @@ def rebuild_sessions(conn: sqlite3.Connection, gap_s: float, now: int | None = N
             r["session_id"]: r["n"]
             for r in conn.execute(
                 """SELECT a.session_id, count(*) AS n FROM segments s
-                   JOIN temp.session_assign a ON a.chunk_id = s.chunk_id GROUP BY a.session_id"""
+                   JOIN temp.session_assign a ON a.chunk_id = s.chunk_id
+                   WHERE s.superseded_by IS NULL GROUP BY a.session_id"""
             )
         }
         for s in sessions:

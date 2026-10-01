@@ -20,6 +20,8 @@ window_s = 30.0                               # max audio per transcription requ
 window_gap_s = 0.3                            # silence inserted between chunks in a window
 max_attempts = 3
 language = "no"                               # "auto" for per-window language detection
+dictation_hold_s = 20                         # a chunk waits this long after its end before STT, so a
+                                              # dictation span for the same audio usually arrives first (ADR 0008)
 
 [worker.filters]
 min_avg_logprob = -1.0                        # applied only when the backend reports the stat

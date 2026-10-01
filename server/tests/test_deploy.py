@@ -88,7 +88,7 @@ def test_deploy_files_use_loopback_bind_behind_tailscale_serve():
     readme = (REPO_ROOT / "server" / "README.md").read_text()
     assert serve in readme and url in readme
     edge_toml = (REPO_ROOT / "deploy" / "edge" / "edge.toml.example").read_text()
-    assert f'server_url = "{url}"' in edge_toml
+    assert f'server_url = "{url}:8480"' in edge_toml  # 443 is held by a container on oma
     edge_sh = (REPO_ROOT / "deploy" / "edge" / "install.sh").read_text()
     assert f'SERVER_URL="${{SERVER_URL:-{url}}}"' in edge_sh
     toml = tomllib.loads((REPO_ROOT / "deploy" / "server" / "server.toml.example").read_text())

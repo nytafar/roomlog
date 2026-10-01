@@ -87,6 +87,53 @@ Upload order: oldest `start_utc` first (lexical order of the spool filenames).
   `401` otherwise. Clients without an NTP flag measure their offset to the server with one
   round trip and stamp in the server's timebase (ADR 0006).
 
+## Dictation spans
+
+A device whose microphone also serves a dictation tool reports each dictation as a span
+(ADR 0008). The server stores the span's text as the transcript of that time instead of
+running STT on the audio; nothing is transcribed twice.
+
+```
+POST /v1/spans
+Authorization: Bearer <device token>
+Content-Type: application/json
+Content-Length: <n>                      (at most 65 536 bytes)
+
+{"start_utc": "2026-10-01T12:00:00.000Z", "end_utc": "2026-10-01T12:00:06.250Z",
+ "text": "restart the worker", "lang": "en", "engine": "voxtype/parakeet-tdt-0.6b-v3-int8",
+ "mode": "raw", "target": {"app": "ghostty", "window": "~/code/roomlog"},
+ "cancelled": false, "origin": "dictation-span/1"}
+```
+
+- `start_utc`, `end_utc`: the sidecar timestamp form; `end_utc >= start_utc`, at most one hour apart.
+- `text`: what the engine produced, before any LLM rewrite; empty when nothing was heard.
+- `lang`: the language the engine was run with, which becomes the row's `lang`.
+- `engine`: free text naming the STT engine and model.
+- `mode`: `raw`, `cleanup` (the text was then rewritten by an LLM before it was typed) or
+  `edit-instruction` (the text is a spoken instruction applied to a selection).
+- `target`: optional; `app` is tagged on the row, `window` is kept on the span only.
+- `cancelled`: the dictation was discarded; an empty `text` counts as cancelled too. The audio
+  of a cancelled span is transcribed normally but its rows stay on the dictation channel.
+- `origin`: the tool and version that produced the span; it becomes every tag's `origin`.
+- `device_id`: optional; when present it must equal the token's device.
+
+| Status | Meaning | Client action |
+|---|---|---|
+| `201` | stored | done |
+| `200` | a span with this device and `start_utc` is already stored | done (a retry after a lost reply) |
+| `401` | missing or unknown token | keep; retry with backoff |
+| `403` | `device_id` ≠ the token's device | drop |
+| `411` | missing `Content-Length` | client bug |
+| `413` | body larger than 64 KiB | drop |
+| `422` | body invalid (`{"error": "span invalid: ..."}`) | drop |
+| `5xx`, timeout, connection error | server problem | keep; retry with backoff |
+
+Success body: `{"id": <span id>, "status": "created" | "exists", "device_id": "<id>"}`.
+
+The client must never let this call hold up the dictation itself: post after the text has
+been delivered, with a short timeout, and spool failures for a later retry. A span posted
+late still wins: STT rows written for its time are marked superseded, not deleted.
+
 ## Auth and transport
 
 Per-device bearer token, configured on the server as `device_id = "token"`, compared in

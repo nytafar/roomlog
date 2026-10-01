@@ -4,6 +4,13 @@ Batch: claim pending chunks (device_id, start_utc_ms order, ≤ 50) → decode �
 (≤ 30 s including 0.3 s gaps, consecutive chunks within the session gap) → transcribe
 through the router → map words back to chunks → filter → write one transaction per window →
 sessionize. A backend without word timestamps gets one chunk per request.
+
+Dictation (ADR 0008): pending spans are applied before chunks are claimed (the span's text
+becomes a `channel=dictation` row; STT rows already written for that time are marked
+superseded). A chunk is claimed only once its end is `dictation_hold_s` old, so the span
+usually wins. Audio inside a span is zeroed before STT, and a chunk with under
+`MIN_UNCOVERED_S` of audio left skips STT altogether. Cancelled or empty spans leave the
+audio to STT but put its rows on the dictation channel.
 """
 
 from __future__ import annotations
@@ -24,12 +31,15 @@ from .backends import Backend, NoBackendAvailable, Router, Segment, Transcript, 
 from .config import Config, Filters
 from .segmenter import RawAudio, Segmenter, covering_segments, purge_raw
 from .sessions import rebuild_sessions
+from .spans import add_tag, span_tags, spans_overlapping
 from .times import now_ms
 
 log = logging.getLogger("roomlog.worker")
 
 PURGE_INTERVAL_MS = 86_400_000  # the worker purges old speech-free raw audio once a day
 SEGMENT_BUDGET_S = 60.0  # segmenter work per batch; a backlog continues in the next batch
+DICTATION_MODEL_ID = "dictation"  # chunks.model_id for a chunk whose audio a span covered whole
+MIN_UNCOVERED_S = 1.0  # less audio than this outside the spans: no STT call for the chunk
 
 
 @dataclass
@@ -65,6 +75,23 @@ class Span:
     @property
     def end_s(self) -> float:
         return self.offset_s + self.duration_s
+
+
+@dataclass
+class Cover:
+    """A chunk's overlap with dictation spans: sample ranges to zero before STT (the spans
+    with text) and the cancelled spans whose STT rows go on the dictation channel."""
+    masked: list[tuple[int, int]] = field(default_factory=list)
+    text_spans: list[sqlite3.Row] = field(default_factory=list)
+    cancelled_spans: list[sqlite3.Row] = field(default_factory=list)
+
+    def masked_s(self) -> float:
+        return sum(b - a for a, b in self.masked) / SAMPLE_RATE
+
+    def holds(self, start_utc_ms: int, end_utc_ms: int) -> bool:
+        """True when the midpoint of [start, end) lies inside a span with text."""
+        mid = (start_utc_ms + end_utc_ms) / 2
+        return any(sp["start_utc_ms"] <= mid < sp["end_utc_ms"] for sp in self.text_spans)
 
 
 @dataclass
@@ -244,6 +271,8 @@ class BatchResult:
     segmented_epochs: int = 0
     segmented_chunks: int = 0
     segment_more: bool = False  # the segmenter stopped at its budget; more raw audio waits
+    spans_applied: int = 0
+    covered: int = 0  # chunks done without STT: a dictation span covered their audio
     errors: list[str] = field(default_factory=list)
 
 
@@ -265,14 +294,103 @@ class Worker:
     # -- claiming
 
     def claim(self) -> list[Chunk]:
+        """Pending chunks whose audio ended at least `dictation_hold_s` ago (ADR 0008)."""
         rows = self.conn.execute(
             """SELECT id, device_id, start_utc_ms, end_utc_ms, duration_ms, path, attempts,
                       kind, run_id, epoch, n_start, n_samples
-               FROM chunks WHERE status = 'pending' AND attempts < ?
+               FROM chunks WHERE status = 'pending' AND attempts < ? AND end_utc_ms <= ?
                ORDER BY device_id, start_utc_ms, id LIMIT ?""",
-            (self.cfg.max_attempts, self.cfg.batch_size),
+            (self.cfg.max_attempts, self.now() - int(self.cfg.dictation_hold_s * 1000), self.cfg.batch_size),
         ).fetchall()
         return [Chunk.from_row(r) for r in rows]
+
+    # -- dictation spans
+
+    def _tag_dictation(self, segment_id: int, span: sqlite3.Row, ts: int) -> None:
+        have = {r["key"] for r in self.conn.execute(
+            "SELECT key FROM tags WHERE target = 'segment' AND segment_id = ?", (segment_id,))}
+        for key, value in span_tags(span):
+            if key not in have:
+                add_tag(self.conn, key, value, span["origin"], segment_id=segment_id, now=ts)
+
+    def apply_spans(self) -> int:
+        """Materialize pending spans. A span with text becomes one `channel=dictation` row
+        (attached to the first overlapping chunk, or to none yet) and supersedes the STT rows
+        it overlaps; a cancelled span only moves overlapping STT rows onto the channel."""
+        rows = self.conn.execute(
+            "SELECT * FROM dictation_spans WHERE status = 'pending' ORDER BY device_id, start_utc_ms, id"
+        ).fetchall()
+        for span in rows:
+            ts = self.now()
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                seg_id: int | None = None
+                overlapping = """device_id = ? AND span_id IS NULL AND superseded_by IS NULL
+                                 AND start_utc_ms < ? AND end_utc_ms > ?"""
+                args = (span["device_id"], span["end_utc_ms"], span["start_utc_ms"])
+                if span["cancelled"]:
+                    for r in self.conn.execute(f"SELECT id FROM segments WHERE {overlapping}", args).fetchall():
+                        self._tag_dictation(r["id"], span, ts)
+                else:
+                    chunk = self.conn.execute(
+                        """SELECT id, start_utc_ms FROM chunks
+                           WHERE device_id = ? AND start_utc_ms < ? AND end_utc_ms > ?
+                           ORDER BY start_utc_ms, id LIMIT 1""", args).fetchone()
+                    offset = max(0, span["start_utc_ms"] - chunk["start_utc_ms"]) if chunk else 0
+                    cur = self.conn.execute(
+                        """INSERT INTO segments (chunk_id, device_id, span_id, idx, start_utc_ms, end_utc_ms,
+                               offset_ms, text, lang, model_id, model_revision)
+                           VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, NULL)""",
+                        (chunk["id"] if chunk else None, span["device_id"], span["id"], span["start_utc_ms"],
+                         span["end_utc_ms"], offset, span["text"].strip(), span["lang"], span["engine"]),
+                    )
+                    seg_id = int(cur.lastrowid)
+                    self._tag_dictation(seg_id, span, ts)
+                    self.conn.execute(
+                        f"UPDATE segments SET superseded_by = ? WHERE {overlapping}", (span["id"], *args))
+                self.conn.execute(
+                    "UPDATE dictation_spans SET status = 'applied', applied_utc_ms = ?, segment_id = ? WHERE id = ?",
+                    (ts, seg_id, span["id"]))
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        return len(rows)
+
+    def cover_for(self, c: Chunk, n_samples: int) -> Cover:
+        cover = Cover()
+        for sp in spans_overlapping(self.conn, c.device_id, c.start_utc_ms, c.end_utc_ms):
+            if sp["cancelled"]:
+                cover.cancelled_spans.append(sp)
+                continue
+            a = max(0, (sp["start_utc_ms"] - c.start_utc_ms) * SAMPLE_RATE // 1000)
+            b = min(n_samples, -(-(sp["end_utc_ms"] - c.start_utc_ms) * SAMPLE_RATE // 1000))
+            if b > a:
+                cover.masked.append((int(a), int(b)))
+                cover.text_spans.append(sp)
+        return cover
+
+    def attach_span_rows(self, c: Chunk, spans: list[sqlite3.Row]) -> None:
+        """A span row written before its audio arrived joins the first chunk that overlaps it."""
+        for sp in spans:
+            self.conn.execute(
+                "UPDATE segments SET chunk_id = ?, offset_ms = ? WHERE span_id = ? AND chunk_id IS NULL",
+                (c.id, max(0, sp["start_utc_ms"] - c.start_utc_ms), sp["id"]))
+
+    def mark_covered(self, chunks: list[Chunk]) -> None:
+        """Done without STT: the span rows already hold the transcript for this audio."""
+        ts = self.now()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            for c in chunks:
+                self.conn.execute(
+                    """UPDATE chunks SET status = 'done', error = NULL, transcribed_utc_ms = ?,
+                           model_id = ?, model_revision = NULL, n_segments_dropped = 0 WHERE id = ?""",
+                    (ts, DICTATION_MODEL_ID, c.id))
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
 
     # -- audio
 
@@ -337,30 +455,37 @@ class Worker:
             raise
 
     def write_window(self, window: list[Chunk], mapped: list[Mapped], dropped: dict[int, int],
-                     backend_by_chunk: dict[int, Backend]) -> None:
-        """Replace each chunk's segments for the backend that produced them and mark it done."""
+                     backend_by_chunk: dict[int, Backend], covers: dict[int, Cover] | None = None) -> None:
+        """Replace each chunk's segments for the backend that produced them and mark it done.
+        Rows inside a cancelled span go on the dictation channel (`covers`)."""
         by_chunk: dict[int, list[Mapped]] = {c.id: [] for c in window}
         for m in mapped:
             by_chunk[m.chunk.id].append(m)
+        covers = covers or {}
         ts = self.now()
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             for c in window:
                 backend = backend_by_chunk[c.id]
-                self.conn.execute("DELETE FROM segments WHERE chunk_id = ? AND model_id = ?",
+                self.conn.execute("DELETE FROM segments WHERE chunk_id = ? AND model_id = ? AND span_id IS NULL",
                                   (c.id, backend.model_id))
                 pieces = sorted(by_chunk[c.id], key=lambda m: (m.start_utc_ms, m.end_utc_ms))
                 for idx, m in enumerate(pieces):
-                    self.conn.execute(
-                        """INSERT INTO segments (chunk_id, idx, start_utc_ms, end_utc_ms, offset_ms,
+                    cur = self.conn.execute(
+                        """INSERT INTO segments (chunk_id, device_id, idx, start_utc_ms, end_utc_ms, offset_ms,
                                text, lang, avg_logprob, no_speech_prob, compression_ratio,
                                words_json, model_id, model_revision)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (c.id, idx, m.start_utc_ms, m.end_utc_ms, m.offset_ms, m.text, m.lang,
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (c.id, c.device_id, idx, m.start_utc_ms, m.end_utc_ms, m.offset_ms, m.text,
+                         m.lang or self.cfg.language or "und",
                          m.avg_logprob, m.no_speech_prob, m.compression_ratio,
                          json.dumps(m.words, ensure_ascii=False) if m.words else None,
                          backend.model_id, backend.model_revision),
                     )
+                    seg_id = int(cur.lastrowid)
+                    for sp in covers.get(c.id, Cover()).cancelled_spans:
+                        if m.start_utc_ms < sp["end_utc_ms"] and m.end_utc_ms > sp["start_utc_ms"]:
+                            self._tag_dictation(seg_id, sp, ts)
                 self.conn.execute(
                     """UPDATE chunks SET status = 'done', error = NULL, transcribed_utc_ms = ?,
                            model_id = ?, model_revision = ?, n_segments_dropped = ?
@@ -402,27 +527,52 @@ class Worker:
     def run_once(self) -> BatchResult:
         res = BatchResult()
         self.segment_raw(res)
+        try:
+            res.spans_applied = self.apply_spans()
+        except Exception as e:
+            log.exception("applying dictation spans failed")
+            res.errors.append(f"spans: {e.__class__.__name__}: {e}")
         chunks = self.claim()
         res.claimed = len(chunks)
         if not chunks:
+            if res.spans_applied:
+                rebuild_sessions(self.conn, self.cfg.session_gap_s, now=self.now())
             return res
 
         audio: dict[int, np.ndarray] = {}
+        covers: dict[int, Cover] = {}
         ok: list[Chunk] = []
+        covered: list[Chunk] = []
         raw = RawAudio(self.archive_dir, self.decode)
         for c in chunks:
             try:
                 a = self.audio_for(c, raw)
                 if len(a) == 0:
                     raise ValueError("decoded to zero samples")
-                audio[c.id] = a
-                ok.append(c)
             except Exception as e:
                 log.warning("decode failed for chunk %d (%s): %s", c.id, c.path or f"derived n={c.n_start}", e)
                 self.mark_attempt_failed([c], f"decode: {e}")
                 res.failed += 1
                 res.errors.append(f"chunk {c.id}: decode: {e}")
+                continue
+            cover = self.cover_for(c, len(a))
+            if cover.masked:
+                self.attach_span_rows(c, cover.text_spans)
+                if len(a) / SAMPLE_RATE - cover.masked_s() < MIN_UNCOVERED_S:
+                    covered.append(c)
+                    continue
+                a = a.copy()
+                for lo, hi in cover.masked:
+                    a[lo:hi] = 0.0
+            audio[c.id] = a
+            covers[c.id] = cover
+            ok.append(c)
+        if covered:
+            self.mark_covered(covered)
+            res.done += len(covered)
+            res.covered = len(covered)
         if not ok:
+            rebuild_sessions(self.conn, self.cfg.session_gap_s, now=self.now())
             return res
 
         backend = self.router.select()
@@ -438,8 +588,10 @@ class Worker:
             sdnotify.notify("WATCHDOG=1")  # a 50-chunk backlog can outlast WatchdogSec
             try:
                 mapped, by_chunk = self.transcribe_window(window, audio, backend)
+                # STT leaking across a zeroed span: whatever lands inside it is the span's
+                mapped = [m for m in mapped if not covers[m.chunk.id].holds(m.start_utc_ms, m.end_utc_ms)]
                 kept, dropped = apply_filters(mapped, self.cfg.filters)
-                self.write_window(window, kept, dropped, by_chunk)
+                self.write_window(window, kept, dropped, by_chunk, covers)
                 res.done += len(window)
             except NoBackendAvailable as e:
                 log.error("window of %d chunks: every backend failed: %s", len(window), e)
@@ -466,9 +618,11 @@ class Worker:
                 res = self.run_once()
                 if res.segmented_chunks:
                     log.info("segmented %d raw epochs into %d chunks", res.segmented_epochs, res.segmented_chunks)
+                if res.spans_applied:
+                    log.info("applied %d dictation spans", res.spans_applied)
                 if res.claimed:
-                    log.info("batch: claimed=%d done=%d failed=%d windows=%d",
-                             res.claimed, res.done, res.failed, res.windows)
+                    log.info("batch: claimed=%d done=%d failed=%d windows=%d covered=%d",
+                             res.claimed, res.done, res.failed, res.windows, res.covered)
                     sdnotify.notify("WATCHDOG=1")
                     if res.done and res.claimed >= self.cfg.batch_size:
                         continue  # backlog: go straight to the next batch

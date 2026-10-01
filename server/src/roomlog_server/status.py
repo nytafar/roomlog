@@ -42,6 +42,14 @@ def render_prom(st: dict[str, Any]) -> str:
                   f"roomlog_raw_pending_oldest_age_seconds {raw['pending_oldest_age_s']}"]
         if raw.get("bytes") is not None:
             lines += ["# TYPE roomlog_raw_bytes gauge", f"roomlog_raw_bytes {raw['bytes']}"]
+    spans = st.get("spans")
+    if spans is not None:
+        lines += ["# HELP roomlog_dictation_spans_total Dictation spans received by worker status (ADR 0008).",
+                  "# TYPE roomlog_dictation_spans_total gauge"]
+        for status in ("pending", "applied"):
+            lines.append(f'roomlog_dictation_spans_total{{status="{status}"}} {spans[status]}')
+        lines += ["# TYPE roomlog_segments_superseded_total gauge",
+                  f"roomlog_segments_superseded_total {spans['superseded_segments']}"]
     last = st.get("last_transcribed_utc")
     lines += [
         "# TYPE roomlog_last_transcribed_utc_seconds gauge",
@@ -87,6 +95,10 @@ def render_text(st: dict[str, Any]) -> str:
         out.append(f"raw            pending={raw['pending']} segmented={raw['segmented']} "
                    f"failed={raw.get('failed', 0)} derived={raw['derived_chunks']} "
                    f"oldest pending {raw['pending_oldest_age_s']} s")
+    spans = st.get("spans")
+    if spans is not None:
+        out.append(f"spans          pending={spans['pending']} applied={spans['applied']} "
+                   f"superseded_segments={spans['superseded_segments']}")
     if st.get("archive_bytes") is not None:
         line = f"archive        {st['archive_bytes'] / 1e6:.1f} MB"
         if raw is not None and raw.get("bytes") is not None:
