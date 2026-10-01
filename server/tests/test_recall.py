@@ -323,3 +323,13 @@ def test_oversize_lookahead_preserves_completed_page(cfg,conn,route):
     p['cursor']=page['next_cursor']
     with pytest.raises(RecallError) as error:reader.read(route,p)
     assert error.value.code=='item_too_large'
+
+
+def test_point_report_tags_require_equal_points_or_half_open_containment(cfg,conn):
+    report(conn,start=2000,end=2000)
+    for name,start,end in [('earlier-point',1000,1000),('same-point',2000,2000),
+                           ('later-point',3000,3000),('ends-at-point',1000,2000),
+                           ('contains-point',1000,3000),('starts-at-point',2000,3000)]:
+        add_tag(conn,'app',name,'test',device_id='nyta',start_utc_ms=start,end_utc_ms=end)
+    row=Reader(cfg.db_path).read('spans',request_params('spans'))['items'][0]
+    assert {tag['value'] for tag in row['tags']}=={'same-point','contains-point','starts-at-point'}

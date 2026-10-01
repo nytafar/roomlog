@@ -220,10 +220,12 @@ def spans(reader, conn, p, stamp):
                 FROM tags WHERE target='span' AND device_id=? AND
                 ((start_utc_ms < ? AND end_utc_ms > ?)
                  OR (start_utc_ms=end_utc_ms AND start_utc_ms>=? AND start_utc_ms<?)
-                 OR (?=? AND start_utc_ms<=? AND (end_utc_ms>? OR end_utc_ms=start_utc_ms)))
+                 OR (?=? AND ((start_utc_ms<=? AND end_utc_ms>?)
+                     OR (end_utc_ms=start_utc_ms AND start_utc_ms=?))))
                 ORDER BY start_utc_ms,id LIMIT ?''',
                 (r['device_id'], r['end_utc_ms'], r['start_utc_ms'], r['start_utc_ms'], r['end_utc_ms'],
-                 r['start_utc_ms'], r['end_utc_ms'], r['start_utc_ms'], r['start_utc_ms'], LIMITS['aggregate_rows'] + 1))
+                 r['start_utc_ms'], r['end_utc_ms'], r['start_utc_ms'], r['start_utc_ms'],
+                 r['start_utc_ms'], LIMITS['aggregate_rows'] + 1))
             value['tags'] = []
             size = 0
             for n, tag in enumerate(tags):
