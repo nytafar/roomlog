@@ -1025,3 +1025,9 @@ input {
 #searchform .ib {
   flex: none;
 }
+
+/* Keep long transcript windows cheap to lay out while zooming and scrolling. */
+.turn {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 120px;
+}
