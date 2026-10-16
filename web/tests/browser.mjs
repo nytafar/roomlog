@@ -23,6 +23,8 @@ const timeline = JSON.parse(
   ),
 );
 const base = fixture.items[0].start_utc_ms;
+const chunkAudio = await readFile(join(root, "tests/fixtures/chunk.opus"));
+const audioRequests = [];
 let latestKnown = base + 5000;
 let current = fixture.items,
   fail = false,
@@ -70,9 +72,22 @@ const server = createServer(async (req, res) => {
               ? row.channel !== "dictation"
               : row.channel === "dictation")),
       );
+      if (route === "audio") {
+        const id = p.get("chunk_id");
+        audioRequests.push(id);
+        if (id === "1") {
+          res.setHeader("Content-Type", "audio/ogg");
+          res.end(chunkAudio);
+        } else {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: { code: "audio_unavailable", message: "No file" } }));
+        }
+        return;
+      }
       if (route === "info")
         payload = {
           server_time_ms: base + 10000,
+          capabilities: { audio: true },
           limits: { transcript_window_ms: 86400000, spans_window_ms: 86400000 },
           sources: sourceIds.map((id) => ({
             device_id: id,
@@ -299,21 +314,43 @@ try {
     `(()=>{const n=document.querySelector('[data-unit="1"]');n.scrollIntoView({block:'center'});const r=n.getBoundingClientRect();return [n.closest(".turn").getBoundingClientRect().right-2,r.top+r.height/2];})()`,
   );
   assert.equal(await evaluate(`document.elementFromPoint(${xy[0]},${xy[1]})?.closest("[data-unit]")==null`),true,"gutter selection exercises visible-row hit testing");
-  await cmd("Input.dispatchMouseEvent", {
-    type: "mousePressed",
-    x: xy[0],
-    y: xy[1],
-    button: "left",
-    clickCount: 1,
-  });
-  await cmd("Input.dispatchMouseEvent", {
-    type: "mouseReleased",
-    x: xy[0],
-    y: xy[1],
-    button: "left",
-    clickCount: 1,
-  });
+  const press = async ([x, y], hold = 0) => {
+    await cmd("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+    if (hold) await sleep(hold);
+    await cmd("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+  };
+  // A tap on a word plays its chunk from that word; the player docks at the bottom.
+  const word = await evaluate(
+    `(()=>{const r=document.querySelector('[data-unit="1"]').getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2];})()`,
+  );
+  await press(word);
+  await waitFor(`!document.querySelector('#player').hidden&&Number(document.querySelector('#seek').value)>0`);
+  assert.equal(await evaluate(`document.querySelector('#clipbar').hidden`), true, "a tap plays, it does not select");
+  assert.ok(
+    (await evaluate(`Number(document.querySelector('#seek').value)`)) >= 0.85,
+    "playback starts at the word (0.9 s into the chunk)",
+  );
+  await waitFor(`document.querySelector('.w.playing')?.dataset.unit==="1"&&document.querySelector('.turn.playing')!==null`);
+  if (process.env.ROOMLOG_SCREENSHOT_DIR) {
+    await mkdir(process.env.ROOMLOG_SCREENSHOT_DIR, { recursive: true });
+    await writeFile(
+      join(process.env.ROOMLOG_SCREENSHOT_DIR, "recall-player.png"),
+      Buffer.from((await cmd("Page.captureScreenshot", { format: "png" })).data, "base64"),
+    );
+  }
+  await evaluate(`document.querySelector('#play-toggle').click()`);
+  await waitFor(`document.querySelector('#play-toggle').getAttribute('aria-label')==='Play'`);
+  await evaluate(`(()=>{const s=document.querySelector('#seek');s.value='0.2';s.dispatchEvent(new Event('input'))})()`);
+  await waitFor(`document.querySelector('.w.playing')?.dataset.unit==="0"`);
+  await evaluate(`document.querySelector('.turn .play').click()`);
+  await waitFor(`document.querySelector('#play-toggle').getAttribute('aria-label')==='Pause'`);
+  assert.deepEqual(audioRequests, ["1"], "replaying a chunk reuses its blob");
+  await evaluate(`document.querySelector('#play-stop').click()`);
+  await waitFor(`document.querySelector('#player').hidden&&document.querySelector('.playing')===null`);
+  // A hold still selects, from the gutter beside the text.
+  await press(xy, 550);
   await waitFor(`!document.querySelector('#clipbar').hidden`);
+  assert.equal(await evaluate(`document.querySelector('#play-selection').hidden`), false);
   await evaluate(`document.querySelector('#save-clip').click()`);
   assert.equal(
     await evaluate(`document.querySelectorAll('#tray .chip').length`),
@@ -323,6 +360,11 @@ try {
   // Dictation without a session and cancelled STT both appear only when requested.
   await change("#channel", "all");
   await waitFor(`document.querySelectorAll('.turn').length===3`);
+  assert.equal(
+    await evaluate(`document.querySelector('[data-segment="2"] .play').disabled`),
+    true,
+    "dictation without a chunk shows it has no audio",
+  );
   await evaluate(
     `document.querySelector('[data-segment="2"] .inspect').click()`,
   );
@@ -337,6 +379,7 @@ try {
     {
       ...fixture.items[0],
       text: '<img src=x onerror="window.pwned=1">',
+      chunk_id: "9",
       timing: "segment",
       words: null,
     },
@@ -351,6 +394,10 @@ try {
     ),
     true,
   );
+  // A chunk whose file is unavailable marks its line and opens no player.
+  await evaluate(`document.querySelector('.turn .play').click()`);
+  await waitFor(`document.querySelector('.turn .play').disabled`);
+  assert.equal(await evaluate(`document.querySelector('#player').hidden`), true);
   fail = true;
   await evaluate(`document.querySelector('#refresh').click()`);
   await waitFor(
@@ -420,7 +467,7 @@ try {
     "token never enters request URLs",
   );
   console.log(
-    "Browser passed: real modules, shared wire fixtures, mobile layout, timed selection, tray, filters, provenance, safe text, refresh removal, stale state, zoom navigation and logout.",
+    "Browser passed: real modules, shared wire fixtures, mobile layout, tap-to-play audio, timed selection, tray, filters, provenance, safe text, refresh removal, stale state, zoom navigation and logout.",
   );
 } finally {
   ws?.close();

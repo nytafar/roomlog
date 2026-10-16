@@ -151,6 +151,7 @@
         <div class="h" id="clip-label"></div>
         <div class="acts">
           <button id="copy" class="pri">Copy</button
+          ><button id="play-selection" hidden>▶ Play</button
           ><button id="save-clip">To tray</button
           ><button id="clear-selection">Clear</button>
         </div>
@@ -158,6 +159,16 @@
           Selection stays within one source. Quotes are preserved at selection
           time.
         </div>
+      </div>
+      <div id="player" role="region" aria-label="Audio player" hidden>
+        <button id="play-toggle" class="ib" aria-label="Pause">❚❚</button>
+        <div class="track">
+          <div class="pl">
+            <span id="player-label"></span><span id="player-time"></span>
+          </div>
+          <input id="seek" type="range" min="0" max="1" step="0.01" value="0" aria-label="Playback position" />
+        </div>
+        <button id="play-stop" class="ib" aria-label="Stop">■</button>
       </div>
       <div id="tray" aria-label="Local clip tray"></div>
       <div id="scrim"></div>

@@ -22,6 +22,7 @@ import {
   intersectsSelection,
 } from "./selection.mjs";
 import { historyKey, reuseHistory, overlapsHistory, coveringDetailKey } from "./history-window.mjs";
+import { Player, unitAt, clock } from "./player.mjs";
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, text, className) => {
   const node = document.createElement(tag);
@@ -52,6 +53,7 @@ const state = {
 let allUnits = [],
   rows = [],
   textRender = null;
+const player = new Player(new Audio(), (id, signal) => adapter.audio(id, signal));
 function sourceLabel(id) {
   return info?.sources.find((source) => source.device_id === id)?.label || id;
 }
@@ -109,6 +111,8 @@ async function login(event) {
     if (last) state.date = localDate(last);
     if (info.sources.length === 1) state.source = info.sources[0].device_id;
     $("#source").value = state.source;
+    $("#play-selection").hidden = !audioOn();
+    $("#gearhint").textContent = hint();
     $("#login").hidden = true;
     $("#app").hidden = false;
     await load();
@@ -126,6 +130,7 @@ $("#logout").onclick = () => {
   data = null;
   loading = false;
   state.selection = null;
+  player.reset();
   state.clips = [];
   state.source = "";
   state.focus = null;
@@ -589,8 +594,9 @@ function renderText(view, expanded) {
         "span",
         `${time(row.start_utc_ms)} · ${row.channel} · ${row.lang || "language unknown"}`,
       ),
-      inspect,
     );
+    if (audioOn()) meta.append(playButton(row));
+    meta.append(inspect);
     body.append(meta);
     const text = el("p");
     const effective = units(row);
@@ -889,6 +895,163 @@ $("#copy").onclick = () => copyQuote();
 $("#save-clip").onclick = () => traySelection();
 $("#clear-selection").onclick = clearSelection;
 
+// Audio: a tap on a word plays from that word, a tap beside the text plays the
+// line from its start; a hold still selects. Playability is per chunk and only certain
+// after the fetch, so unplayable rows fall back to tap-to-select.
+const audioOn = () => !!info?.capabilities?.audio;
+const hint = () =>
+  `week ◀ · day · sessions · text ▶ · ${audioOn() ? "tap text to play · " : ""}hold text to select`;
+function rowOf(unit) {
+  return rows.find(
+    (r) => r.segment_id === unit.segment_id && r.device_id === unit.device_id,
+  );
+}
+function playButton(row) {
+  const button = el("button", "▶", "play");
+  button.dataset.chunk = row.chunk_id ?? "";
+  button.setAttribute("aria-label", `Play from ${time(row.start_utc_ms)}`);
+  button.onclick = () => playRow(row, row.start_utc_ms);
+  if (!player.canPlay(row)) noAudio(button);
+  return button;
+}
+function noAudio(button) {
+  button.textContent = "no audio";
+  button.disabled = true;
+  button.removeAttribute("aria-label");
+  button.title = "No audio is stored for this line";
+}
+function tapToPlay(g) {
+  const unit = allUnits[g.index],
+    row = unit && rowOf(unit);
+  if (!audioOn() || !row || !player.canPlay(row)) return false;
+  const from = g.onWord ? unit.start_utc_ms : row.start_utc_ms;
+  playRow(row, from);
+  return true;
+}
+async function playRow(row, from, to = null) {
+  const label = `${sourceLabel(row.device_id)} · ${time(from)}`;
+  let result;
+  try {
+    result = await player.play(row, from, to, label);
+  } catch (error) {
+    toast(error.message || "Could not play this audio.");
+    return;
+  }
+  if (result === "unavailable") {
+    document
+      .querySelectorAll(`.play[data-chunk="${CSS.escape(String(row.chunk_id))}"]`)
+      .forEach(noAudio);
+    toast("No audio is stored for this line.");
+  } else if (result === "missing") {
+    toast("This line changed. Refreshing.");
+    load(true);
+  }
+}
+$("#play-selection").onclick = () => {
+  const selection = state.selection;
+  const unit = selection && allUnits.find((u) => intersectsSelection(u, selection));
+  const row = unit && rowOf(unit);
+  if (!row || !player.canPlay(row)) return toast("No audio is stored for this selection.");
+  playRow(row, selection.from_ms, selection.to_ms);
+};
+$("#play-toggle").onclick = () => player.toggle();
+$("#play-stop").onclick = () => player.stop();
+const seek = $("#seek");
+let scrubbing = false;
+seek.addEventListener("pointerdown", () => (scrubbing = true));
+seek.addEventListener("pointerup", () => (scrubbing = false));
+seek.addEventListener("change", () => (scrubbing = false));
+seek.addEventListener("input", () => {
+  player.seek(Number(seek.value));
+  followPlayback();
+});
+player.onchange = renderPlayer;
+for (const type of ["play", "pause", "ended", "seeked", "loadedmetadata"])
+  player.audio.addEventListener(type, renderPlayer);
+function renderPlayer() {
+  const current = player.current,
+    audio = player.audio;
+  document
+    .querySelectorAll(".turn.pending")
+    .forEach((node) => node.classList.remove("pending"));
+  if (player.pending) turnOf(player.pending.row)?.classList.add("pending");
+  const open = !!current;
+  $("#player").hidden = !open;
+  document.body.classList.toggle("has-player", open);
+  if (!open) return paintPlayback(null);
+  const playing = !audio.paused;
+  $("#play-toggle").textContent = playing ? "❚❚" : "▶";
+  $("#play-toggle").setAttribute("aria-label", playing ? "Pause" : "Play");
+  $("#player-label").textContent = current.label;
+  const duration = Number.isFinite(audio.duration)
+    ? audio.duration
+    : Math.max(1, (current.row.end_utc_ms - current.chunkStart) / 1000);
+  seek.max = duration;
+  // Tint the part of the chunk that was asked for: the clip, or the tapped segment.
+  const end = Number.isFinite(current.stopAt)
+    ? current.stopAt
+    : (current.row.end_utc_ms - current.chunkStart) / 1000;
+  seek.style.setProperty("--a", `${(100 * current.from) / duration}%`);
+  seek.style.setProperty("--b", `${(100 * Math.min(end, duration)) / duration}%`);
+  followPlayback();
+}
+let playFrame,
+  playKey = null,
+  playNodes = [];
+const rowUnits = new WeakMap();
+function followPlayback() {
+  cancelAnimationFrame(playFrame);
+  const t = player.tick();
+  paintPlayback(t);
+  if (t != null && !player.audio.paused)
+    playFrame = requestAnimationFrame(followPlayback);
+}
+function turnOf(row) {
+  return document.querySelector(
+    `.turn[data-segment="${CSS.escape(String(row.segment_id))}"][data-device="${CSS.escape(row.device_id)}"]`,
+  );
+}
+// Light the segment and word under the playhead. The chunk can hold several
+// segments, so the playhead walks across rows of the same chunk.
+function paintPlayback(t) {
+  const current = player.current;
+  let key = null,
+    row,
+    index = -1;
+  if (current && t != null) {
+    const chunkRows = rows.filter(
+      (r) =>
+        r.device_id === current.row.device_id &&
+        String(r.chunk_id) === current.chunkId,
+    );
+    row = chunkRows[Math.max(0, unitAt(chunkRows, t))] || current.row;
+    if (!rowUnits.has(row)) rowUnits.set(row, units(row));
+    const list = rowUnits.get(row);
+    index = list[0]?.kind === "word" ? unitAt(list, t) : -1;
+    key = `${row.device_id}:${row.segment_id}:${index}`;
+  }
+  if (key !== playKey || playNodes.some((node) => !node.isConnected)) {
+    playNodes.forEach((node) => node.classList.remove("playing"));
+    playNodes = [];
+    playKey = key;
+    const turn = row && turnOf(row);
+    if (turn) {
+      playNodes.push(turn);
+      const word = index >= 0 && turn.querySelectorAll("[data-unit]")[index];
+      if (word) playNodes.push(word);
+    }
+    playNodes.forEach((node) => node.classList.add("playing"));
+  }
+  if (!current) return;
+  const now = player.audio.currentTime;
+  if (!scrubbing) seek.value = now;
+  const text = `${clock(now)} / ${clock(Number(seek.max))}`;
+  if ($("#player-time").textContent !== text) {
+    $("#player-time").textContent = text;
+    seek.setAttribute("aria-valuetext", `${clock(now)} of ${clock(Number(seek.max))}`);
+  }
+}
+
 // Keep the prototype's horizontal gears and off-text IN/OUT handles. No inferred
 // word times are needed: untimed rows naturally stop at segment precision.
 let gesture = null;
@@ -993,6 +1156,7 @@ document.addEventListener("pointerdown", (event) => {
     y: event.clientY,
     lastY: event.clientY,
     index,
+    onWord: !!event.target.closest("[data-unit]"),
     zone: browseZone(event.clientX),
     moved: false,
     selecting: false,
@@ -1050,10 +1214,9 @@ function endGesture(event) {
   if (!g || event.pointerId !== g.id) return;
   clearTimeout(g.timer);
   if (event.type === "pointerup" && !g.moved && !g.selecting && g.index != null)
-    startSelection(g);
+    if (!tapToPlay(g)) startSelection(g);
   gesture = null;
-  $("#gearhint").textContent =
-    "week ◀ · day · sessions · text ▶ · hold text to select";
+  $("#gearhint").textContent = hint();
 }
 document.addEventListener("pointerup", endGesture);
 document.addEventListener("pointercancel", endGesture);

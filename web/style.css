@@ -1036,3 +1036,134 @@ input {
   content-visibility: auto;
   contain-intrinsic-size: auto 120px;
 }
+/* audio: docked player, row play buttons, playhead highlight */
+#player {
+  position: fixed;
+  left: 8px;
+  right: 8px;
+  bottom: calc(var(--safeB) + 10px);
+  z-index: 26;
+  max-width: 880px;
+  margin: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #23262c;
+  border: 1px solid #33373e;
+  border-radius: 16px;
+  padding: 8px 10px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+  touch-action: none;
+}
+#player[hidden] {
+  display: none;
+}
+#player .ib {
+  width: 44px;
+  height: 44px;
+  flex: none;
+  color: var(--fg);
+  background: #31353c;
+}
+#play-toggle {
+  color: var(--acc) !important;
+}
+#player .track {
+  flex: 1;
+  min-width: 0;
+}
+#player .pl {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--dim);
+  white-space: nowrap;
+}
+#player-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#player-time {
+  font-variant-numeric: tabular-nums;
+}
+#seek {
+  width: 100%;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  appearance: none;
+  -webkit-appearance: none;
+  --a: 0%;
+  --b: 100%;
+}
+#seek::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #3a3e46 var(--a), rgba(255, 209, 102, 0.45) var(--a) var(--b), #3a3e46 var(--b));
+}
+#seek::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #3a3e46 var(--a), rgba(255, 209, 102, 0.45) var(--a) var(--b), #3a3e46 var(--b));
+}
+#seek::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  margin-top: -7px;
+  border-radius: 50%;
+  background: var(--acc);
+}
+#seek::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--acc);
+}
+#seek:focus-visible {
+  outline: 2px solid var(--acc);
+  outline-offset: 2px;
+}
+body.has-tray #player {
+  bottom: calc(var(--safeB) + 66px);
+}
+body.has-player #clipbar {
+  bottom: calc(var(--safeB) + 82px);
+}
+body.has-player.has-tray #clipbar {
+  bottom: calc(var(--safeB) + 138px);
+}
+body.has-player #view {
+  padding-bottom: 260px;
+}
+.play {
+  font-size: 11px;
+  color: var(--acc);
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: var(--card);
+}
+.play:disabled {
+  color: var(--faint);
+  background: none;
+}
+.turn.pending .play {
+  animation: pend 0.8s ease-in-out infinite alternate;
+}
+@keyframes pend {
+  to {
+    opacity: 0.35;
+  }
+}
+.turn.playing {
+  border-color: var(--acc);
+}
+.w.playing {
+  background: rgba(255, 209, 102, 0.55);
+  color: #141414;
+  border-radius: 3px;
+}

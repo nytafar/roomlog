@@ -43,6 +43,24 @@ export class HttpRecall {
       );
     return body;
   }
+  // Chunk audio as a Blob. Unlike reads it may use the HTTP cache: a chunk ID always
+  // names the same bytes and the reader marks them private and immutable.
+  async audio(chunkId, signal) {
+    const response = await this.fetcher(
+      `${this.base}/audio?${new URLSearchParams({ chunk_id: chunkId })}`,
+      { signal, headers: { Authorization: `Bearer ${this.#token}` } },
+    );
+    if (response.ok) return response.blob();
+    let error;
+    try {
+      error = (await response.json()).error;
+    } catch {}
+    throw new RecallError(
+      error?.message || "The reader could not load this audio.",
+      response.status,
+      error?.code,
+    );
+  }
 }
 // Dedupe on the route's own identity. Span reports also carry a (possibly null) segment_id,
 // and span, segment and session IDs are separate spaces, so never fall back across them.
