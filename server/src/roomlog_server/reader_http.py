@@ -85,9 +85,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control','private, no-store'); data=self.body_headers(data)
         if status==503: self.send_header('Retry-After','1')
         if status==401: self.send_header('WWW-Authenticate','Bearer')
+        if self.close_connection: self.send_header('Connection','close')
         self.end_headers(); self.wfile.write(data)
     def do_GET(self):
         try:
+            # GET bodies are never read, so with keep-alive a body would be parsed as the next
+            # request (smuggling through a pooling proxy). Refuse it and drop the connection.
+            if self.headers.get_all('Transfer-Encoding') or any(v.strip()!='0' for v in self.headers.get_all('Content-Length',[])):
+                self.close_connection=True
+                raise RecallError(400,'invalid_request','GET requests must not carry a body')
             if len(self.path)>8192: raise RecallError(400,'invalid_parameter','Request URL too long')
             u=urlsplit(self.path)
             if u.path=='/healthz':
@@ -148,7 +154,8 @@ class Handler(BaseHTTPRequestHandler):
     def static(self,path):
         root=self.server.static_root
         if root is None: raise RecallError(404,'not_found','No static app configured')
-        target=(root/unquote(path).lstrip('/')).resolve()
+        try: target=(root/unquote(path).lstrip('/')).resolve()
+        except (ValueError,OSError): raise RecallError(404,'not_found','File not found')  # e.g. an embedded NUL
         if not target.is_relative_to(root): raise RecallError(404,'not_found','File not found')
         if target.is_dir(): target=(target/'index.html').resolve()
         if not target.is_relative_to(root): raise RecallError(404,'not_found','File not found')

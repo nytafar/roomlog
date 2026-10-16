@@ -280,7 +280,9 @@ def search(reader, conn, p, stamp):
     def values():
         for r in rows:
             value = reader.segment_item(conn, r['id'])
-            value.update(score=r['score'], address=dict(device_id=r['device_id'], from_ms=value['start_utc_ms'], to_ms=value['end_utc_ms']))
+            value.update(score=r['score'], address=dict(device_id=r['device_id'], from_ms=value['start_utc_ms'],
+                                                  # a point row still needs a nonempty [from,to) window
+                                                  to_ms=max(value['end_utc_ms'], value['start_utc_ms'] + 1)))
             key = [r['start_utc_ms'], r['device_id'], r['id']]
             yield value, [r['score']] + key if table else key
     return reader.page('search', p, stamp, values())

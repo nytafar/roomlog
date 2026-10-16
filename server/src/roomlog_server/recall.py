@@ -216,7 +216,8 @@ class Reader:
         unavailable=RecallError(404,'audio_unavailable','Chunk audio is not available')
         # Derived chunks (ADR 0005) are slices of raw captures and have no file of their own.
         if not row['path']: raise unavailable
-        target=(self.archive_dir/row['path']).resolve()
+        try: target=(self.archive_dir/row['path']).resolve()
+        except (ValueError,OSError): raise unavailable
         if not target.is_relative_to(self.archive_dir):
             logging.getLogger(__name__).warning('Chunk %s path escapes the archive',chunk_id)
             raise unavailable
