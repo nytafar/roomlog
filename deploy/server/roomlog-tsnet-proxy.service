@@ -1,30 +1,39 @@
 # Publishes roomlog-reader (127.0.0.1:8540) on the tailnet as its own node, `roomlog`, at
 # https://roomlog.tailf63b9a.ts.net, and passes the visitor's Tailscale login to the reader in
 # Tailscale-User-Login so the owner gets in without a token (ADR 0009). The proxy deletes any
-# client-supplied identity headers and sets none for tagged nodes, and rewrites Host to
-# `localhost:8540`. The reader honours the header only for `tailscale_logins` in reader.toml,
-# with that Host, from a loopback peer running as the reader's own uid, on a loopback bind.
+# client-supplied identity and X-Forwarded-* headers, sets no identity for tagged nodes, sets
+# X-Forwarded-For to the client's tailnet IP, and rewrites Host to `localhost:8540`. The
+# reader honours the login only for `tailscale_logins` from a `tailscale_devices` IP, with
+# that Host, from a loopback peer running as the reader's own uid, on a loopback bind.
 #
 # Install (systemd --user on oma; nothing in install.sh does this):
 #   1. Build the pinned proxy (tailscale.com needs go >= 1.27.1; GOTOOLCHAIN=auto fetches it):
 #        GOBIN=$HOME/.local/bin go install tailscale.com/cmd/tsnet-proxy@v1.104.1
-#   2. Create a pre-auth key tagged tag:svc in the admin console (reusable: no; ephemeral: no),
-#      and store it outside the repo, readable only by you:
-#        install -d -m 700 ~/.config/roomlog-tsnet
-#        (umask 077; printf 'TS_AUTHKEY=%s\n' 'tskey-auth-...' > ~/.config/roomlog-tsnet/authkey.env)
+#   2. First join, either way:
+#      a. Keyless (what oma used): start the unit with no key file, find
+#         "To start this tsnet server, ... go to: https://login.tailscale.com/a/..." in
+#         `journalctl --user -u roomlog-tsnet-proxy`, open it and approve the node, then in the
+#         admin console add tag:svc to the `roomlog` node (Edit ACL tags).
+#      b. Pre-auth key tagged tag:svc (reusable: no; ephemeral: no), kept outside the repo,
+#         readable only by you:
+#           (umask 077; printf 'TS_AUTHKEY=%s\n' 'tskey-auth-...' > ~/.config/roomlog-reader/tsnet-authkey.env)
+#      The key file must not live in ~/.config/roomlog-tsnet: systemd (261 here) treats
+#      ~/.config/<StateDirectory> as a pre-253 user state dir, and with that directory present
+#      it symlinks ~/.local/state/roomlog-tsnet to it, so node state lands in the config dir.
 #      The key is only needed for the first join; node state then lives in the StateDirectory
 #      (~/.local/state/roomlog-tsnet), and the file may be deleted (the `-` makes it optional).
 #   3. cp deploy/server/roomlog-tsnet-proxy.service ~/.config/systemd/user/
 #      systemctl --user daemon-reload && systemctl --user enable --now roomlog-tsnet-proxy
-#   4. Add the owner's login to reader.toml (`tailscale_logins = ["nytafar@github"]`) and
-#      restart roomlog-reader.
+#   4. In reader.toml set `tailscale_logins` and `tailscale_devices` (the owner's own
+#      phone/laptop tailnet IPs, both families; never oma or another server: anything running
+#      on a user-owned node is WhoIs'd as the owner), then restart roomlog-reader.
 [Unit]
 Description=Room Log recall on the tailnet (tsnet-proxy roomlog -> roomlog-reader)
 After=network-online.target roomlog-reader.service
 Wants=network-online.target
 [Service]
 Type=simple
-EnvironmentFile=-%h/.config/roomlog-tsnet/authkey.env
+EnvironmentFile=-%h/.config/roomlog-reader/tsnet-authkey.env
 # %S is ~/.local/state in the user manager; systemd creates it 0700 and keeps it writable.
 StateDirectory=roomlog-tsnet
 StateDirectoryMode=0700

@@ -34,6 +34,15 @@ def valid_login(value):
     return isinstance(value,str) and bool(value) and value==value.strip() and all(' '<=c<='~' for c in value)
 
 
+def device_address(value):
+    """A tailnet IP in canonical form (IPv4-mapped IPv6 as IPv4), so differently written IPv6
+    still compares equal. Raises ValueError for anything else, scoped addresses included."""
+    if not isinstance(value,str): raise ValueError(f'not an IP address: {value!r}')
+    ip=ipaddress.ip_address(value)
+    if ip.version==6 and ip.scope_id: raise ValueError(f'scoped address: {value!r}')
+    return ip.ipv4_mapped if ip.version==6 and ip.ipv4_mapped else ip
+
+
 PROC_NET_TCP=('/proc/net/tcp','/proc/net/tcp6')
 
 
@@ -76,7 +85,7 @@ def peer_uid(peer,ours,tables=PROC_NET_TCP):
 
 class ReaderServer(ThreadingHTTPServer):
     daemon_threads=True
-    def __init__(self,address,reader,tokens,static_root=None,identity_logins=(),identity_hosts=None):
+    def __init__(self,address,reader,tokens,static_root=None,identity_logins=(),identity_hosts=None,identity_devices=()):
         # The identity header is only as trustworthy as the path to this socket. Loopback keeps
         # other machines out; the peer-uid check (Handler.identity_role) keeps other local
         # accounts out; the Host pin keeps DNS-rebinding browser pages out. Anywhere but
@@ -85,6 +94,12 @@ class ReaderServer(ThreadingHTTPServer):
             raise ValueError(f'tailscale_logins needs a loopback bind, not {address[0]!r}')
         if any(not valid_login(v) for v in identity_logins):
             raise ValueError('tailscale_logins entries must be printable ASCII without surrounding spaces')
+        # A login alone names the user, not the device: every user-owned node (oma itself, and
+        # through it every container and local account) is WhoIs'd as the owner. So identity
+        # also needs the client's tailnet IP, as tsnet-proxy reports it, to be a listed device.
+        if identity_logins and not identity_devices:
+            raise ValueError('tailscale_logins needs tailscale_devices: a login alone is any software on any of your nodes')
+        self.identity_devices=frozenset(device_address(v) for v in identity_devices)
         self.identity_logins=frozenset(identity_logins)
         self.reader,self.tokens=reader,tokens
         self.static_root=Path(static_root).resolve() if static_root else None
@@ -202,13 +217,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send(503,dict(error=dict(code='read_unavailable',message='Reader database unavailable')))
     def identity_role(self):
         """'owner' for exactly one allowed Tailscale-User-Login, compared raw, with exactly one
-        pinned Host, from a loopback peer whose socket is ours (same uid); else None, and the
-        bearer check decides as without identity sign-in."""
+        pinned Host, exactly one X-Forwarded-For naming a listed device, from a loopback peer
+        whose socket is ours (same uid); else None, and the bearer check decides as without
+        identity sign-in."""
         logins=self.server.identity_logins
         if not logins or not is_loopback(self.client_address[0]): return None
         values=self.headers.get_all(IDENTITY_HEADER,[]); hosts=self.headers.get_all('Host',[])
         if len(values)!=1 or values[0] not in logins: return None
         if len(hosts)!=1 or hosts[0].lower() not in self.server.identity_hosts: return None
+        # tsnet-proxy's Rewrite: Go strips inbound X-Forwarded-* first, then SetXForwarded sets
+        # exactly the client's tailnet IP (bare, no brackets, for IPv6).
+        forwarded=self.headers.get_all('X-Forwarded-For',[])
+        if len(forwarded)!=1: return None
+        try: device=device_address(forwarded[0].strip())
+        except ValueError: return None
+        if device not in self.server.identity_devices: return None
         if peer_uid(self.client_address,self.connection.getsockname())!=os.getuid(): return None
         return 'owner'
     def audio(self,target,sha256):
@@ -269,7 +292,9 @@ def build_server(config_path):
     hosts=cfg.get('tailscale_hosts')
     if hosts is not None and (not isinstance(hosts,list) or any(not isinstance(v,str) or not v or v!=v.strip() for v in hosts)): raise ValueError('tailscale_hosts must be a list of Host values')
     host,port=cfg.get('bind','127.0.0.1:8540').rsplit(':',1)
-    return ReaderServer((host,int(port)),Reader(Path(cfg['db_path']).expanduser(),labels,reader_archive_dir(cfg)),tokens,Path(cfg['static_root']).expanduser() if cfg.get('static_root') else None,logins,hosts)
+    devices=cfg.get('tailscale_devices',[])
+    if not isinstance(devices,list): raise ValueError('tailscale_devices must be a list of tailnet IP addresses')
+    return ReaderServer((host,int(port)),Reader(Path(cfg['db_path']).expanduser(),labels,reader_archive_dir(cfg)),tokens,Path(cfg['static_root']).expanduser() if cfg.get('static_root') else None,logins,hosts,devices)
 
 def main(argv=None):
     p=argparse.ArgumentParser(prog='roomlog-reader'); p.add_argument('--config',required=True)

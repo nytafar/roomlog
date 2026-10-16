@@ -1,6 +1,7 @@
 """Tailscale identity sign-in on the reader (ADR 0009): a trusted proxy on oma sets
-`Tailscale-User-Login`; the reader honours it only for configured logins, with the proxy's
-Host, from a same-uid loopback peer, on a loopback bind."""
+`Tailscale-User-Login` and `X-Forwarded-For`; the reader honours them only for configured
+logins on listed devices, with the proxy's Host, from a same-uid loopback peer, on a loopback
+bind."""
 import http.client
 import ipaddress
 import json
@@ -16,12 +17,15 @@ from roomlog_server.reader_http import ReaderServer, build_server, peer_uid, pro
 from roomlog_server.recall import Reader
 
 OWNER = 'nytafar@github'
+PHONE4, PHONE6 = '100.70.214.44', 'fd7a:115c:a1e0::1601:d62e'
+OMA4 = '100.79.124.57'  # user-owned: WhoIs says OWNER for anything on it, containers included
+DEVICES = [PHONE4, PHONE6]
 
 
 @contextmanager
-def serving(cfg, logins=(), hosts=None):
+def serving(cfg, logins=(), hosts=None, devices=DEVICES):
     server = ReaderServer(('127.0.0.1', 0), Reader(cfg.db_path),
-                          {'owner-secret': 'owner', 'device-secret': 'device'}, None, logins, hosts)
+                          {'owner-secret': 'owner', 'device-secret': 'device'}, None, logins, hosts, devices)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -51,8 +55,9 @@ def get(port, headers=(), path='/v1/recall/info', host=None):
         client.close()
 
 
-def login(value):
-    return [('Tailscale-User-Login', value)]
+def login(value, xff=PHONE4):
+    """Identity headers as tsnet-proxy sends them for a request from device `xff`."""
+    return [('Tailscale-User-Login', value)] + ([('X-Forwarded-For', xff)] if xff else [])
 
 
 def bearer(token):
@@ -77,7 +82,7 @@ def test_without_a_matching_login_the_bearer_check_is_unchanged(cfg, conn, login
     cases = [
         ([], 401), (login('someone@github'), 401), (login(''), 401),
         (login(OWNER.upper()), 401),
-        (login(OWNER) + login(OWNER), 401),  # repeated header: refuse to guess
+        (login(OWNER) + login(OWNER, None), 401),  # repeated header: refuse to guess
         (bearer('device-secret'), 403), (login('someone@github') + bearer('device-secret'), 403),
         (bearer('owner-secret'), 200), (login('someone@github') + bearer('owner-secret'), 200),
     ]
@@ -97,6 +102,40 @@ def test_unknown_routes_stay_not_found_under_identity(cfg, conn):
     with serving(cfg, [OWNER]) as port:
         assert get(port, login(OWNER), '/v1/recall/nope')[0] == 404
         assert get(port, [], '/v1/recall/nope')[0] == 401
+
+
+@pytest.mark.parametrize('xff', [PHONE4, PHONE6, 'FD7A:115C:A1E0:0:0:0:1601:D62E', '::ffff:100.70.214.44'])
+def test_listed_devices_get_in(cfg, conn, xff):
+    with serving(cfg, [OWNER]) as port:
+        assert get(port, login(OWNER, xff))[0] == 200
+
+
+def test_listed_devices_match_in_canonical_form(cfg, conn):
+    with serving(cfg, [OWNER], devices=['FD7A:115C:A1E0:0000::1601:D62E']) as port:
+        assert get(port, login(OWNER, PHONE6))[0] == 200
+
+
+@pytest.mark.parametrize('forwarded', [
+    [],                                    # missing
+    [OMA4],                                # oma itself: any container or local account
+    ['100.104.237.20'],                    # another tailnet device, not listed
+    [PHONE4, PHONE4],                      # two headers
+    [OMA4 + ', ' + PHONE4], [PHONE4 + ', ' + OMA4], [PHONE4 + ',' + PHONE4],  # a list
+    ['phone'], [''], ['[' + PHONE6 + ']'], [PHONE4 + ':443'], ['fe80::1%eth0'], ['unknown'],
+])
+def test_identity_needs_exactly_one_listed_device(cfg, conn, forwarded):
+    headers = login(OWNER, None) + [('X-Forwarded-For', v) for v in forwarded]
+    with serving(cfg, [OWNER]) as port:
+        status, body, _ = get(port, headers)
+        assert status == 401 and body['error']['code'] == 'unauthorized'
+        assert get(port, headers + bearer('owner-secret'))[0] == 200
+        assert get(port, headers + bearer('device-secret'))[0] == 403
+
+
+def test_logins_without_devices_refuse_to_start(cfg, conn):
+    for devices in ([], ()):
+        with pytest.raises(ValueError, match='tailscale_devices'):
+            ReaderServer(('127.0.0.1', 0), Reader(cfg.db_path), {'owner-secret': 'owner'}, None, [OWNER], None, devices)
 
 
 def test_login_is_compared_raw_never_decoded(cfg, conn):
@@ -183,7 +222,7 @@ def test_peer_uid_of_a_real_loopback_connection(tmp_path):
 @pytest.mark.parametrize('host', ['0.0.0.0', '100.64.0.1', '192.168.80.1', 'oma.tailf63b9a.ts.net', ''])
 def test_identity_on_a_non_loopback_bind_refuses_to_start(cfg, conn, host):
     with pytest.raises(ValueError, match='loopback'):
-        ReaderServer((host, 0), Reader(cfg.db_path), {'owner-secret': 'owner'}, None, [OWNER])
+        ReaderServer((host, 0), Reader(cfg.db_path), {'owner-secret': 'owner'}, None, [OWNER], None, DEVICES)
 
 
 @pytest.mark.parametrize('host', ['0.0.0.0', ''])
@@ -202,10 +241,11 @@ def write_config(tmp_path, cfg, extra):
 
 @pytest.mark.parametrize('extra,expected', [
     ('', ()),
-    (f'tailscale_logins = ["{OWNER}"]\ntailscale_hosts = ["oma.tailf63b9a.ts.net:8540", "localhost:0"]\n', (OWNER,)),
+    (f'tailscale_logins = ["{OWNER}"]\ntailscale_devices = ["{PHONE4}"]\ntailscale_hosts = ["oma.tailf63b9a.ts.net:8540", "localhost:0"]\n', (OWNER,)),
+    (f'tailscale_devices = ["{PHONE4}"]\n', ()),
     ('tailscale_logins = []\n', ()),
-    (f'bind = "127.0.0.1:0"\ntailscale_logins = ["{OWNER}"]\n', (OWNER,)),
-    (f'bind = "localhost:0"\ntailscale_logins = ["{OWNER}"]\n', (OWNER,)),
+    (f'bind = "127.0.0.1:0"\ntailscale_logins = ["{OWNER}"]\ntailscale_devices = ["{PHONE4}", "{PHONE6}"]\n', (OWNER,)),
+    (f'bind = "localhost:0"\ntailscale_logins = ["{OWNER}"]\ntailscale_devices = ["{PHONE6}"]\n', (OWNER,)),
 ])
 def test_config_reads_allowed_logins(cfg, conn, tmp_path, extra, expected):
     server = build_server(write_config(tmp_path, cfg, extra if 'bind' in extra else 'bind = "127.0.0.1:0"\n' + extra))
@@ -224,7 +264,14 @@ def test_config_reads_allowed_logins(cfg, conn, tmp_path, extra, expected):
     'tailscale_logins = ["nyta\\tfar@github"]\n',
     'tailscale_hosts = "localhost:8540"\n',
     'tailscale_hosts = [""]\n',
-    f'bind = "0.0.0.0:0"\ntailscale_logins = ["{OWNER}"]\n',
+    f'bind = "0.0.0.0:0"\ntailscale_logins = ["{OWNER}"]\ntailscale_devices = ["{PHONE4}"]\n',
+    f'tailscale_logins = ["{OWNER}"]\n',
+    f'tailscale_logins = ["{OWNER}"]\ntailscale_devices = []\n',
+    f'tailscale_logins = ["{OWNER}"]\ntailscale_devices = "{PHONE4}"\n',
+    f'tailscale_logins = ["{OWNER}"]\ntailscale_devices = ["phone"]\n',
+    f'tailscale_logins = ["{OWNER}"]\ntailscale_devices = ["100.70.214.0/24"]\n',
+    f'tailscale_logins = ["{OWNER}"]\ntailscale_devices = [1]\n',
+    'tailscale_devices = ["phone"]\n',
 ])
 def test_config_refuses_bad_identity_settings(cfg, conn, tmp_path, extra):
     if 'bind' not in extra:

@@ -10,6 +10,12 @@ static_root = "/home/lasse/services/apps/roomlog-reader/web"
 # Printable ASCII only, compared exactly. Refused at startup unless `bind` is loopback, and
 # honoured only from a peer socket owned by the reader's own uid.
 # tailscale_logins = ["nytafar@github"]
+# Required with tailscale_logins (startup error otherwise): the tailnet IPs of the owner's own
+# client devices, as tsnet-proxy reports them in X-Forwarded-For. A login alone is not
+# enough: everything running on a user-owned node (oma's containers and local accounts, other
+# servers) is WhoIs'd as the owner, so never list oma or a server. List both families per
+# device; IPv6 is compared in canonical form.
+# tailscale_devices = ["100.64.0.10", "fd7a:115c:a1e0::a"]
 # Host values the identity header is honoured with (DNS-rebinding guard). Default: only
 # "localhost:<bind port>", which is what tsnet-proxy sends; leave it unset. `tailscale
 # serve` cannot use identity whatever this says: tailscaled runs as root, so its socket
