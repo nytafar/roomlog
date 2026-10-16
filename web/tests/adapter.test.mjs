@@ -174,3 +174,32 @@ test("word selection preserves authoritative whitespace and partial quotes", () 
   assert.equal(clipFromUnits([units(r)[1]], [r]).quoted_text, "verden!");
   assert.equal(units({ ...r, text: "Different text" })[0].kind, "segment");
 });
+test("span pages dedupe on span_id, not on a span's segment_id", async () => {
+  const pending = { device_id: "nyta", span_id: "7", segment_id: null };
+  const applied = { device_id: "nyta", span_id: "3", segment_id: "7" };
+  const twin = { ...applied, text: "newer" };
+  const adapter = {
+    read: async (route, params) =>
+      params.cursor
+        ? { items: [twin], next_cursor: null, as_of_ms: 2 }
+        : { items: [pending, applied], next_cursor: "c", as_of_ms: 1 },
+  };
+  const spans = (await pages(adapter, "spans", {})).items;
+  assert.deepEqual(spans.map((s) => s.span_id).sort(), ["3", "7"]);
+  assert.equal(spans.find((s) => s.span_id === "3").text, "newer");
+  const bounded = await boundedPages(adapter, "spans", {
+    from_ms: 0,
+    to_ms: 10,
+  });
+  assert.deepEqual(bounded.items.map((s) => s.span_id).sort(), ["3", "7"]);
+  const sessions = {
+    read: async () => ({
+      items: [
+        { device_id: "nyta", session_id: "7" },
+        { device_id: "nyta", session_id: "8" },
+      ],
+      next_cursor: null,
+    }),
+  };
+  assert.equal((await pages(sessions, "sessions", {})).items.length, 2);
+});

@@ -44,6 +44,13 @@ export class HttpRecall {
     return body;
   }
 }
+// Dedupe on the route's own identity. Span reports also carry a (possibly null) segment_id,
+// and span, segment and session IDs are separate spaces, so never fall back across them.
+const ROUTE_ID = { spans: "span_id", sessions: "session_id" };
+export function itemKey(route, item) {
+  const kind = ROUTE_ID[route] ?? "segment_id";
+  return `${item.device_id}:${kind}:${item[kind]}`;
+}
 export async function pages(
   adapter,
   route,
@@ -60,8 +67,7 @@ export async function pages(
       throw new RecallError("Invalid list response.", 502, "invalid_response");
     as_of_ms = response.as_of_ms;
     for (const item of response.items) {
-      const id = item.segment_id ?? item.span_id ?? item.session_id;
-      items.set(`${item.device_id}:${id}`, item);
+      items.set(itemKey(route, item), item);
       if (items.size > maxItems)
         throw new RecallError(
           "This window has too much text. Choose a shorter range.",
@@ -110,10 +116,7 @@ export async function boundedPages(
     );
     as_of_ms = Math.max(as_of_ms, result.as_of_ms || 0);
     for (const item of result.items)
-      items.set(
-        `${item.device_id}:${item.segment_id ?? item.span_id ?? item.session_id}`,
-        item,
-      );
+      items.set(itemKey(route, item), item);
     if (items.size > 20000)
       throw new RecallError("Choose a shorter range.", 422, "window_too_large");
   }
