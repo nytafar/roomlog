@@ -728,9 +728,14 @@ body.has-tray #tray {
 }
 
 /* Integration layout: keep zoom map and clip vocabulary with responsive controls. */
-html,
-body {
+/* Keep the document as the scroll owner for window scrolling and touch gestures. */
+html {
   overflow: auto;
+}
+body {
+  height: auto;
+  min-height: 100%;
+  overflow: visible;
   user-select: auto;
   -webkit-user-select: auto;
 }

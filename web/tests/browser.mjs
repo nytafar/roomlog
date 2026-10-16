@@ -256,6 +256,28 @@ try {
     0,
     "credentials and transcripts not persisted",
   );
+  // Real touch input over a long history window must move the document.
+  await cmd("Emulation.setTouchEmulationEnabled", {enabled: true, maxTouchPoints: 1});
+  await evaluate(`window.scrollProbe=document.createElement('div');scrollProbe.style.height='2400px';document.querySelector('#vp').append(scrollProbe);window.scrollTo(0,0)`);
+  const scrollPoint = await evaluate(`(()=>{const r=scrollProbe.getBoundingClientRect();return {x:195,y:Math.max(450,r.top+30)}})()`);
+  await cmd("Input.dispatchTouchEvent", {type:"touchStart",touchPoints:[scrollPoint]});
+  for(let i=1;i<=10;i++) {
+    await cmd("Input.dispatchTouchEvent", {type:"touchMove",touchPoints:[{x:scrollPoint.x,y:scrollPoint.y-i*20}]});
+    await sleep(20);
+  }
+  await cmd("Input.dispatchTouchEvent", {type:"touchEnd",touchPoints:[]});
+  await sleep(200);
+  const scrolled = await evaluate(`({window:scrollY,body:document.body.scrollTop,root:document.documentElement.scrollTop,bodyHeight:document.body.scrollHeight,rootHeight:document.documentElement.scrollHeight})`);
+  assert.ok(scrolled.window > 50, "swiping history scrolls the document down");
+  await cmd("Input.dispatchTouchEvent", {type:"touchStart",touchPoints:[{x:195,y:400}]});
+  for(let i=1;i<=5;i++) {
+    await cmd("Input.dispatchTouchEvent", {type:"touchMove",touchPoints:[{x:195,y:400+i*20}]});
+    await sleep(20);
+  }
+  await cmd("Input.dispatchTouchEvent", {type:"touchEnd",touchPoints:[]});
+  await sleep(100);
+  assert.ok(await evaluate(`scrollY`) < scrolled.window - 50, "swiping back scrolls the document up");
+  await evaluate(`scrollProbe.remove();window.scrollTo(0,0)`);
   // Loaded day detail is reusable at session/text zoom and focused ranges.
   const warmReadCount = requests.length;
   await evaluate(`window.warmFirstTurn=document.querySelector(".turn")`);
