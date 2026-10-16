@@ -12,6 +12,7 @@
       "session_id": null,
       "chunk_id": null,
       "chunk_start_utc_ms": null,
+      "audio_available": false,
       "span_id": "10",
       "producer": {
         "kind": "dictation",

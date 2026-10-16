@@ -263,6 +263,7 @@ def test_wire_fixtures_are_actual_reader_responses(cfg,conn,monkeypatch):
     monkeypatch.setattr(recall,'now_ms',lambda:first['as_of_ms'])
     cid=chunk(conn,model='fixture-model')
     conn.execute("UPDATE chunks SET start_utc_ms=?,end_utc_ms=?,session_id='session-1'",(start,start+5000))
+    cfg.archive_dir.mkdir(parents=True,exist_ok=True);(cfg.archive_dir/'x').write_bytes(b'OggS')  # chunk 1 plays
     rid=report(conn,device='phone',start=start+1000,end=start+3000,target=dict(app='codex'))
     conn.execute('UPDATE dictation_spans SET id=10 WHERE id=?',(rid,))
     for row in sorted(first['items']+phone['items'],key=lambda r:int(r['segment_id'])):

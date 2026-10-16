@@ -178,3 +178,28 @@ def test_rows_carry_chunk_start(cfg, conn, archive):
 def test_archive_dir_config(tmp_path):
     assert reader_archive_dir({'db_path': str(tmp_path / 'data/roomlog.db')}) == (tmp_path / 'data/archive').resolve()
     assert reader_archive_dir({'db_path': 'x.db', 'archive_dir': str(tmp_path / 'a')}) == (tmp_path / 'a').resolve()
+
+
+def test_audio_available_matches_the_route(cfg, conn, archive):
+    playable = add_chunk(conn, '2026/10/16/chunk.opus', start=1000)
+    gone = add_chunk(conn, '2026/10/16/gone.opus', sha='b' * 64, start=1000)
+    derived = add_chunk(conn, None, sha='c' * 64, start=1000, kind='derived')
+    escape = add_chunk(conn, '../secret.opus', sha='d' * 64, start=1000)
+    (archive.parent / 'secret.opus').write_bytes(b'secret')
+    for cid in (playable, gone, derived, escape):
+        add_segment(conn, cid)
+    span = conn.execute("""INSERT INTO dictation_spans(device_id,start_utc_ms,end_utc_ms,text,lang,engine,mode,
+        origin,body_json,received_utc_ms) VALUES('nyta',1600,1700,'standalone','no','e','raw','o','{}',0)""").lastrowid
+    conn.execute("""INSERT INTO segments(chunk_id,device_id,span_id,idx,start_utc_ms,end_utc_ms,offset_ms,text,lang,model_id)
+        VALUES(NULL,'nyta',?,0,1600,1700,0,'hello','no','dictation')""", (span,))
+    reader = Reader(cfg.db_path, archive_dir=archive)
+    window = dict(device_id='nyta', from_ms='1000', to_ms='5000', channel='all')
+    expected = {str(playable): True, str(gone): False, str(derived): False, str(escape): False, None: False}
+    rows = reader.read('transcript', parse('transcript', list(window.items())))['items']
+    assert {r['chunk_id']: r['audio_available'] for r in rows} == expected
+    hits = reader.read('search', parse('search', list(dict(window, q='hello').items())))['items']
+    assert {r['chunk_id']: r['audio_available'] for r in hits} == expected
+    with serving(cfg, archive) as get:
+        for cid, available in expected.items():
+            if cid is not None:
+                assert (get(f'/v1/recall/audio?chunk_id={cid}')[0] == 200) is available

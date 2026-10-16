@@ -213,16 +213,22 @@ class Reader:
         with closing(self.connection()) as conn:
             row=conn.execute('SELECT path,sha256 FROM chunks WHERE id=?',(chunk_id,)).fetchone()
         if row is None: raise RecallError(404,'not_found','Unknown chunk')
-        unavailable=RecallError(404,'audio_unavailable','Chunk audio is not available')
+        target=self.audio_file(chunk_id,row['path'])
+        if target is None: raise RecallError(404,'audio_unavailable','Chunk audio is not available')
+        return target,row['sha256']
+
+    def audio_file(self,chunk_id,path):
+        """The one rule for playable audio, shared by the route and rows' `audio_available`:
+        a stored path that resolves to a regular file inside the archive, else None."""
         # Derived chunks (ADR 0005) are slices of raw captures and have no file of their own.
-        if not row['path']: raise unavailable
-        try: target=(self.archive_dir/row['path']).resolve()
-        except (ValueError,OSError): raise unavailable
+        if not path: return None
+        try: target=(self.archive_dir/path).resolve()
+        except (ValueError,OSError): return None
         if not target.is_relative_to(self.archive_dir):
             logging.getLogger(__name__).warning('Chunk %s path escapes the archive',chunk_id)
-            raise unavailable
-        if not target.is_file(): raise unavailable
-        return target,row['sha256']
+            return None
+        try: return target if target.is_file() else None
+        except OSError: return None
 
     def check_response(self,result):
         check_budget()
@@ -256,9 +262,12 @@ class Reader:
 
     def segment_item(self,conn,identity):
         row=conn.execute(f'''SELECT s.*,c.session_id,c.status processing_state,
-            c.start_utc_ms chunk_start,{CHANNEL} channel FROM segments s
+            c.start_utc_ms chunk_start,c.path chunk_path,{CHANNEL} channel FROM segments s
             LEFT JOIN chunks c ON c.id=s.chunk_id WHERE s.id=?''',(identity,)).fetchone()
-        return item(conn,row)
+        value=item(conn,row)
+        # One stat per row (pages are bounded); true exactly when /audio would serve the chunk.
+        value['audio_available']=row['chunk_id'] is not None and self.audio_file(row['chunk_id'],row['chunk_path']) is not None
+        return value
 
     def digest(self,route,p):
         return hashlib.sha256(json.dumps([route,{k:v for k,v in p.items() if k not in ('cursor','limit')}],sort_keys=True).encode()).hexdigest()

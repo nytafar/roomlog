@@ -12,6 +12,7 @@
       "session_id": "session-1",
       "chunk_id": "1",
       "chunk_start_utc_ms": 1790850000000,
+      "audio_available": true,
       "span_id": null,
       "producer": {
         "kind": "stt",
@@ -48,6 +49,7 @@
       "session_id": "session-1",
       "chunk_id": "1",
       "chunk_start_utc_ms": 1790850000000,
+      "audio_available": true,
       "span_id": null,
       "producer": {
         "kind": "stt",
