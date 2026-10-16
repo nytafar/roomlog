@@ -274,3 +274,50 @@ def test_migration_v5_to_v6_never_reuses_a_chunk_id(tmp_path):
     conn.execute("DELETE FROM chunks WHERE id = ?", (a,))
     assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 0  # the cascade survives
     conn.close()
+
+
+def test_a_stale_second_migrator_does_not_rebuild_again(tmp_path, monkeypatch):
+    """Two processes start on a v5 database; the second reads v5 before the first commits v6.
+    Under the lock it must see v6 and skip, or the rebuild would reset the id counter."""
+    import sqlite3
+    path = tmp_path / "v5.db"
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    dbmod.migrate(conn, target=5)
+    seed_chunk(conn, sha_seed=b"a")
+    conn.close()
+    first = dbmod.connect(path)
+    top = seed_chunk(first, sha_seed=b"b")
+    first.execute("DELETE FROM chunks WHERE id = ?", (top,))
+
+    stale = sqlite3.connect(str(path), isolation_level=None)
+    stale.row_factory = sqlite3.Row
+    real = dbmod.user_version
+    reads = []
+
+    def as_before_the_first_commit(c):
+        reads.append(1)
+        return 5 if len(reads) == 1 else real(c)
+
+    monkeypatch.setattr(dbmod, "user_version", as_before_the_first_commit)
+    dbmod.migrate(stale)
+    monkeypatch.undo()
+    assert len(reads) >= 2  # read again under the lock
+    stale.close()
+    assert seed_chunk(first, sha_seed=b"c") > top
+    first.close()
+
+
+def test_rerunning_the_v6_rebuild_keeps_the_id_counter(tmp_path):
+    conn = dbmod.connect(tmp_path / "v6.db")
+    top = seed_chunk(conn, sha_seed=b"a")
+    top = seed_chunk(conn, sha_seed=b"b")
+    conn.execute("DELETE FROM chunks WHERE id = ?", (top,))
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("BEGIN")
+    for statement in dbmod._statements(dbmod._MIGRATIONS[6]):
+        conn.execute(statement)
+    conn.execute("COMMIT")
+    conn.execute("PRAGMA foreign_keys=ON")
+    assert seed_chunk(conn, sha_seed=b"c") > top
+    conn.close()

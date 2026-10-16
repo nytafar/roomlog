@@ -296,7 +296,7 @@ def test_resegment_range_in_the_middle_of_a_run_touches_only_that_extent(tmp_pat
     out = reset_segmentation(conn, "s22", from_ms=RAW_T0 + 100_000, to_ms=RAW_T0 + 130_000)
     hit = [c for c in before if c["n_start"] < 5 * SEGMENT and c["n_start"] + c["n_samples"] > 4 * SEGMENT]
     assert len(hit) == 4  # 115-121, 125-131, 135-141, 145-151
-    assert out == {"epochs": 1, "raw_reset": 3, "chunks_deleted": 4, "audio_removed": 0}  # raw 3, 4, 5 (the straddlers reach into 3 and 5)
+    assert out == {"epochs": 1, "raw_reset": 3, "chunks_deleted": 4, "audio_removed": 0, "audio_remove_failed": 0}  # raw 3, 4, 5 (the straddlers reach into 3 and 5)
     assert statuses(conn, "s22") == ["segmented"] * 3 + ["pending"] * 3 + ["segmented"] * 4
     left = [dict(r) for r in conn.execute("SELECT id, n_start, n_samples, sha256 FROM chunks ORDER BY n_start")]
     assert left == [c for c in before if c not in hit]  # the others keep their ids and transcripts

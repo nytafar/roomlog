@@ -528,7 +528,12 @@ class Segmenter:
             raise
         if orphans:
             # Same PCM as a chunk that already exists elsewhere: the row is kept, the file not.
-            remove_unreferenced(self.conn, self.archive_dir, orphans)
+            # Best-effort: the rows are committed, and the sweep removes what this leaves.
+            try:
+                remove_unreferenced(self.conn, self.archive_dir, orphans)
+            except Exception:
+                log.warning("could not remove %d unreferenced derived file(s); left for the sweep",
+                            len(orphans), exc_info=True)
         return mark
 
     @staticmethod
@@ -694,8 +699,8 @@ def reset_segmentation(conn: sqlite3.Connection, device_id: str, from_ms: int | 
     gap that filled late.
 
     The deleted chunks' audio files are removed after the commit when `archive_dir` is given
-    (one that a re-derived chunk already points at again stays); without it they are left
-    for `derived_audio.sweep`. Chunk ids are never reused (AUTOINCREMENT, schema v6), so a
+    (one that a re-derived chunk already points at again stays); without it, or when that
+    removal fails (`audio_remove_failed`), they are left for `derived_audio.sweep`. Chunk ids are never reused (AUTOINCREMENT, schema v6), so a
     re-derived chunk never answers under the id of a deleted one, whose immutable audio
     response a client may have cached.
     """
@@ -712,7 +717,7 @@ def reset_segmentation(conn: sqlite3.Connection, device_id: str, from_ms: int | 
             FROM raw_segments WHERE {' AND '.join(where)} GROUP BY run_id, epoch""",
         params,
     ).fetchall()
-    out = {"epochs": 0, "raw_reset": 0, "chunks_deleted": 0, "audio_removed": 0}
+    out = {"epochs": 0, "raw_reset": 0, "chunks_deleted": 0, "audio_removed": 0, "audio_remove_failed": 0}
     deleted_paths: list[str] = []
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -789,7 +794,14 @@ def reset_segmentation(conn: sqlite3.Connection, device_id: str, from_ms: int | 
         conn.execute("ROLLBACK")
         raise
     if archive_dir is not None and deleted_paths:
-        out["audio_removed"] = remove_unreferenced(conn, archive_dir, deleted_paths)["removed"]
+        # The reset is committed; failing here (the database locked by a busy worker, say)
+        # must not hide that or stop the re-run. What is not removed now, the sweep removes.
+        try:
+            out["audio_removed"] = remove_unreferenced(conn, archive_dir, deleted_paths)["removed"]
+        except Exception:
+            log.warning("removing the files of %d deleted derived chunk(s) failed; left for the sweep",
+                        len(deleted_paths), exc_info=True)
+            out["audio_remove_failed"] = len(deleted_paths)
     return out
 
 

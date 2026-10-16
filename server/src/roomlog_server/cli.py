@@ -154,6 +154,9 @@ def cmd_resegment(cfg: Config, args: argparse.Namespace) -> int:
                              archive_dir=cfg.archive_dir)
     print(f"reset epochs={out['epochs']} raw={out['raw_reset']} chunks_deleted={out['chunks_deleted']} "
           f"audio_removed={out['audio_removed']}")
+    if out["audio_remove_failed"]:
+        print(f"  could not remove the files of {out['audio_remove_failed']} deleted chunk(s) now; "
+              "the worker's daily sweep will", file=sys.stderr)
     return _segment(cfg, conn, args)
 
 

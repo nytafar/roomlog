@@ -349,6 +349,9 @@ INSERT INTO chunks_v6 SELECT id, sha256, kind, device_id, start_utc_ms, end_utc_
     n_start, n_samples, meta_json, run_id, epoch, discontinuity, clock_synced, received_utc_ms,
     status, attempts, error, transcribed_utc_ms, model_id, model_revision, session_id,
     n_segments_dropped FROM chunks;
+-- a counter the old table already had (it never has at v5) is kept, never lowered
+UPDATE sqlite_sequence SET seq = max(seq, COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'chunks'), 0))
+    WHERE name = 'chunks_v6';
 DROP TABLE chunks;
 ALTER TABLE chunks_v6 RENAME TO chunks;
 CREATE INDEX chunks_start ON chunks (start_utc_ms);
@@ -406,6 +409,20 @@ def user_version(conn: sqlite3.Connection) -> int:
     return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
 
+def _statements(script: str) -> list[str]:
+    """Split a migration script into complete statements (trigger bodies stay whole)."""
+    out: list[str] = []
+    buf = ""
+    for line in script.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            out.append(buf.strip())
+            buf = ""
+    if buf.strip() and not all(ln.strip().startswith("--") or not ln.strip() for ln in buf.splitlines()):
+        raise ValueError(f"incomplete statement at the end of a migration: {buf.strip()[:80]}")
+    return out
+
+
 def migrate(conn: sqlite3.Connection, target: int = SCHEMA_VERSION) -> None:
     """Apply migrations up to `target` (tests stop early to build an old database)."""
     current = user_version(conn)
@@ -425,9 +442,19 @@ def migrate(conn: sqlite3.Connection, target: int = SCHEMA_VERSION) -> None:
         if before:
             log.warning("database has %d dangling foreign key row(s) before migration", len(before))
         for version in range(current + 1, target + 1):
-            script = f"BEGIN;\n{_MIGRATIONS[version]}\nPRAGMA user_version={version};"
+            # The version is read again under the write lock: two processes starting together
+            # both see the old version above, and the one that gets the lock second must not
+            # run a step the first already committed (a second v6 rebuild would reset the
+            # AUTOINCREMENT counter). `executescript` would commit an open transaction, so the
+            # statements run one by one inside this one.
+            conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.executescript(script)
+                if user_version(conn) >= version:
+                    conn.execute("COMMIT")
+                    continue
+                for statement in _statements(_MIGRATIONS[version]):
+                    conn.execute(statement)
+                conn.execute(f"PRAGMA user_version={version}")
                 after = _dangling(conn)
                 added = after - before
                 if added:

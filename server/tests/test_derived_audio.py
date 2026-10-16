@@ -175,6 +175,39 @@ def test_reset_with_a_changed_derivation_leaves_no_orphans(site):
     assert new and not (new & old) and files(cfg) == new
 
 
+def test_a_failed_file_removal_after_the_reset_commit_is_reported_not_raised(site, monkeypatch, caplog):
+    cfg, conn, _ = site
+    make_segmenter(cfg, conn).run_once()
+
+    def locked(*a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(segmod, "remove_unreferenced", locked)
+    out = reset_segmentation(conn, "s22", archive_dir=cfg.archive_dir)
+    assert (out["chunks_deleted"], out["audio_removed"], out["audio_remove_failed"]) == (2, 0, 2)
+    assert derived(conn) == [] and len(files(cfg)) == 2  # the reset stands; the files wait
+    assert "left for the sweep" in caplog.text
+    monkeypatch.undo()
+    assert make_segmenter(cfg, conn).run_once().chunks == 2  # same chunks, same files again
+    assert files(cfg) == {r["path"] for r in derived(conn)}
+
+
+def test_cli_resegment_goes_on_when_file_removal_fails(site, monkeypatch, capsys):
+    cfg, conn, _ = site
+    from roomlog_server.cli import main
+    toml = cfg.config_dir / "server.toml"
+    toml.write_text(f'[paths]\ndata_dir = "{cfg.data_dir}"\n[segmenter]\nvad = "energy"\n'
+                    '[[backends]]\nname = "fake"\ntype = "fake"\nmodel = "fake-model"\n')
+    assert main(["-c", str(toml), "segment"]) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(segmod, "remove_unreferenced",
+                        lambda *a, **kw: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")))
+    assert main(["-c", str(toml), "resegment", "--device", "s22"]) == 0
+    out, err = capsys.readouterr()
+    assert out.splitlines() == ["reset epochs=1 raw=3 chunks_deleted=2 audio_removed=0", "epochs=1 chunks=2"]
+    assert "daily sweep" in err
+
+
 def test_reset_without_archive_dir_leaves_files_for_the_sweep(site):
     cfg, conn, _ = site
     make_segmenter(cfg, conn).run_once()

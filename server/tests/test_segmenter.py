@@ -318,7 +318,7 @@ def test_reset_segmentation_rederives_the_same_chunks(tmp_path):
                  "VALUES (?, 's22', 0, 0, 1, 0, 'x', 'm')", (before[0]["id"],))
 
     out = reset_segmentation(conn, "s22")
-    assert out == {"epochs": 1, "raw_reset": 3, "chunks_deleted": 2, "audio_removed": 0}
+    assert out == {"epochs": 1, "raw_reset": 3, "chunks_deleted": 2, "audio_removed": 0, "audio_remove_failed": 0}
     assert derived(conn) == [] and conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 0
     assert raw_status(conn) == ["pending"] * 3
     assert conn.execute("SELECT count(*) FROM raw_progress").fetchone()[0] == 0
@@ -341,7 +341,7 @@ def test_reset_segmentation_rederives_the_same_chunks(tmp_path):
     assert [c["sha256"] for c in derived(conn)] == [c["sha256"] for c in before]
     # another device is untouched
     assert reset_segmentation(conn, "nobody") == {"epochs": 0, "raw_reset": 0, "chunks_deleted": 0,
-                                                     "audio_removed": 0}
+                                                     "audio_removed": 0, "audio_remove_failed": 0}
     conn.close()
 
 
