@@ -86,3 +86,21 @@ def test_search_address_of_point_row_is_a_valid_window(cfg, conn):
     assert addresses == [(2200, 2201), (2300, 2400)]
     for a, b in addresses:
         parse('transcript', [('device_id', 'nyta'), ('from_ms', str(a)), ('to_ms', str(b))])
+
+
+def test_unstatable_static_paths_are_not_found(cfg, conn, tmp_path):
+    root = tmp_path / 'public'
+    root.mkdir()
+    (root / 'index.html').write_text('app')
+    locked = root / 'locked'
+    locked.mkdir()
+    (locked / 'index.html').write_text('hidden')
+    locked.chmod(0)
+    try:
+        with serving(cfg, root) as port:
+            for path in ('/' + 'a' * 300, '/' + 'a' * 300 + '/', '/locked/index.html', '/locked/'):
+                reply = exchange(port, b'GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' % path.encode())
+                assert reply.startswith(b'HTTP/1.1 404 '), (path, reply)
+                assert b'hidden' not in reply
+    finally:
+        locked.chmod(0o755)

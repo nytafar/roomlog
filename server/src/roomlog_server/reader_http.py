@@ -58,6 +58,13 @@ def byte_range(header,size):
     return a,min(b,size-1)
 
 
+def etag_matches(header,etag):
+    """If-None-Match weak comparison (RFC 9110 13.1.2): `*`, or any listed tag equal to ours
+    once `W/` is dropped from both."""
+    tags=[t.strip() for t in header.split(',')]
+    return '*' in tags or etag.removeprefix('W/') in (t.removeprefix('W/') for t in tags)
+
+
 def reader_archive_dir(cfg):
     """`archive_dir` from reader.toml, else the server's default beside the database."""
     if cfg.get('archive_dir'): return Path(cfg['archive_dir']).expanduser().resolve()
@@ -130,7 +137,7 @@ class Handler(BaseHTTPRequestHandler):
         with f:
             size=os.fstat(f.fileno()).st_size
             common=[('ETag',etag),('Cache-Control',AUDIO_CACHE),('Accept-Ranges','bytes')]
-            if etag in (t.strip() for t in self.headers.get('If-None-Match','').split(',')):
+            if etag_matches(self.headers.get('If-None-Match',''),etag):
                 self.send_response(304)
                 for name,value in common: self.send_header(name,value)
                 self.end_headers(); return
@@ -157,10 +164,13 @@ class Handler(BaseHTTPRequestHandler):
         try: target=(root/unquote(path).lstrip('/')).resolve()
         except (ValueError,OSError): raise RecallError(404,'not_found','File not found')  # e.g. an embedded NUL
         if not target.is_relative_to(root): raise RecallError(404,'not_found','File not found')
-        if target.is_dir(): target=(target/'index.html').resolve()
-        if not target.is_relative_to(root): raise RecallError(404,'not_found','File not found')
-        if not target.is_file(): raise RecallError(404,'not_found','File not found')
-        data=target.read_bytes(); self.send_response(200)
+        # stat and read can fail too (ENAMETOOLONG, EACCES); none of that is the client's business
+        try:
+            if target.is_dir(): target=(target/'index.html').resolve()
+            if not target.is_relative_to(root) or not target.is_file(): raise RecallError(404,'not_found','File not found')
+            data=target.read_bytes()
+        except (ValueError,OSError): raise RecallError(404,'not_found','File not found')
+        self.send_response(200)
         self.send_header('Content-Type',mimetypes.guess_type(target.name)[0] or 'application/octet-stream')
         data=self.body_headers(data); self.send_header('Cache-Control','no-store')
         self.send_header('X-Content-Type-Options','nosniff'); self.end_headers(); self.wfile.write(data)

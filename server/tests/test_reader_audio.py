@@ -203,3 +203,27 @@ def test_audio_available_matches_the_route(cfg, conn, archive):
         for cid, available in expected.items():
             if cid is not None:
                 assert (get(f'/v1/recall/audio?chunk_id={cid}')[0] == 200) is available
+
+
+@pytest.mark.parametrize('header,matches', [
+    (f'"{SHA}"', True), ('*', True), (f'W/"{SHA}"', True), (f'"x", W/"{SHA}"', True),
+    (f'"x",W/"y" ,  "{SHA}"', True), ('"x", W/"y"', False), (SHA, False), (f'W/"{SHA[:-1]}"', False)])
+def test_if_none_match_uses_weak_comparison(cfg, conn, archive, header, matches):
+    cid = add_chunk(conn, '2026/10/16/chunk.opus')
+    with serving(cfg, archive) as get:
+        status, body, r = get(f'/v1/recall/audio?chunk_id={cid}', If_None_Match=header)
+        assert (status, len(body)) == ((304, 0) if matches else (200, len(AUDIO)))
+        assert r.getheader('ETag') == f'"{SHA}"'
+
+
+def test_escape_warning_is_logged_once_per_chunk(cfg, conn, archive, caplog):
+    cid = add_chunk(conn, '../secret.opus')
+    add_segment(conn, cid)
+    reader = Reader(cfg.db_path, archive_dir=archive)
+    window = parse('transcript', [('device_id', 'nyta'), ('from_ms', '1000'), ('to_ms', '5000')])
+    with caplog.at_level('WARNING', logger='roomlog_server.recall'):
+        for _ in range(3):
+            assert reader.read('transcript', window)['items'][0]['audio_available'] is False
+            with pytest.raises(Exception):
+                reader.audio(cid)
+    assert sum('escapes the archive' in m for m in caplog.messages) == 1

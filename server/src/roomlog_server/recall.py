@@ -170,6 +170,7 @@ class Reader:
         # Chunk paths are relative to the archive; the server's default is data_dir/archive
         # beside data_dir/roomlog.db.
         self.archive_dir=Path(archive_dir or self.path.parent/'archive').expanduser().resolve()
+        self.escaped=set()  # chunk ids already warned about, so page reads don't repeat it
         with closing(self.connection()) as conn:
             if db.user_version(conn)!=db.SCHEMA_VERSION: raise RuntimeError('Reader requires current database schema; migrate with writer separately')
 
@@ -225,7 +226,9 @@ class Reader:
         try: target=(self.archive_dir/path).resolve()
         except (ValueError,OSError): return None
         if not target.is_relative_to(self.archive_dir):
-            logging.getLogger(__name__).warning('Chunk %s path escapes the archive',chunk_id)
+            if chunk_id not in self.escaped:
+                self.escaped.add(chunk_id)
+                logging.getLogger(__name__).warning('Chunk %s path escapes the archive',chunk_id)
             return None
         try: return target if target.is_file() else None
         except OSError: return None
