@@ -28,6 +28,7 @@ const audioRequests = [];
 let latestKnown = base + 5000;
 let current = fixture.items,
   fail = false,
+  identity = false, // the reader honours a Tailscale login, as behind the tailnet proxy
   requests = [];
 const sourceIds = [...new Set(fixture.items.map((row) => row.device_id))];
 const server = createServer(async (req, res) => {
@@ -35,8 +36,9 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
     if (url.pathname.startsWith("/v1/recall/")) {
       requests.push(url);
+      url.authorization = req.headers.authorization;
       res.setHeader("Content-Type", "application/json");
-      if (req.headers.authorization !== "Bearer browser-test") {
+      if (!identity && req.headers.authorization !== "Bearer browser-test") {
         res.writeHead(401);
         res.end(
           JSON.stringify({
@@ -249,8 +251,11 @@ try {
     url: `http://127.0.0.1:${server.address().port}/`,
   });
   await waitFor(
-    `document.readyState==='complete'&&!!document.querySelector('#token')`,
+    `document.readyState==='complete'&&!document.querySelector('#login').hidden`,
   );
+  assert.equal(requests.length, 1, "one tokenless probe before the token screen");
+  assert.equal(requests[0].authorization, undefined);
+  assert.equal(await evaluate(`document.activeElement.id`), "token");
   await evaluate(
     `document.querySelector('#token').value='browser-test';document.querySelector('#login').requestSubmit()`,
   );
@@ -520,13 +525,35 @@ try {
     ),
     true,
   );
+  // Behind the tailnet proxy the reader already knows the owner: a reload gets straight in,
+  // sends no token and offers no logout that would do nothing.
+  identity = true;
+  const signedIn = requests.length;
+  await cmd("Page.navigate", {
+    url: `http://127.0.0.1:${server.address().port}/`,
+  });
+  await waitFor(
+    `!document.querySelector('#app').hidden&&document.querySelector('.turn p')?.textContent==='Fresh midnight point'&&!document.querySelector('#status').textContent.includes('Loading')`,
+  );
+  assert.equal(
+    await evaluate(
+      `document.querySelector('#login').hidden&&getComputedStyle(document.querySelector('#logout')).display==='none'`,
+    ),
+    true,
+    "no token screen and no logout under identity sign-in",
+  );
+  assert.ok(requests.length > signedIn);
+  assert.ok(
+    requests.slice(signedIn).every((url) => url.authorization === undefined),
+    "identity sign-in sends no token",
+  );
   assert.deepEqual(errors, [], "no browser runtime errors");
   assert.ok(
     requests.every((url) => !url.href.includes("browser-test")),
     "token never enters request URLs",
   );
   console.log(
-    "Browser passed: real modules, shared wire fixtures, mobile layout, tap-to-play audio, continuous playback, timed selection, tray, filters, provenance, safe text, refresh removal, stale state, zoom navigation and logout.",
+    "Browser passed: real modules, shared wire fixtures, mobile layout, tap-to-play audio, continuous playback, timed selection, tray, filters, provenance, safe text, refresh removal, stale state, zoom navigation, logout and tokenless identity sign-in.",
   );
 } finally {
   ws?.close();

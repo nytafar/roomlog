@@ -1,4 +1,6 @@
 // The token is intentionally private, memory-only, and never part of a URL/cache key.
+// Without a token no Authorization header is sent: behind the tailnet proxy the reader
+// knows the owner from the Tailscale identity it is given (ADR 0009).
 export class RecallError extends Error {
   constructor(message, status, code) {
     super(message);
@@ -13,6 +15,9 @@ export class HttpRecall {
     this.fetcher = (...args) => fetcher(...args);
     this.base = base;
   }
+  #headers() {
+    return this.#token ? { Authorization: `Bearer ${this.#token}` } : {};
+  }
   async read(route, params = {}, signal) {
     const query = new URLSearchParams(
       Object.entries(params).filter(([, v]) => v !== "" && v != null),
@@ -22,7 +27,7 @@ export class HttpRecall {
       {
         signal,
         cache: "no-store",
-        headers: { Authorization: `Bearer ${this.#token}` },
+        headers: this.#headers(),
       },
     );
     let body;
@@ -51,7 +56,7 @@ export class HttpRecall {
       {
         signal,
         cache: "no-store",
-        headers: { Authorization: `Bearer ${this.#token}` },
+        headers: this.#headers(),
       },
     );
     if (response.ok) return response.blob();

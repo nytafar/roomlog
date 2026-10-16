@@ -92,32 +92,51 @@ function toast(message) {
   $("#toast").classList.add("show");
   setTimeout(() => $("#toast").classList.remove("show"), 2500);
 }
+// Signed in by the reader itself (Tailscale identity behind the tailnet proxy): there is no
+// token to forget, so no logout either.
+let identity = false;
+async function open(client, signedIn) {
+  const setup = await client.read("info");
+  identity = signedIn;
+  $("#logout").hidden = signedIn;
+  adapter = client;
+  info = setup;
+  store = new WindowStore(adapter);
+  sourceOptions();
+  const last = Math.max(
+    0,
+    ...info.sources.map((source) => source.last_known_ms || 0),
+  );
+  if (last) state.date = localDate(last);
+  if (info.sources.length === 1) state.source = info.sources[0].device_id;
+  $("#source").value = state.source;
+  $("#play-selection").hidden = !audioOn();
+  $("#gearhint").textContent = hint();
+  $("#login").hidden = true;
+  $("#app").hidden = false;
+  await load();
+}
 async function login(event) {
   event.preventDefault();
   $("#login-error").textContent = "";
   const token = $("#token").value;
   $("#token").value = "";
-  const client = new HttpRecall(token);
   try {
-    const setup = await client.read("info");
-    adapter = client;
-    info = setup;
-    store = new WindowStore(adapter);
-    sourceOptions();
-    const last = Math.max(
-      0,
-      ...info.sources.map((source) => source.last_known_ms || 0),
-    );
-    if (last) state.date = localDate(last);
-    if (info.sources.length === 1) state.source = info.sources[0].device_id;
-    $("#source").value = state.source;
-    $("#play-selection").hidden = !audioOn();
-    $("#gearhint").textContent = hint();
-    $("#login").hidden = true;
-    $("#app").hidden = false;
-    await load();
+    await open(new HttpRecall(token), false);
   } catch (error) {
     $("#login-error").textContent = error.message;
+  }
+}
+// Ask first without a token; only a refusal (or no answer) brings up the token screen.
+async function start() {
+  try {
+    await open(new HttpRecall(), true);
+  } catch (error) {
+    if (adapter) return;
+    if (error.status !== 401 && error.status !== 403)
+      $("#login-error").textContent = error.message;
+    $("#login").hidden = false;
+    $("#token").focus();
   }
 }
 $("#login").addEventListener("submit", login);
@@ -298,7 +317,11 @@ async function load(refresh = false) {
       `${result.value ? "Stale history · " : ""}${result.error.message} · use ↻ to retry`,
     );
     if (result.error.status === 401 || result.error.status === 403)
-      toast("Read access rejected. Log out and enter the owner read token.");
+      toast(
+        identity
+          ? "Read access rejected. Reload to sign in again."
+          : "Read access rejected. Log out and enter the owner read token.",
+      );
   } else status(`${result.cached ? "Loaded history" : "Updated " + time(Date.now())}`);
 }
 // One request per category at a time stays within the reader's concurrency budget.
@@ -1396,3 +1419,4 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("focus", () => {
   if (adapter && !loading && !gesture) load(true);
 });
+start();

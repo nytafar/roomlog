@@ -6,7 +6,9 @@ from contextlib import closing
 import logging
 import sqlite3
 import hmac
+import ipaddress
 import json
+from email.header import decode_header, make_header
 import mimetypes
 import os
 import threading
@@ -16,9 +18,32 @@ from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
 from .recall import LIMITS, Reader, RecallError, parse
 
+IDENTITY_HEADER='Tailscale-User-Login'
+
+
+def is_loopback(host):
+    """True only for a host that can never be reached from another machine."""
+    if host=='localhost': return True
+    try: return ipaddress.ip_address(host.strip('[]')).is_loopback
+    except ValueError: return False
+
+
+def decode_login(value):
+    """A login as tsnet-proxy sends it: `mime.QEncoding.Encode("utf-8", login)`, so plain
+    ASCII arrives as is and anything else as RFC 2047 encoded words. None if undecodable."""
+    try: return str(make_header(decode_header(value)))
+    except (ValueError, LookupError, UnicodeError): return None
+
+
 class ReaderServer(ThreadingHTTPServer):
     daemon_threads=True
-    def __init__(self,address,reader,tokens,static_root=None):
+    def __init__(self,address,reader,tokens,static_root=None,identity_logins=()):
+        # The identity header is only as trustworthy as the path to this socket: on loopback
+        # the only senders are oma's own processes (the tailnet proxy among them). Anywhere
+        # else a peer could set it, so refuse to start rather than honour or silently drop it.
+        if identity_logins and not is_loopback(address[0]):
+            raise ValueError(f'tailscale_logins needs a loopback bind, not {address[0]!r}')
+        self.identity_logins=frozenset(identity_logins)
         self.reader,self.tokens=reader,tokens
         self.static_root=Path(static_root).resolve() if static_root else None
         self.slots=threading.BoundedSemaphore(LIMITS['concurrent_reads'])
@@ -107,9 +132,11 @@ class Handler(BaseHTTPRequestHandler):
                 with closing(self.server.reader.connection()) as conn: conn.execute('SELECT 1')
                 self.send(200,dict(status='ready')); return
             if not u.path.startswith('/v1/recall/'): self.static(u.path); return
-            auth=self.headers.get_all('Authorization',[])
-            token=auth[0][7:] if len(auth)==1 and auth[0].startswith('Bearer ') else ''
-            role=next((role for key,role in self.server.tokens.items() if hmac.compare_digest(key.encode(),token.encode())),None)
+            role=self.identity_role()
+            if role is None:
+                auth=self.headers.get_all('Authorization',[])
+                token=auth[0][7:] if len(auth)==1 and auth[0].startswith('Bearer ') else ''
+                role=next((role for key,role in self.server.tokens.items() if hmac.compare_digest(key.encode(),token.encode())),None)
             if role is None: raise RecallError(401,'unauthorized','Read credential required')
             if role!='owner': raise RecallError(403,'forbidden','Credential has no read role')
             route=u.path.removeprefix('/v1/recall/')
@@ -128,6 +155,14 @@ class Handler(BaseHTTPRequestHandler):
         except sqlite3.Error:
             logging.getLogger(__name__).exception('Reader database failure')
             self.send(503,dict(error=dict(code='read_unavailable',message='Reader database unavailable')))
+    def identity_role(self):
+        """'owner' for exactly one allowed Tailscale-User-Login from a loopback peer, else None
+        (and the bearer check decides, as without identity sign-in)."""
+        logins=self.server.identity_logins
+        if not logins or not is_loopback(self.client_address[0]): return None
+        values=self.headers.get_all(IDENTITY_HEADER,[])
+        if len(values)!=1: return None
+        return 'owner' if decode_login(values[0]) in logins else None
     def audio(self,target,sha256):
         """One chunk's Ogg Opus file. Content is fixed per chunk ID (its path holds its sha256 and
         speech chunks are never rewritten), so the browser may keep it privately for good."""
@@ -175,15 +210,19 @@ class Handler(BaseHTTPRequestHandler):
         data=self.body_headers(data); self.send_header('Cache-Control','no-store')
         self.send_header('X-Content-Type-Options','nosniff'); self.end_headers(); self.wfile.write(data)
 
-def main(argv=None):
-    p=argparse.ArgumentParser(prog='roomlog-reader'); p.add_argument('--config',required=True)
-    args=p.parse_args(argv)
-    with Path(args.config).expanduser().open('rb') as f: cfg=tomllib.load(f)
+def build_server(config_path):
+    with Path(config_path).expanduser().open('rb') as f: cfg=tomllib.load(f)
     with Path(cfg['tokens_file']).expanduser().open('rb') as f: tokens=tomllib.load(f).get('tokens',{})
     if not tokens or any(not isinstance(k,str) or not k or v not in ('owner','device') for k,v in tokens.items()): raise ValueError('Invalid reader credential roles')
     labels=cfg.get('sources',{})
     if any(not isinstance(v,dict) or v.get('display_as','device') not in ('device','room') or not isinstance(v.get('label',''),str) for v in labels.values()): raise ValueError('Invalid source presentation')
+    logins=cfg.get('tailscale_logins',[])
+    if not isinstance(logins,list) or any(not isinstance(v,str) or not v for v in logins): raise ValueError('tailscale_logins must be a list of login names')
     host,port=cfg.get('bind','127.0.0.1:8540').rsplit(':',1)
-    server=ReaderServer((host,int(port)),Reader(Path(cfg['db_path']).expanduser(),labels,reader_archive_dir(cfg)),tokens,Path(cfg['static_root']).expanduser() if cfg.get('static_root') else None)
+    return ReaderServer((host,int(port)),Reader(Path(cfg['db_path']).expanduser(),labels,reader_archive_dir(cfg)),tokens,Path(cfg['static_root']).expanduser() if cfg.get('static_root') else None,logins)
+
+def main(argv=None):
+    p=argparse.ArgumentParser(prog='roomlog-reader'); p.add_argument('--config',required=True)
+    server=build_server(p.parse_args(argv).config)
     try: server.serve_forever()
     finally: server.server_close()

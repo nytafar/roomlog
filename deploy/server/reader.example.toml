@@ -5,6 +5,10 @@ db_path = "~/.local/share/roomlog/roomlog.db"
 # archive_dir = "~/.local/share/roomlog/archive"
 tokens_file = "~/.config/roomlog-reader/tokens.toml"
 static_root = "/home/lasse/services/apps/roomlog-reader/web"
+# Tailscale logins read as the owner without a token, taken from the Tailscale-User-Login
+# header that roomlog-tsnet-proxy.service sets (ADR 0009). Empty or absent: bearer only.
+# Refused at startup unless `bind` is loopback, since any peer could forge the header.
+# tailscale_logins = ["nytafar@github"]
 [sources.nyta]
 label = "Kitchen"
 display_as = "room"

@@ -43,6 +43,18 @@ test("auth stays in header; recipient content is encoded; additive fields are to
   assert.ok(request.url.includes("%3Cscript%3E%26"));
   assert.equal(request.options.cache, "no-store");
 });
+test("without a token no Authorization header is sent, for reads and audio", async () => {
+  const seen = [];
+  const client = new HttpRecall(undefined, {
+    fetcher: async (url, options) => {
+      seen.push(options.headers);
+      return { ok: true, json: async () => ({}), blob: async () => "blob" };
+    },
+  });
+  await client.read("info");
+  await client.audio("1");
+  assert.deepEqual(seen, [{}, {}]);
+});
 test("paging deduplicates IDs and keeps tied IDs, complete refresh replaces removals", async () => {
   const client = {
     read: async (_route, p) =>

@@ -804,6 +804,7 @@ input {
   margin: 8px 0;
 }
 #app[hidden],
+#logout[hidden],
 #login[hidden] {
   display: none;
 }
