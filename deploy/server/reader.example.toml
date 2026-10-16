@@ -11,9 +11,10 @@ static_root = "/home/lasse/services/apps/roomlog-reader/web"
 # honoured only from a peer socket owned by the reader's own uid.
 # tailscale_logins = ["nytafar@github"]
 # Host values the identity header is honoured with (DNS-rebinding guard). Default: only
-# "localhost:<bind port>", which is what tsnet-proxy sends. `tailscale serve` forwards the
-# client's Host, so honouring it there is an opt-in:
-# tailscale_hosts = ["localhost:8540", "oma.tailf63b9a.ts.net:8540"]
+# "localhost:<bind port>", which is what tsnet-proxy sends; leave it unset. `tailscale
+# serve` cannot use identity whatever this says: tailscaled runs as root, so its socket
+# fails the same-uid check, and that path stays bearer-only.
+# tailscale_hosts = ["localhost:8540"]
 [sources.nyta]
 label = "Kitchen"
 display_as = "room"
