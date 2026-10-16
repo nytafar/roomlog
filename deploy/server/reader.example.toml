@@ -1,5 +1,8 @@
 bind = "127.0.0.1:8540"
 db_path = "~/.local/share/roomlog/roomlog.db"
+# Chunk audio for GET /v1/recall/audio; `chunks.path` is relative to this. Optional:
+# defaults to `archive/` beside db_path, the server's own default (data_dir/archive).
+# archive_dir = "~/.local/share/roomlog/archive"
 tokens_file = "~/.config/roomlog-reader/tokens.toml"
 static_root = "/home/lasse/services/apps/roomlog-reader/web"
 [sources.nyta]

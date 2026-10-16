@@ -11,6 +11,7 @@
       "channel": "dictation",
       "session_id": null,
       "chunk_id": null,
+      "chunk_start_utc_ms": null,
       "span_id": "10",
       "producer": {
         "kind": "dictation",

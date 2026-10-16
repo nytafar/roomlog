@@ -44,6 +44,8 @@ def bad(message, field=None):
 
 
 def parse(route, pairs):
+    if route == 'audio':
+        return parse_audio(pairs)
     allowed = set() if route == 'info' else {'from_ms','to_ms','device_id'} | FILTERS
     if route in ('transcript','spans','sessions','search'): allowed |= {'limit','cursor'}
     if route == 'timeline': allowed |= {'tz','bucket'}
@@ -90,6 +92,17 @@ def parse(route, pairs):
     return p
 
 
+def parse_audio(pairs):
+    p = {}
+    for k,v in pairs:
+        if k != 'chunk_id' or k in p: bad('Unknown or repeated parameter', k)
+        p[k] = v
+    v = p.get('chunk_id', '')
+    if not (v.isascii() and v.isdigit() and len(v) <= 19 and 0 < int(v) <= 9223372036854775807):
+        bad('Required positive integer chunk ID', 'chunk_id')
+    return dict(chunk_id=int(v))
+
+
 def overlap(alias='s'):
     return f"({alias}.start_utc_ms < ? AND ({alias}.end_utc_ms > ? OR ({alias}.end_utc_ms={alias}.start_utc_ms AND {alias}.start_utc_ms>=?)))"
 
@@ -129,6 +142,8 @@ def item(conn,r):
     check_budget()
     d={k:r[k] for k in ('device_id','start_utc_ms','end_utc_ms','text','lang','channel','session_id')}
     for out,key in [('segment_id','id'),('chunk_id','chunk_id'),('span_id','span_id')]: d[out]=str(r[key]) if r[key] is not None else None
+    # Lets a client seek in the chunk's audio before it loads: offset = start_utc_ms - this.
+    d['chunk_start_utc_ms']=r['chunk_start'] if r['chunk_id'] is not None else None
     d.update(processing_state=r['processing_state'],producer=dict(kind='dictation' if r['span_id'] is not None else 'stt',model_id=r['model_id'],model_revision=r['model_revision']),speaker=None,timing='segment',words=None,tags=tags(conn,r['id']))
     if sum(len(str(r[k]).encode()) for k in ('text','words_json')) > LIMITS['page_bytes']:
         raise RecallError(422,'item_too_large','One item exceeds page budget')
@@ -150,8 +165,11 @@ def item(conn,r):
 
 
 class Reader:
-    def __init__(self,path, labels=None):
+    def __init__(self,path, labels=None, archive_dir=None):
         self.path=Path(path); self.labels=labels or {}
+        # Chunk paths are relative to the archive; the server's default is data_dir/archive
+        # beside data_dir/roomlog.db.
+        self.archive_dir=Path(archive_dir or self.path.parent/'archive').expanduser().resolve()
         with closing(self.connection()) as conn:
             if db.user_version(conn)!=db.SCHEMA_VERSION: raise RuntimeError('Reader requires current database schema; migrate with writer separately')
 
@@ -190,6 +208,21 @@ class Reader:
                 conn.close()
             _DEADLINE.reset(deadline)
 
+    def audio(self,chunk_id):
+        """The archive file of one chunk and its sha256; 404 unless it is a regular file inside the archive."""
+        with closing(self.connection()) as conn:
+            row=conn.execute('SELECT path,sha256 FROM chunks WHERE id=?',(chunk_id,)).fetchone()
+        if row is None: raise RecallError(404,'not_found','Unknown chunk')
+        unavailable=RecallError(404,'audio_unavailable','Chunk audio is not available')
+        # Derived chunks (ADR 0005) are slices of raw captures and have no file of their own.
+        if not row['path']: raise unavailable
+        target=(self.archive_dir/row['path']).resolve()
+        if not target.is_relative_to(self.archive_dir):
+            logging.getLogger(__name__).warning('Chunk %s path escapes the archive',chunk_id)
+            raise unavailable
+        if not target.is_file(): raise unavailable
+        return target,row['sha256']
+
     def check_response(self,result):
         check_budget()
         if len(json.dumps(result,ensure_ascii=False,allow_nan=False).encode()) > LIMITS['page_bytes']:
@@ -204,7 +237,7 @@ class Reader:
         return [dict(device_id=r['device_id'],label=self.labels.get(r['device_id'],{}).get('label',r['device_id']),display_as=self.labels.get(r['device_id'],{}).get('display_as','device'),first_known_ms=r['first'],last_known_ms=r['last']) for r in rows]
 
     def info(self,conn,stamp):
-        return dict(server_time_ms=stamp,limits=LIMITS,capabilities=dict(word_timing='optional',speaker_identity=False,audio=False,change_feed=False,saved_clips=False),sources=self.sources(conn))
+        return dict(server_time_ms=stamp,limits=LIMITS,capabilities=dict(word_timing='optional',speaker_identity=False,audio=True,change_feed=False,saved_clips=False),sources=self.sources(conn))
 
     def transcript(self,conn,p,stamp):
         where,args=policy(p); where+=[overlap()]; args += [p['to_ms'],p['from_ms'],p['from_ms']]

@@ -8,6 +8,7 @@ import sqlite3
 import hmac
 import json
 import mimetypes
+import os
 import threading
 import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,6 +37,33 @@ def accepts_gzip(header):
     return 0 < encodings.get('gzip', encodings.get('*', 0)) <= 1
 
 
+AUDIO_CACHE='private, max-age=31536000, immutable'
+
+
+def byte_range(header,size):
+    """(first,last) for one satisfiable `bytes=` range; None to ignore the header (RFC 9110 14.2
+    lets a server ignore multiple or malformed ranges and send the whole file)."""
+    unit,_,spec=header.partition('=')
+    first,dash,last=spec.strip().partition('-')
+    if unit.strip().lower()!='bytes' or ',' in spec or not dash: return None
+    if any(v and not (v.isascii() and v.isdigit() and len(v)<=19) for v in (first,last)): return None
+    if not first:
+        if not last: return None
+        n=int(last)
+        if n==0 or size==0: raise RecallError(416,'range_not_satisfiable','Requested range not satisfiable')
+        return max(0,size-n),size-1
+    a=int(first); b=int(last) if last else max(a,size-1)
+    if b<a: return None
+    if a>=size: raise RecallError(416,'range_not_satisfiable','Requested range not satisfiable')
+    return a,min(b,size-1)
+
+
+def reader_archive_dir(cfg):
+    """`archive_dir` from reader.toml, else the server's default beside the database."""
+    if cfg.get('archive_dir'): return Path(cfg['archive_dir']).expanduser().resolve()
+    return (Path(cfg['db_path']).expanduser().parent/'archive').resolve()
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     def setup(self):
@@ -50,9 +78,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(data)))
         return data
     def log_message(self,*args): pass
-    def send(self,status,value):
+    def send(self,status,value,headers=()):
         data=json.dumps(value,ensure_ascii=False,allow_nan=False).encode()
         self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8')
+        for name,header in headers: self.send_header(name,header)
         self.send_header('Cache-Control','private, no-store'); data=self.body_headers(data)
         if status==503: self.send_header('Retry-After','1')
         if status==401: self.send_header('WWW-Authenticate','Bearer')
@@ -71,20 +100,51 @@ class Handler(BaseHTTPRequestHandler):
             if role is None: raise RecallError(401,'unauthorized','Read credential required')
             if role!='owner': raise RecallError(403,'forbidden','Credential has no read role')
             route=u.path.removeprefix('/v1/recall/')
-            if route not in ('info','transcript','timeline','sessions','spans','search'): raise RecallError(404,'not_found','Unknown route')
+            if route not in ('info','transcript','timeline','sessions','spans','search','audio'): raise RecallError(404,'not_found','Unknown route')
             p=parse(route,parse_qsl(u.query,keep_blank_values=True))
             if not self.server.slots.acquire(blocking=False): raise RecallError(503,'read_budget_exhausted','Reader is busy; retry')
-            try: result=self.server.reader.read(route,p)
+            try: result=self.server.reader.audio(p['chunk_id']) if route=='audio' else self.server.reader.read(route,p)
             finally: self.server.slots.release()
+            if route=='audio': self.audio(*result); return
             self.send(200,result)
         except RecallError as e:
             error=dict(code=e.code,message=e.message)
             if e.field: error['field']=e.field
-            self.send(e.status,dict(error=error))
+            self.send(e.status,dict(error=error),getattr(e,'headers',()))
         except (BrokenPipeError,ConnectionResetError): pass
         except sqlite3.Error:
             logging.getLogger(__name__).exception('Reader database failure')
             self.send(503,dict(error=dict(code='read_unavailable',message='Reader database unavailable')))
+    def audio(self,target,sha256):
+        """One chunk's Ogg Opus file. Content is fixed per chunk ID (its path holds its sha256 and
+        speech chunks are never rewritten), so the browser may keep it privately for good."""
+        etag=f'"{sha256}"'
+        try: f=target.open('rb')
+        except OSError: raise RecallError(404,'audio_unavailable','Chunk audio is not available')
+        with f:
+            size=os.fstat(f.fileno()).st_size
+            common=[('ETag',etag),('Cache-Control',AUDIO_CACHE),('Accept-Ranges','bytes')]
+            if etag in (t.strip() for t in self.headers.get('If-None-Match','').split(',')):
+                self.send_response(304)
+                for name,value in common: self.send_header(name,value)
+                self.end_headers(); return
+            span=None
+            if self.headers.get('Range') and self.headers.get('If-Range',etag).strip()==etag:
+                try: span=byte_range(self.headers['Range'],size)
+                except RecallError as e:
+                    e.headers=[('Content-Range',f'bytes */{size}'),('Accept-Ranges','bytes')]; raise
+            first,last=span or (0,size-1)
+            self.send_response(206 if span else 200)
+            self.send_header('Content-Type','audio/ogg')
+            for name,value in common: self.send_header(name,value)
+            if span: self.send_header('Content-Range',f'bytes {first}-{last}/{size}')
+            self.send_header('Content-Length',str(last-first+1))
+            self.send_header('X-Content-Type-Options','nosniff'); self.end_headers()
+            f.seek(first); remaining=last-first+1
+            while remaining>0:
+                block=f.read(min(65536,remaining))
+                if not block: break
+                self.wfile.write(block); remaining-=len(block)
     def static(self,path):
         root=self.server.static_root
         if root is None: raise RecallError(404,'not_found','No static app configured')
@@ -107,6 +167,6 @@ def main(argv=None):
     labels=cfg.get('sources',{})
     if any(not isinstance(v,dict) or v.get('display_as','device') not in ('device','room') or not isinstance(v.get('label',''),str) for v in labels.values()): raise ValueError('Invalid source presentation')
     host,port=cfg.get('bind','127.0.0.1:8540').rsplit(':',1)
-    server=ReaderServer((host,int(port)),Reader(Path(cfg['db_path']).expanduser(),labels),tokens,Path(cfg['static_root']).expanduser() if cfg.get('static_root') else None)
+    server=ReaderServer((host,int(port)),Reader(Path(cfg['db_path']).expanduser(),labels,reader_archive_dir(cfg)),tokens,Path(cfg['static_root']).expanduser() if cfg.get('static_root') else None)
     try: server.serve_forever()
     finally: server.server_close()
