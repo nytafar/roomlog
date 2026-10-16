@@ -64,7 +64,8 @@ Sessions are islands of chunks per device with no gap longer than five minutes, 
 |---|---|
 | [`contract/`](contract/) | Sidecar schema, examples, wire protocol. Pinned; both sides build against it. |
 | [`edge/`](edge/) | `roomlog-edge`: capture, timeline, Silero VAD, chunker, Opus encode, spool, uploader, health. Python. |
-| [`server/`](server/) | `roomlog-server`: ingest, archive, SQLite, worker, backends, sessions, CLI, MCP. Python. |
+| [`server/`](server/) | `roomlog-server`: ingest, archive, SQLite, worker, backends, sessions, CLI, MCP, and `roomlog-reader`, the read-only recall HTTP API. Python. |
+| [`web/`](web/) | Recall PWA (vanilla ES modules, no build), served by `roomlog-reader`. |
 | [`android/`](android/) | Kotlin thin client: `:core` (timeline, Ogg Opus writer, sidecar, spool, uploader, clock offset) and the app. |
 | [`deploy/`](deploy/) | Install scripts, systemd units and example configs for edge and server. |
 | [`tests/e2e/`](tests/e2e/) | Capture → ingest → worker → search, in-process, with a fake transcriber. |
@@ -102,7 +103,7 @@ roomlog session <id>
 roomlog export --vault ~/notes/roomlog
 ```
 
-Each package is a standalone `uv` project; `uv run pytest -q` inside `edge/` or `server/` is the gate and needs no hardware.
+Each package is a standalone `uv` project; `uv run pytest -q` inside `edge/` or `server/` is the gate and needs no hardware. The end-to-end tests run from the server environment (`cd server && uv run pytest -q ../tests/e2e`), and the web app's from `web/` (`node --test tests/*.test.mjs && node tests/browser.mjs`).
 
 ## Status
 
