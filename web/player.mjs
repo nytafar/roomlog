@@ -58,6 +58,11 @@ export class ChunkCache {
     }
     return url;
   }
+  delete(id) {
+    const url = this.#entries.get(id);
+    if (url) this.revoke(url);
+    this.#entries.delete(id);
+  }
   clear() {
     for (const url of this.#entries.values()) this.revoke(url);
     this.#entries.clear();
@@ -77,6 +82,8 @@ export class Player {
     audio.preload = "auto";
     for (const type of ["play", "pause", "ended", "loadedmetadata", "seeked"])
       audio.addEventListener(type, () => this.#position());
+    // rAF stops in hidden tabs and on a locked screen; this keeps clip ends there.
+    audio.addEventListener("timeupdate", () => this.tick());
     const session = globalThis.navigator?.mediaSession;
     if (session)
       for (const [action, handler] of [
@@ -95,7 +102,8 @@ export class Player {
     return playable(row, this.unavailable);
   }
   // Plays the row's chunk from fromMs; toMs (optional) pauses there. The newest call
-  // wins. Resolves to "playing", "blocked" (autoplay refused; the bar can resume),
+  // wins. Resolves to "playing", "paused" (paused before playback began), "blocked"
+  // (autoplay refused; the bar can resume),
   // "unavailable" (no file for this chunk), "missing" (unknown chunk) or "aborted".
   async play(row, fromMs = row.start_utc_ms, toMs = null, label = "") {
     this.#request?.abort();
@@ -147,8 +155,24 @@ export class Player {
       await this.audio.play();
     } catch (error) {
       if (request.signal.aborted) return "aborted";
+      if (error?.name === "NotAllowedError") {
+        this.onchange();
+        return "blocked";
+      }
+      // A pause before play() settled rejects it; the player simply stays paused.
+      if (error?.name === "AbortError" && !this.audio.error) {
+        this.onchange();
+        return "paused";
+      }
+      if (!this.audio.error) throw error;
+      // An undecodable chunk must not stay cached as the loaded source, or the
+      // next play of it would wait for metadata forever.
+      this.cache.delete(id);
+      this.#loaded = null;
+      this.audio.removeAttribute("src");
+      this.audio.load?.();
+      this.current = null;
       this.onchange();
-      if (error?.name === "NotAllowedError") return "blocked";
       throw error;
     }
     return request.signal.aborted ? "aborted" : "playing";

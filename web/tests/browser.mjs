@@ -347,6 +347,11 @@ try {
   assert.deepEqual(audioRequests, ["1"], "replaying a chunk reuses its blob");
   await evaluate(`document.querySelector('#play-stop').click()`);
   await waitFor(`document.querySelector('#player').hidden&&document.querySelector('.playing')===null`);
+  // Taps outside a transcript row never start audio.
+  await press(await evaluate(`(()=>{const r=document.querySelector('.convh').getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2];})()`));
+  await sleep(300);
+  assert.equal(await evaluate(`document.querySelector('#player').hidden`), true, "header taps do not play");
+  await evaluate(`document.querySelector('#clear-selection').click()`);
   // A hold still selects, from the gutter beside the text.
   await press(xy, 550);
   await waitFor(`!document.querySelector('#clipbar').hidden`);

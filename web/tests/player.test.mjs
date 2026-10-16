@@ -14,11 +14,15 @@ class FakeAudio extends EventTarget {
   get src() {
     return this.#src;
   }
+  broken = false;
   set src(url) {
     this.#src = url;
     this.readyState = 0;
     this.duration = NaN;
+    const broken = this.broken;
     setTimeout(() => {
+      this.error = broken ? { code: 3 } : null;
+      if (broken) return this.dispatchEvent(new Event("error"));
       this.readyState = 1;
       this.duration = 6;
       this.dispatchEvent(new Event("loadedmetadata"));
@@ -106,6 +110,40 @@ test("a clip pauses at its end and replays from its start", async () => {
   assert.equal(audio.paused, false);
 });
 
+test("pausing before play() settles keeps the chunk loaded", async () => {
+  const audio = new FakeAudio();
+  audio.play = async () => {
+    throw new DOMException("interrupted by pause", "AbortError");
+  };
+  const player = new Player(audio, async () => ({}), cache());
+  assert.equal(await player.play(row("1", "7", 1000)), "paused");
+  assert.equal(player.current.chunkId, "7");
+});
+
+test("a clip also ends from timeupdate, which runs while the screen is locked", async () => {
+  const audio = new FakeAudio();
+  const player = new Player(audio, async () => ({}), cache());
+  await player.play(row("1", "7", 2000), 2000, 2600);
+  audio.currentTime = 1.8;
+  audio.dispatchEvent(new Event("timeupdate"));
+  assert.equal(audio.paused, true);
+  assert.equal(audio.currentTime, 1.6);
+});
+
+test("an undecodable chunk is dropped so playing it again refetches", async () => {
+  const audio = new FakeAudio(),
+    { cache: c, revoked } = cache();
+  let fetches = 0;
+  const player = new Player(audio, async () => (fetches++, {}), { cache: c });
+  audio.broken = true;
+  await assert.rejects(player.play(row("1", "7", 1000)), /decoded/);
+  assert.equal(player.current, null);
+  assert.deepEqual(revoked, ["blob:1"]);
+  audio.broken = false;
+  assert.equal(await player.play(row("1", "7", 1000)), "playing");
+  assert.equal(fetches, 2);
+});
+
 test("the newest play wins over a slower fetch", async () => {
   const audio = new FakeAudio();
   let release;
@@ -157,7 +195,7 @@ test("adapter fetches chunk audio with the bearer header, outside the URL", asyn
   const seen = [];
   const recall = new HttpRecall("secret", {
     fetcher: async (url, init) => {
-      seen.push([url, init.headers.Authorization]);
+      seen.push([url, init.headers.Authorization, init.cache]);
       return url.includes("chunk_id=9")
         ? new Response(new Blob(["ogg"]), { status: 200 })
         : new Response(
@@ -168,5 +206,9 @@ test("adapter fetches chunk audio with the bearer header, outside the URL", asyn
   });
   assert.equal(await (await recall.audio("9")).text(), "ogg");
   await assert.rejects(recall.audio("10"), (e) => e.code === "audio_unavailable" && e.status === 404);
-  assert.deepEqual(seen[0], ["/v1/recall/audio?chunk_id=9", "Bearer secret"]);
+  assert.deepEqual(
+    seen[0],
+    ["/v1/recall/audio?chunk_id=9", "Bearer secret", "no-store"],
+    "token stays out of the URL and audio stays out of the disk cache",
+  );
 });

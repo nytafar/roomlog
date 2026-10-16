@@ -404,6 +404,7 @@ function render() {
   else renderText(view, state.level === "session");
   $("#view").replaceChildren(view);
   paintSelection();
+  renderPlayer();
 }
 function renderWeek(view) {
   const buckets = data.timeline.rows || [];
@@ -782,7 +783,7 @@ $("#help-button").onclick = () =>
     ],
     [
       "Evidence",
-      "Density is transcript-covered time. Missing capture evidence means unknown; VAD no speech is not proof of silence. Audio playback and speaker identity are not available.",
+      "Density is transcript-covered time. Missing capture evidence means unknown; VAD no speech is not proof of silence. Speaker identity is not available.",
     ],
     [
       "Mobile",
@@ -923,7 +924,7 @@ function noAudio(button) {
 function tapToPlay(g) {
   const unit = allUnits[g.index],
     row = unit && rowOf(unit);
-  if (!audioOn() || !row || !player.canPlay(row)) return false;
+  if (!audioOn() || !g.onTurn || !row || !player.canPlay(row)) return false;
   const from = g.onWord ? unit.start_utc_ms : row.start_utc_ms;
   playRow(row, from);
   return true;
@@ -1030,7 +1031,12 @@ function paintPlayback(t) {
     index = list[0]?.kind === "word" ? unitAt(list, t) : -1;
     key = `${row.device_id}:${row.segment_id}:${index}`;
   }
-  if (key !== playKey || playNodes.some((node) => !node.isConnected)) {
+  // Re-find nodes when the text tree was rebuilt or was detached at another zoom.
+  if (
+    key !== playKey ||
+    (key && !playNodes.length) ||
+    playNodes.some((node) => !node.isConnected)
+  ) {
     playNodes.forEach((node) => node.classList.remove("playing"));
     playNodes = [];
     playKey = key;
@@ -1157,6 +1163,7 @@ document.addEventListener("pointerdown", (event) => {
     lastY: event.clientY,
     index,
     onWord: !!event.target.closest("[data-unit]"),
+    onTurn: !!event.target.closest(".turn"),
     zone: browseZone(event.clientX),
     moved: false,
     selecting: false,

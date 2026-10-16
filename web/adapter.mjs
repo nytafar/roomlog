@@ -43,12 +43,16 @@ export class HttpRecall {
       );
     return body;
   }
-  // Chunk audio as a Blob. Unlike reads it may use the HTTP cache: a chunk ID always
-  // names the same bytes and the reader marks them private and immutable.
+  // Chunk audio as a Blob. Kept out of the HTTP cache like reads, so room audio never
+  // outlives logout on disk; the player's in-memory blobs cover replay.
   async audio(chunkId, signal) {
     const response = await this.fetcher(
       `${this.base}/audio?${new URLSearchParams({ chunk_id: chunkId })}`,
-      { signal, headers: { Authorization: `Bearer ${this.#token}` } },
+      {
+        signal,
+        cache: "no-store",
+        headers: { Authorization: `Bearer ${this.#token}` },
+      },
     );
     if (response.ok) return response.blob();
     let error;
