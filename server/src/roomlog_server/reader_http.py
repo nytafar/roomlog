@@ -8,9 +8,9 @@ import sqlite3
 import hmac
 import ipaddress
 import json
-from email.header import decode_header, make_header
 import mimetypes
 import os
+import sys
 import threading
 import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,26 +28,71 @@ def is_loopback(host):
     except ValueError: return False
 
 
-def decode_login(value):
-    """A login as tsnet-proxy sends it: `mime.QEncoding.Encode("utf-8", login)`, so plain
-    ASCII arrives as is and anything else as RFC 2047 encoded words. None if undecodable."""
-    try: return str(make_header(decode_header(value)))
-    except (ValueError, LookupError, UnicodeError): return None
+def valid_login(value):
+    """A login tsnet-proxy sends unencoded: Go's mime.QEncoding passes printable ASCII through
+    as is, so only those logins can be compared raw (no decoding of client-shaped input)."""
+    return isinstance(value,str) and bool(value) and value==value.strip() and all(' '<=c<='~' for c in value)
+
+
+PROC_NET_TCP=('/proc/net/tcp','/proc/net/tcp6')
+
+
+def proc_address(field,byteorder=sys.byteorder):
+    """`0100007F:2160` from /proc/net/tcp{,6} as (ip_address, port). The address is 32-bit words
+    in host byte order; IPv4-mapped IPv6 comes back as IPv4."""
+    hexip,hexport=field.split(':')
+    raw=bytes.fromhex(hexip)
+    if len(raw) not in (4,16): raise ValueError(field)
+    if byteorder=='little': raw=b''.join(raw[i:i+4][::-1] for i in range(0,len(raw),4))
+    ip=ipaddress.ip_address(raw)
+    if ip.version==6 and ip.ipv4_mapped: ip=ip.ipv4_mapped
+    return ip,int(hexport,16)
+
+
+def socket_uid(lines,local,remote,byteorder=sys.byteorder):
+    """uid of the established socket whose own end is `local` and far end is `remote`, both
+    (ip_address, port), from /proc/net/tcp-format lines; None if absent or unparsable."""
+    for line in lines:
+        fields=line.split()
+        if len(fields)<8 or fields[3]!='01': continue  # 01 = TCP_ESTABLISHED; skips the header
+        try:
+            if proc_address(fields[1],byteorder)==local and proc_address(fields[2],byteorder)==remote: return int(fields[7])
+        except ValueError: continue
+    return None
+
+
+def peer_uid(peer,ours,tables=PROC_NET_TCP):
+    """uid owning the client end of a loopback connection: its row has the client's address
+    as local and ours as remote. None when it can't be found (not Linux, unreadable /proc)."""
+    try: local=(ipaddress.ip_address(peer[0]),peer[1]); remote=(ipaddress.ip_address(ours[0]),ours[1])
+    except ValueError: return None
+    for table in tables:
+        try:
+            with open(table) as f: uid=socket_uid(f,local,remote)
+        except OSError: continue
+        if uid is not None: return uid
+    return None
 
 
 class ReaderServer(ThreadingHTTPServer):
     daemon_threads=True
-    def __init__(self,address,reader,tokens,static_root=None,identity_logins=()):
-        # The identity header is only as trustworthy as the path to this socket: on loopback
-        # the only senders are oma's own processes (the tailnet proxy among them). Anywhere
-        # else a peer could set it, so refuse to start rather than honour or silently drop it.
+    def __init__(self,address,reader,tokens,static_root=None,identity_logins=(),identity_hosts=None):
+        # The identity header is only as trustworthy as the path to this socket. Loopback keeps
+        # other machines out; the peer-uid check (Handler.identity_role) keeps other local
+        # accounts out; the Host pin keeps DNS-rebinding browser pages out. Anywhere but
+        # loopback a peer could set it, so refuse to start rather than honour or drop it.
         if identity_logins and not is_loopback(address[0]):
             raise ValueError(f'tailscale_logins needs a loopback bind, not {address[0]!r}')
+        if any(not valid_login(v) for v in identity_logins):
+            raise ValueError('tailscale_logins entries must be printable ASCII without surrounding spaces')
         self.identity_logins=frozenset(identity_logins)
         self.reader,self.tokens=reader,tokens
         self.static_root=Path(static_root).resolve() if static_root else None
         self.slots=threading.BoundedSemaphore(LIMITS['concurrent_reads'])
         super().__init__(address,Handler)
+        # tsnet-proxy rewrites Host to its target, `localhost:<local port>` (httputil SetURL with
+        # http://localhost:<port>); a browser page can only send its own origin's host.
+        self.identity_hosts=frozenset(h.lower() for h in (identity_hosts if identity_hosts is not None else [f'localhost:{self.server_port}']))
 
 def accepts_gzip(header):
     encodings = {}
@@ -156,13 +201,16 @@ class Handler(BaseHTTPRequestHandler):
             logging.getLogger(__name__).exception('Reader database failure')
             self.send(503,dict(error=dict(code='read_unavailable',message='Reader database unavailable')))
     def identity_role(self):
-        """'owner' for exactly one allowed Tailscale-User-Login from a loopback peer, else None
-        (and the bearer check decides, as without identity sign-in)."""
+        """'owner' for exactly one allowed Tailscale-User-Login, compared raw, with exactly one
+        pinned Host, from a loopback peer whose socket is ours (same uid); else None, and the
+        bearer check decides as without identity sign-in."""
         logins=self.server.identity_logins
         if not logins or not is_loopback(self.client_address[0]): return None
-        values=self.headers.get_all(IDENTITY_HEADER,[])
-        if len(values)!=1: return None
-        return 'owner' if decode_login(values[0]) in logins else None
+        values=self.headers.get_all(IDENTITY_HEADER,[]); hosts=self.headers.get_all('Host',[])
+        if len(values)!=1 or values[0] not in logins: return None
+        if len(hosts)!=1 or hosts[0].lower() not in self.server.identity_hosts: return None
+        if peer_uid(self.client_address,self.connection.getsockname())!=os.getuid(): return None
+        return 'owner'
     def audio(self,target,sha256):
         """One chunk's Ogg Opus file. Content is fixed per chunk ID (its path holds its sha256 and
         speech chunks are never rewritten), so the browser may keep it privately for good."""
@@ -217,9 +265,11 @@ def build_server(config_path):
     labels=cfg.get('sources',{})
     if any(not isinstance(v,dict) or v.get('display_as','device') not in ('device','room') or not isinstance(v.get('label',''),str) for v in labels.values()): raise ValueError('Invalid source presentation')
     logins=cfg.get('tailscale_logins',[])
-    if not isinstance(logins,list) or any(not isinstance(v,str) or not v for v in logins): raise ValueError('tailscale_logins must be a list of login names')
+    if not isinstance(logins,list) or any(not valid_login(v) for v in logins): raise ValueError('tailscale_logins must be a list of printable-ASCII login names')
+    hosts=cfg.get('tailscale_hosts')
+    if hosts is not None and (not isinstance(hosts,list) or any(not isinstance(v,str) or not v or v!=v.strip() for v in hosts)): raise ValueError('tailscale_hosts must be a list of Host values')
     host,port=cfg.get('bind','127.0.0.1:8540').rsplit(':',1)
-    return ReaderServer((host,int(port)),Reader(Path(cfg['db_path']).expanduser(),labels,reader_archive_dir(cfg)),tokens,Path(cfg['static_root']).expanduser() if cfg.get('static_root') else None,logins)
+    return ReaderServer((host,int(port)),Reader(Path(cfg['db_path']).expanduser(),labels,reader_archive_dir(cfg)),tokens,Path(cfg['static_root']).expanduser() if cfg.get('static_root') else None,logins,hosts)
 
 def main(argv=None):
     p=argparse.ArgumentParser(prog='roomlog-reader'); p.add_argument('--config',required=True)

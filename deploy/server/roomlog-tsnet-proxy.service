@@ -1,8 +1,9 @@
 # Publishes roomlog-reader (127.0.0.1:8540) on the tailnet as its own node, `roomlog`, at
 # https://roomlog.tailf63b9a.ts.net, and passes the visitor's Tailscale login to the reader in
 # Tailscale-User-Login so the owner gets in without a token (ADR 0009). The proxy deletes any
-# client-supplied identity headers and sets none for tagged nodes; the reader honours the
-# header only for `tailscale_logins` in reader.toml, and only on a loopback bind.
+# client-supplied identity headers and sets none for tagged nodes, and rewrites Host to
+# `localhost:8540`. The reader honours the header only for `tailscale_logins` in reader.toml,
+# with that Host, from a loopback peer running as the reader's own uid, on a loopback bind.
 #
 # Install (systemd --user on oma; nothing in install.sh does this):
 #   1. Build the pinned proxy (tailscale.com needs go >= 1.27.1; GOTOOLCHAIN=auto fetches it):
@@ -11,8 +12,8 @@
 #      and store it outside the repo, readable only by you:
 #        install -d -m 700 ~/.config/roomlog-tsnet
 #        (umask 077; printf 'TS_AUTHKEY=%s\n' 'tskey-auth-...' > ~/.config/roomlog-tsnet/authkey.env)
-#      The key is only needed for the first join; node state then lives in the --dir below,
-#      and the file may be deleted (the `-` makes it optional).
+#      The key is only needed for the first join; node state then lives in the StateDirectory
+#      (~/.local/state/roomlog-tsnet), and the file may be deleted (the `-` makes it optional).
 #   3. cp deploy/server/roomlog-tsnet-proxy.service ~/.config/systemd/user/
 #      systemctl --user daemon-reload && systemctl --user enable --now roomlog-tsnet-proxy
 #   4. Add the owner's login to reader.toml (`tailscale_logins = ["nytafar@github"]`) and
@@ -24,14 +25,35 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-%h/.config/roomlog-tsnet/authkey.env
-ExecStartPre=/usr/bin/mkdir -p -m 700 %h/.local/share/roomlog-tsnet
-ExecStart=%h/.local/bin/tsnet-proxy --https --dir %h/.local/share/roomlog-tsnet roomlog 8540 443
+# %S is ~/.local/state in the user manager; systemd creates it 0700 and keeps it writable.
+StateDirectory=roomlog-tsnet
+StateDirectoryMode=0700
+ExecStart=%h/.local/bin/tsnet-proxy --https --dir %S/roomlog-tsnet roomlog 8540 443
 Restart=on-failure
 RestartSec=5
 MemoryMax=256M
 CPUQuota=50%
 TasksMax=64
-NoNewPrivileges=true
 UMask=0077
+# Sandbox. Each directive was checked to take effect under this user manager (systemd 261)
+# with a transient `systemd-run --user`; CapabilityBoundingSet is left out because a user
+# manager cannot set it (the unit fails with 218/CAPABILITIES).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# netlink: tsnet watches interfaces and routes; unix: local resolver sockets
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 [Install]
 WantedBy=default.target

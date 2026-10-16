@@ -7,8 +7,13 @@ tokens_file = "~/.config/roomlog-reader/tokens.toml"
 static_root = "/home/lasse/services/apps/roomlog-reader/web"
 # Tailscale logins read as the owner without a token, taken from the Tailscale-User-Login
 # header that roomlog-tsnet-proxy.service sets (ADR 0009). Empty or absent: bearer only.
-# Refused at startup unless `bind` is loopback, since any peer could forge the header.
+# Printable ASCII only, compared exactly. Refused at startup unless `bind` is loopback, and
+# honoured only from a peer socket owned by the reader's own uid.
 # tailscale_logins = ["nytafar@github"]
+# Host values the identity header is honoured with (DNS-rebinding guard). Default: only
+# "localhost:<bind port>", which is what tsnet-proxy sends. `tailscale serve` forwards the
+# client's Host, so honouring it there is an opt-in:
+# tailscale_hosts = ["localhost:8540", "oma.tailf63b9a.ts.net:8540"]
 [sources.nyta]
 label = "Kitchen"
 display_as = "room"

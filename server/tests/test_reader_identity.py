@@ -1,22 +1,27 @@
 """Tailscale identity sign-in on the reader (ADR 0009): a trusted proxy on oma sets
-`Tailscale-User-Login`; the reader honours it only for configured logins on a loopback bind."""
+`Tailscale-User-Login`; the reader honours it only for configured logins, with the proxy's
+Host, from a same-uid loopback peer, on a loopback bind."""
 import http.client
+import ipaddress
 import json
+import os
+import socket
 import threading
 from contextlib import contextmanager
 
 import pytest
 
-from roomlog_server.reader_http import ReaderServer, build_server, decode_login
+from roomlog_server import reader_http
+from roomlog_server.reader_http import ReaderServer, build_server, peer_uid, proc_address, socket_uid
 from roomlog_server.recall import Reader
 
 OWNER = 'nytafar@github'
 
 
 @contextmanager
-def serving(cfg, logins=()):
+def serving(cfg, logins=(), hosts=None):
     server = ReaderServer(('127.0.0.1', 0), Reader(cfg.db_path),
-                          {'owner-secret': 'owner', 'device-secret': 'device'}, None, logins)
+                          {'owner-secret': 'owner', 'device-secret': 'device'}, None, logins, hosts)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -27,10 +32,16 @@ def serving(cfg, logins=()):
         thread.join()
 
 
-def get(port, headers=(), path='/v1/recall/info'):
+def get(port, headers=(), path='/v1/recall/info', host=None):
+    """GET with Host as tsnet-proxy sends it (`localhost:<port>`) unless `host` says otherwise;
+    host='' sends none, a list sends each."""
     client = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+    host = f'localhost:{port}' if host is None else host
     try:
-        client.putrequest('GET', path)
+        client.putrequest('GET', path, skip_host=True)
+        for value in ([host] if isinstance(host, str) else host):
+            if value:
+                client.putheader('Host', value)
         for name, value in headers:
             client.putheader(name, value)
         client.endheaders()
@@ -88,19 +99,85 @@ def test_unknown_routes_stay_not_found_under_identity(cfg, conn):
         assert get(port, [], '/v1/recall/nope')[0] == 401
 
 
-def test_login_is_decoded_as_tsnet_proxy_encodes_it():
-    # tsnet-proxy sends mime.QEncoding.Encode("utf-8", login): plain ASCII passes through,
-    # anything else becomes RFC 2047 encoded words.
-    assert decode_login(OWNER) == OWNER
-    assert decode_login('=?utf-8?q?bl=C3=A5b=C3=A6r@github?=') == 'blåbær@github'
-    assert decode_login('=?utf-8?q?a?= =?utf-8?q?b@github?=') == 'ab@github'
-    assert decode_login('=?utf-8?q?=FF@github?=') is None
-    assert decode_login('') == ''
+def test_login_is_compared_raw_never_decoded(cfg, conn):
+    # tsnet-proxy Q-encodes only non-ASCII logins, which the config refuses; an encoded word
+    # (Q or B, any charset) for the allowed login is just a different string.
+    with serving(cfg, [OWNER]) as port:
+        for value in ('=?utf-8?q?nytafar@github?=', '=?utf-8?b?bnl0YWZhckBnaXRodWI=?=',
+                      '=?iso-8859-1?q?nytafar=40github?='):
+            assert get(port, login(value))[0] == 401
 
 
-def test_encoded_login_matches_its_decoded_entry(cfg, conn):
-    with serving(cfg, ['blåbær@github']) as port:
-        assert get(port, login('=?utf-8?q?bl=C3=A5b=C3=A6r@github?='))[0] == 200
+@pytest.mark.parametrize('host', ['evil.example:{port}', '127.0.0.1:{port}', 'localhost', 'localhost:1',
+                                  '', ['localhost:{port}', 'localhost:{port}']])
+def test_identity_needs_the_proxy_host(cfg, conn, host):
+    # DNS rebinding: a page at http://evil.example:8540 resolved to 127.0.0.1 is same-origin with
+    # the reader and may send the identity header, but its Host stays its own.
+    with serving(cfg, [OWNER]) as port:
+        sent = [h.format(port=port) for h in host] if isinstance(host, list) else host.format(port=port)
+        status, body, _ = get(port, login(OWNER), host=sent)
+        assert status == 401 and body['error']['code'] == 'unauthorized'
+        assert get(port, login(OWNER) + bearer('owner-secret'), host=sent)[0] == 200
+        assert get(port, login(OWNER), host='LocalHost:{}'.format(port))[0] == 200
+
+
+def test_configured_hosts_replace_the_default(cfg, conn):
+    with serving(cfg, [OWNER], ['oma.tailf63b9a.ts.net:8540']) as port:
+        assert get(port, login(OWNER), host='oma.tailf63b9a.ts.net:8540')[0] == 200
+        assert get(port, login(OWNER))[0] == 401
+
+
+def test_identity_needs_a_peer_with_our_uid(cfg, conn, monkeypatch):
+    with serving(cfg, [OWNER]) as port:
+        assert get(port, login(OWNER))[0] == 200  # the real /proc lookup finds us
+        for uid in (os.getuid() + 1, 0, None):  # another account, root, or lookup failure
+            monkeypatch.setattr(reader_http, 'peer_uid', lambda peer, ours, uid=uid: uid)
+            assert get(port, login(OWNER))[0] == 401
+            assert get(port, login(OWNER) + bearer('owner-secret'))[0] == 200
+
+
+# Rows as Linux writes them on a little-endian host: a client 127.0.0.1:54434 owned by uid 1000
+# connected to a reader on 127.0.0.1:8540 (uid 1000 also owns the reader's accepted end).
+TCP = """\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:215C 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 101 1 0 100 0 0 10 0
+   1: 0100007F:D4A2 0100007F:215C 06 00000000:00000000 03:00000000 00000000     0        0 0 3 0
+   2: 0100007F:215C 0100007F:D4A2 01 00000000:00000000 00:00000000 00000000  1000        0 102 1 0 20 4 30 10 -1
+   3: 0100007F:D4A2 0100007F:215C 01 00000000:00000000 00:00000000 00000000  1001        0 103 1 0 20 4 30 10 -1
+   4: garbage
+""".splitlines()
+TCP6 = """\
+  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000001000000:D4A3 00000000000000000000000001000000:215C 01 00000000:00000000 00:00000000 00000000  1002        0 104 1 0
+   1: 0000000000000000FFFF00000100007F:D4A4 0000000000000000FFFF00000100007F:215C 01 00000000:00000000 00:00000000 00000000  1003        0 105 1 0
+""".splitlines()
+
+
+def addr(ip, port):
+    return ipaddress.ip_address(ip), port
+
+
+def test_proc_net_tcp_rows_are_parsed():
+    assert proc_address('0100007F:215C', 'little') == addr('127.0.0.1', 8540)
+    assert proc_address('7F000001:215C', 'big') == addr('127.0.0.1', 8540)
+    assert proc_address('00000000000000000000000001000000:215C', 'little') == addr('::1', 8540)
+    assert proc_address('0000000000000000FFFF00000100007F:0050', 'little') == addr('127.0.0.1', 80)
+    reader = addr('127.0.0.1', 8540)
+    # the client's row, not the reader's accepted end nor the TIME_WAIT row of an older connection
+    assert socket_uid(TCP, addr('127.0.0.1', 54434), reader, 'little') == 1001
+    assert socket_uid(TCP, addr('127.0.0.1', 1), reader, 'little') is None
+    assert socket_uid(TCP6, addr('::1', 54435), addr('::1', 8540), 'little') == 1002
+    assert socket_uid(TCP6, addr('127.0.0.1', 54436), reader, 'little') == 1003
+
+
+def test_peer_uid_of_a_real_loopback_connection(tmp_path):
+    with socket.create_server(('127.0.0.1', 0)) as listener, \
+            socket.create_connection(listener.getsockname(), timeout=5) as client:
+        accepted, peer = listener.accept()
+        with accepted:
+            assert peer_uid(peer, accepted.getsockname()) == os.getuid()
+            assert peer_uid(peer, accepted.getsockname(), (str(tmp_path / 'missing'),)) is None
+            assert peer_uid(('127.0.0.1', 1), accepted.getsockname()) is None
 
 
 @pytest.mark.parametrize('host', ['0.0.0.0', '100.64.0.1', '192.168.80.1', 'oma.tailf63b9a.ts.net', ''])
@@ -125,6 +202,7 @@ def write_config(tmp_path, cfg, extra):
 
 @pytest.mark.parametrize('extra,expected', [
     ('', ()),
+    (f'tailscale_logins = ["{OWNER}"]\ntailscale_hosts = ["oma.tailf63b9a.ts.net:8540", "localhost:0"]\n', (OWNER,)),
     ('tailscale_logins = []\n', ()),
     (f'bind = "127.0.0.1:0"\ntailscale_logins = ["{OWNER}"]\n', (OWNER,)),
     (f'bind = "localhost:0"\ntailscale_logins = ["{OWNER}"]\n', (OWNER,)),
@@ -141,6 +219,11 @@ def test_config_reads_allowed_logins(cfg, conn, tmp_path, extra, expected):
     'tailscale_logins = "nytafar@github"\n',
     'tailscale_logins = [""]\n',
     'tailscale_logins = [1]\n',
+    'tailscale_logins = ["blåbær@github"]\n',
+    'tailscale_logins = [" nytafar@github"]\n',
+    'tailscale_logins = ["nyta\\tfar@github"]\n',
+    'tailscale_hosts = "localhost:8540"\n',
+    'tailscale_hosts = [""]\n',
     f'bind = "0.0.0.0:0"\ntailscale_logins = ["{OWNER}"]\n',
 ])
 def test_config_refuses_bad_identity_settings(cfg, conn, tmp_path, extra):
