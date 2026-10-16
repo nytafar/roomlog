@@ -504,7 +504,7 @@ def test_migration_v3_to_v4_keeps_rows_and_backfills_lang(tmp_path):
     conn.close()
 
     conn = dbmod.connect(path)
-    assert dbmod.user_version(conn) == 5
+    assert dbmod.user_version(conn) == dbmod.SCHEMA_VERSION
     rows = conn.execute("SELECT * FROM segments ORDER BY id").fetchall()
     assert [(r["text"], r["lang"], r["device_id"], r["chunk_id"], r["span_id"], r["superseded_by"]) for r in rows] == [
         ("gammel rad", "no", "lass22", cid, None, None), ("engelsk rad", "en", "lass22", cid, None, None)]

@@ -23,10 +23,14 @@ ffmpeg encodes the test audio).
 
 ## Chunk kinds
 
-`chunks.kind` is `speech` (a file the Linux edge uploaded) or `derived` (no file: a slice
+`chunks.kind` is `speech` (a file the Linux edge uploaded) or `derived` (a slice
 `[n_start, n_start + n_samples)` of the raw stream of one `(device, run_id, epoch)`, identity
 = SHA-256 of that int16 PCM slice). Both kinds flow through the same worker, sessions, search
-and MCP. Raw segments keep `status` `pending` until the segmenter has covered them;
+and MCP. STT reads a derived chunk from raw; for playback the segmenter also writes an Ogg
+Opus file of exactly its samples to `archive/derived/` (`derived_audio.py`: bit-exact, so the
+file is a function of the PCM, no sidecar) before it commits the row. `resegment` removes the
+files of the chunks it deletes and the worker's daily sweep removes unreferenced ones; chunk
+ids are AUTOINCREMENT (schema v6), so a re-derived chunk never answers under an old id. Raw segments keep `status` `pending` until the segmenter has covered them;
 `raw_progress.segmented_to_n` is the per-epoch high-water mark. A raw file that does not
 decode to its `n_samples` (beyond 64 samples of codec priming) gets `status` `failed`, is
 counted in `roomlog status`, and its neighbours continue as if it were a gap; `resegment`
@@ -83,6 +87,7 @@ uv run roomlog segment                # one segmenter pass (the worker does this
 uv run roomlog resegment --device s22 --from 2026-09-26   # re-run VAD + chunker over history
 uv run roomlog resegment --device s22 --from 2026-09-26T13:00 --to 2026-09-26T13:30  # only that range; chunks outside stay
 uv run roomlog purge-raw              # 30-day retention for speech-free raw audio (the worker: daily)
+uv run roomlog backfill-derived-audio # files for derived chunks from before they had one (idempotent; --limit N)
 uv run roomlog verify                 # archive, archive/raw and derived-chunk coverage
 ```
 

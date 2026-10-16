@@ -80,6 +80,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("purge-raw", help="delete speech-free raw segments older than the retention (30 days)")
 
+    s = sub.add_parser("backfill-derived-audio",
+                       help="write the playable file of every derived chunk that has none (idempotent)")
+    s.add_argument("--limit", type=int, help="at most this many chunks this run (resume by running again)")
+
     s = sub.add_parser("fetch-model", help="download the local backend's ct2 model and the Silero VAD")
     s.add_argument("--model", help="HF repo id (default: first local backend's model)")
     s.add_argument("--revision")
@@ -146,8 +150,10 @@ def cmd_resegment(cfg: Config, args: argparse.Namespace) -> int:
     from .segmenter import reset_segmentation
     assert cfg.db_path is not None
     conn = dbmod.connect(cfg.db_path)
-    out = reset_segmentation(conn, args.device_id, parse_user_time(args.from_utc), parse_user_time(args.to_utc))
-    print(f"reset epochs={out['epochs']} raw={out['raw_reset']} chunks_deleted={out['chunks_deleted']}")
+    out = reset_segmentation(conn, args.device_id, parse_user_time(args.from_utc), parse_user_time(args.to_utc),
+                             archive_dir=cfg.archive_dir)
+    print(f"reset epochs={out['epochs']} raw={out['raw_reset']} chunks_deleted={out['chunks_deleted']} "
+          f"audio_removed={out['audio_removed']}")
     return _segment(cfg, conn, args)
 
 
@@ -158,6 +164,27 @@ def cmd_purge_raw(cfg: Config, args: argparse.Namespace) -> int:
     out = purge_raw(conn, cfg.archive_dir)
     print(f"deleted={out['deleted']} bytes={out['bytes']} retention_days={RAW_RETENTION_DAYS}")
     return 0
+
+
+def cmd_backfill_derived_audio(cfg: Config, args: argparse.Namespace) -> int:
+    from .derived_audio import backfill, sweep
+    assert cfg.db_path is not None and cfg.archive_dir is not None
+    conn = dbmod.connect(cfg.db_path)
+
+    def progress(r) -> None:
+        done = r.linked + r.raw_missing + r.mismatched + r.gone + len(r.errors)
+        if done and done % 100 == 0:
+            print(f"  ... {done} chunks, {r.bytes / 1e6:.1f} MB written", file=sys.stderr)
+
+    res = backfill(conn, cfg.archive_dir, limit=args.limit, progress=progress)
+    swept = sweep(conn, cfg.archive_dir)
+    out = {**res.as_dict(), "swept": swept["removed"], "swept_bytes": swept["bytes"]}
+    text = (f"derived={res.derived} present={res.present} linked={res.linked} written={res.written} "
+            f"bytes={res.bytes} raw_missing={res.raw_missing} mismatched={res.mismatched} gone={res.gone} "
+            f"errors={len(res.errors)} swept={swept['removed']}\n")
+    text += "".join(f"  {e}\n" for e in res.errors)
+    _out(args, out, text)
+    return 0 if not res.errors else 1
 
 
 def cmd_search(cfg: Config, args: argparse.Namespace) -> int:
@@ -302,6 +329,7 @@ COMMANDS = {
     "segment": cmd_segment,
     "resegment": cmd_resegment,
     "purge-raw": cmd_purge_raw,
+    "backfill-derived-audio": cmd_backfill_derived_audio,
     "fetch-model": cmd_fetch_model,
     "selftest": cmd_selftest,
 }

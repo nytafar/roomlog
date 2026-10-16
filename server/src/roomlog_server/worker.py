@@ -27,7 +27,7 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 
-from . import sdnotify
+from . import derived_audio, sdnotify
 from .audio import SAMPLE_RATE, concat_with_gaps, decode_opus
 from .backends import Backend, NoBackendAvailable, Router, Segment, Transcript, Word
 from .config import Config, Filters
@@ -456,7 +456,8 @@ class Worker:
         res.errors.extend(f"segmenter: {e}" for e in seg.errors)
 
     def maybe_purge_raw(self) -> dict[str, int] | None:
-        """Run `purge_raw` at most once per `PURGE_INTERVAL_MS`; the loop calls this every poll."""
+        """Run `purge_raw` and the derived-audio sweep at most once per `PURGE_INTERVAL_MS`; the
+        loop calls this every poll."""
         now = self.now()
         if self._last_purge_ms is not None and now - self._last_purge_ms < PURGE_INTERVAL_MS:
             return None
@@ -464,6 +465,10 @@ class Worker:
         out = purge_raw(self.conn, self.archive_dir, now=now)
         if out["deleted"]:
             log.info("purged %d raw segments (%.1f MB) older than the retention", out["deleted"], out["bytes"] / 1e6)
+        try:
+            derived_audio.sweep(self.conn, self.archive_dir)  # files of deleted derived chunks, crash leftovers
+        except Exception:
+            log.exception("sweeping derived audio failed")
         return out
 
     # -- marking

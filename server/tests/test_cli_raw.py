@@ -45,7 +45,7 @@ def test_cli_help_lists_raw_subcommands(capsys):
     with pytest.raises(SystemExit):
         main(["--help"])
     out = capsys.readouterr().out
-    for cmd in ("segment", "resegment", "purge-raw"):
+    for cmd in ("segment", "resegment", "purge-raw", "backfill-derived-audio"):
         assert cmd in out
 
 
@@ -98,21 +98,45 @@ def test_cli_resegment(raw_site, capsys):
     run(base + ["segment"], capsys)
     run(base + ["worker", "--once"], capsys)
     conn = dbmod.connect(cfg.db_path)
-    sha_before = conn.execute("SELECT sha256 FROM chunks").fetchone()[0]
+    sha_before, id_before, path_before = conn.execute("SELECT sha256, id, path FROM chunks").fetchone()
     assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 1
     conn.close()
     rc, out, _ = run(base + ["resegment", "--device", "s22"], capsys)
     assert rc == 0
-    assert out.splitlines() == ["reset epochs=1 raw=3 chunks_deleted=1", "epochs=1 chunks=1"]
+    # the deleted chunk's file goes with it; the re-derived chunk writes the same one again
+    assert out.splitlines() == ["reset epochs=1 raw=3 chunks_deleted=1 audio_removed=1", "epochs=1 chunks=1"]
     conn = dbmod.connect(cfg.db_path)
-    row = conn.execute("SELECT sha256, status FROM chunks").fetchone()
+    row = conn.execute("SELECT id, sha256, status, path FROM chunks").fetchone()
     assert row["sha256"] == sha_before and row["status"] == "pending"
+    assert row["id"] > id_before and row["path"] == path_before and (cfg.archive_dir / path_before).is_file()
     assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 0
     conn.close()
     rc, out, _ = run(base + ["resegment", "--device", "s22", "--from", "2027-01-01"], capsys)
-    assert rc == 0 and out.splitlines()[0] == "reset epochs=0 raw=0 chunks_deleted=0"
+    assert rc == 0 and out.splitlines()[0] == "reset epochs=0 raw=0 chunks_deleted=0 audio_removed=0"
     with pytest.raises(SystemExit):
         main(base + ["resegment"])
+
+
+def test_cli_backfill_derived_audio_is_idempotent(raw_site, capsys):
+    cfg, fx, base = raw_site
+    run(base + ["segment"], capsys)
+    conn = dbmod.connect(cfg.db_path)
+    rel = conn.execute("SELECT path FROM chunks").fetchone()[0]
+    # a chunk from before derived files: no path, no file
+    conn.execute("UPDATE chunks SET path = NULL")
+    (cfg.archive_dir / rel).unlink()
+    conn.close()
+    rc, out, _ = run(base + ["verify"], capsys)
+    assert rc == 0  # not playable yet, but not broken
+    rc, out, _ = run(base + ["--json", "backfill-derived-audio"], capsys)
+    assert rc == 0
+    res = json.loads(out)
+    assert (res["derived"], res["present"], res["linked"], res["written"]) == (1, 0, 1, 1)
+    assert res["bytes"] == (cfg.archive_dir / rel).stat().st_size > 0
+    rc, out, _ = run(base + ["backfill-derived-audio"], capsys)
+    assert rc == 0 and out.startswith("derived=1 present=1 linked=0 written=0 bytes=0 ")
+    rc, out, _ = run(base + ["--json", "verify"], capsys)
+    assert rc == 0 and json.loads(out)["derived_without_audio"] == 0
 
 
 def test_cli_purge_raw(raw_site, capsys):

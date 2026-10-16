@@ -11,6 +11,11 @@ still becomes a row), `span_id`, `superseded_by` and `lang NOT NULL`.
 
 v5: a trigger that detaches a span's row from a chunk being deleted (`resegment`), so the
 dictation text outlives the chunk and joins the re-derived one.
+
+v6: `chunks.id` becomes AUTOINCREMENT. Derived chunks are deleted and re-derived
+(`resegment`) and now have audio files the reader serves as immutable per `chunk_id`; a
+plain rowid hands a deleted top id to the next insert, so a client could keep playing the
+old audio for a new chunk. The counter starts at the current max id.
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ from pathlib import Path
 
 log = logging.getLogger("roomlog.db")
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _MIGRATIONS: dict[int, str] = {
     1: """
@@ -306,6 +311,52 @@ CREATE TRIGGER segments_au AFTER UPDATE ON segments BEGIN
 END;
 """,
     5: """
+CREATE TRIGGER chunks_bd_detach_spans BEFORE DELETE ON chunks BEGIN
+    UPDATE segments SET chunk_id = NULL WHERE chunk_id = old.id AND span_id IS NOT NULL;
+END;
+""",
+    # Same columns as v3; foreign keys are off around the script (see v3), so dropping the old
+    # table neither cascades into `segments` nor fires the v5 trigger, which is recreated.
+    6: """
+CREATE TABLE chunks_v6 (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    sha256              TEXT NOT NULL UNIQUE,
+    kind                TEXT NOT NULL DEFAULT 'speech' CHECK (kind IN ('speech', 'derived')),
+    device_id           TEXT NOT NULL,
+    start_utc_ms        INTEGER NOT NULL,
+    end_utc_ms          INTEGER NOT NULL,
+    duration_ms         INTEGER NOT NULL,
+    path                TEXT,
+    n_start             INTEGER,
+    n_samples           INTEGER,
+    meta_json           TEXT NOT NULL,
+    run_id              TEXT NOT NULL,
+    epoch               INTEGER NOT NULL,
+    discontinuity       INTEGER NOT NULL DEFAULT 0,
+    clock_synced        INTEGER NOT NULL DEFAULT 1,
+    received_utc_ms     INTEGER NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'done', 'failed')),
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    error               TEXT,
+    transcribed_utc_ms  INTEGER,
+    model_id            TEXT,
+    model_revision      TEXT,
+    session_id          TEXT,
+    n_segments_dropped  INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO chunks_v6 SELECT id, sha256, kind, device_id, start_utc_ms, end_utc_ms, duration_ms, path,
+    n_start, n_samples, meta_json, run_id, epoch, discontinuity, clock_synced, received_utc_ms,
+    status, attempts, error, transcribed_utc_ms, model_id, model_revision, session_id,
+    n_segments_dropped FROM chunks;
+DROP TABLE chunks;
+ALTER TABLE chunks_v6 RENAME TO chunks;
+CREATE INDEX chunks_start ON chunks (start_utc_ms);
+CREATE INDEX chunks_device_start ON chunks (device_id, start_utc_ms);
+CREATE INDEX chunks_status ON chunks (status);
+CREATE INDEX chunks_session ON chunks (session_id);
+CREATE INDEX chunks_path ON chunks (path);
+CREATE INDEX chunks_timeline ON chunks (device_id, run_id, epoch, n_start);
 CREATE TRIGGER chunks_bd_detach_spans BEFORE DELETE ON chunks BEGIN
     UPDATE segments SET chunk_id = NULL WHERE chunk_id = old.id AND span_id IS NOT NULL;
 END;

@@ -111,7 +111,8 @@ def test_raw_segments_reach_search(tmp_path, capsys):
         conn = dbmod.connect(server_cfg.db_path, readonly=True)
         try:
             chunk = conn.execute("SELECT * FROM chunks").fetchone()
-            assert chunk["kind"] == "derived" and chunk["path"] is None and chunk["status"] == "done"
+            assert chunk["kind"] == "derived" and chunk["status"] == "done"
+            assert (server_cfg.archive_dir / chunk["path"]).is_file()  # playable on its own
             assert chunk["n_start"] < SEGMENT < chunk["n_start"] + chunk["n_samples"]
             seg = conn.execute("SELECT * FROM segments").fetchone()
             tone_start_ms = t0_ns // 1_000_000 + 25_000

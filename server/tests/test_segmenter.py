@@ -75,7 +75,8 @@ def test_chunk_spanning_segment_boundary_is_exact_and_idempotent(tmp_path):
     # the codec's tail ringing may keep one more window above the energy gate
     assert n_end in (window_after(40 * RATE) + PAD, window_after(40 * RATE) + W + PAD)
     assert c["n_start"] < SEGMENT < n_end  # spans the 30 s seam
-    assert c["kind"] == "derived" and c["path"] is None and c["status"] == "pending"
+    assert c["kind"] == "derived" and c["status"] == "pending"
+    assert c["path"].startswith("derived/") and c["path"].endswith(f"_{c['sha256'][:8]}.opus")
     assert c["start_utc_ms"] == RAW_T0 + n_start * 1000 // RATE  # exact: n_start is a multiple of 16
     assert c["end_utc_ms"] - c["start_utc_ms"] == c["duration_ms"] == samples_to_ms(n_end - n_start)
     assert c["run_id"] == fx.run_id and c["epoch"] == 0
@@ -317,7 +318,7 @@ def test_reset_segmentation_rederives_the_same_chunks(tmp_path):
                  "VALUES (?, 's22', 0, 0, 1, 0, 'x', 'm')", (before[0]["id"],))
 
     out = reset_segmentation(conn, "s22")
-    assert out == {"epochs": 1, "raw_reset": 3, "chunks_deleted": 2}
+    assert out == {"epochs": 1, "raw_reset": 3, "chunks_deleted": 2, "audio_removed": 0}
     assert derived(conn) == [] and conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 0
     assert raw_status(conn) == ["pending"] * 3
     assert conn.execute("SELECT count(*) FROM raw_progress").fetchone()[0] == 0
@@ -339,7 +340,8 @@ def test_reset_segmentation_rederives_the_same_chunks(tmp_path):
     make_segmenter(cfg, conn, now).run_once()
     assert [c["sha256"] for c in derived(conn)] == [c["sha256"] for c in before]
     # another device is untouched
-    assert reset_segmentation(conn, "nobody") == {"epochs": 0, "raw_reset": 0, "chunks_deleted": 0}
+    assert reset_segmentation(conn, "nobody") == {"epochs": 0, "raw_reset": 0, "chunks_deleted": 0,
+                                                     "audio_removed": 0}
     conn.close()
 
 
@@ -358,7 +360,7 @@ def test_purge_raw_deletes_only_old_speech_free_segmented_segments(tmp_path):
     make_segmenter(cfg, conn, RAW_T0).run_once()
     conn.execute("UPDATE raw_segments SET status = 'pending' WHERE device_id = 'stale'")
     assert len(derived(conn)) == 1
-    files_before = sorted(str(p.relative_to(cfg.archive_dir)) for p in cfg.archive_dir.rglob("*.opus"))
+    files_before = sorted(str(p.relative_to(cfg.archive_dir)) for p in (cfg.archive_dir / "raw").rglob("*.opus"))
     assert len(files_before) == 6
 
     out = purge_raw(conn, cfg.archive_dir, now=RAW_T0)
@@ -369,8 +371,9 @@ def test_purge_raw_deletes_only_old_speech_free_segmented_segments(tmp_path):
         ("stale", 0),  # old but still pending
         ("young", 0), ("young", SEGMENT),
     ]
-    files_after = sorted(str(p.relative_to(cfg.archive_dir)) for p in cfg.archive_dir.rglob("*.opus"))
+    files_after = sorted(str(p.relative_to(cfg.archive_dir)) for p in (cfg.archive_dir / "raw").rglob("*.opus"))
     assert files_after == sorted(r["path"] for r in rows)
+    assert (cfg.archive_dir / derived(conn)[0]["path"]).is_file()  # purge never touches derived files
     assert not list(cfg.archive_dir.rglob("*.json.tmp"))
     for p in cfg.archive_dir.rglob("*.json"):
         assert p.with_suffix(".opus").exists()

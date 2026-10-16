@@ -1,8 +1,9 @@
 """`roomlog verify`: re-hash the archive against sidecars and cross-check with the DB.
 
 Speech chunks live under `archive/YYYY/...` and map to `chunks`; raw segments live under
-`archive/raw/...` and map to `raw_segments`. Derived chunks have no file; for them the check
-is that their raw audio is still present and contiguous.
+`archive/raw/...` and map to `raw_segments`. Derived chunks are checked against their raw
+audio (still present and contiguous); their playable files under `archive/derived/...` have
+no sidecar and must each be the file of one derived row (`derived_audio`).
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .archive import RAW_PREFIX
+from .derived_audio import DERIVED_PREFIX
 from .segmenter import covering_segments, raw_covers
 
 
@@ -25,6 +27,9 @@ def verify_archive(conn: sqlite3.Connection, archive_dir: Path) -> dict[str, Any
         for json_path in sorted(archive_dir.rglob("*.json")):
             opus = json_path.with_suffix(".opus")
             rel = str(opus.relative_to(archive_dir))
+            if rel.startswith(DERIVED_PREFIX):
+                problems.append(f"{rel}: sidecar under derived/")
+                continue
             table = "raw_segments" if rel.startswith(RAW_PREFIX) else "chunks"
             n_files += 1
             if not opus.exists():
@@ -49,7 +54,14 @@ def verify_archive(conn: sqlite3.Connection, archive_dir: Path) -> dict[str, Any
             elif row["path"] != rel:
                 problems.append(f"{rel}: {table} row points at {row['path']}")
             seen_paths.add(rel)
+        derived_paths = {r[0] for r in conn.execute(
+            "SELECT path FROM chunks WHERE kind = 'derived' AND path IS NOT NULL")}
         for opus in sorted(archive_dir.rglob("*.opus")):
+            rel = str(opus.relative_to(archive_dir))
+            if rel.startswith(DERIVED_PREFIX):
+                if rel not in derived_paths:
+                    problems.append(f"{rel}: derived audio no chunk refers to (the worker's sweep removes it)")
+                continue
             if not opus.with_suffix(".json").exists():
                 problems.append(f"{opus.relative_to(archive_dir)}: audio without sidecar")
         for tmp in archive_dir.rglob("*.tmp"):
@@ -64,11 +76,19 @@ def verify_archive(conn: sqlite3.Connection, archive_dir: Path) -> dict[str, Any
         if r["path"] not in seen_paths and not (archive_dir / r["path"]).exists():
             problems.append(f"{r['path']}: raw_segments row without file")
     n_derived = 0
+    n_unplayable = 0
     for r in conn.execute(
-            "SELECT id, device_id, run_id, epoch, n_start, n_samples FROM chunks WHERE kind = 'derived'"):
+            "SELECT id, sha256, path, device_id, run_id, epoch, n_start, n_samples FROM chunks WHERE kind = 'derived'"):
         n_derived += 1
+        if r["path"] is None:
+            n_unplayable += 1  # from before derived files; `roomlog backfill-derived-audio` writes it
+        elif not r["path"].startswith(DERIVED_PREFIX) or not r["path"].endswith(f"_{r['sha256'][:8]}.opus"):
+            problems.append(f"derived chunk {r['id']}: path {r['path']} is not its derived/ file")
+        elif not (archive_dir / r["path"]).is_file():
+            problems.append(f"{r['path']}: derived chunk {r['id']} without file")
         n_end = r["n_start"] + r["n_samples"]
         segs = covering_segments(conn, r["device_id"], r["run_id"], r["epoch"], r["n_start"], n_end)
         if not raw_covers(segs, r["n_start"], n_end):
             problems.append(f"derived chunk {r['id']} ({r['device_id']} n={r['n_start']}): raw audio missing")
-    return {"files": n_files, "rows": n_rows, "derived": n_derived, "problems": problems, "ok": not problems}
+    return {"files": n_files, "rows": n_rows, "derived": n_derived, "derived_without_audio": n_unplayable,
+            "problems": problems, "ok": not problems}

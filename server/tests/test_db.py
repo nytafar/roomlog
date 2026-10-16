@@ -243,3 +243,34 @@ def test_migration_tolerates_preexisting_dangling_rows_and_rolls_back_new_ones(t
     assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 2
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     conn.close()
+
+
+def test_migration_v5_to_v6_never_reuses_a_chunk_id(tmp_path):
+    """v6 rebuilds `chunks` with AUTOINCREMENT: the reader serves audio per chunk id as
+    immutable, so a re-derived chunk must not get the id of a deleted one."""
+    import sqlite3
+    path = tmp_path / "v5.db"
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    dbmod.migrate(conn, target=5)
+    a = seed_chunk(conn, sha_seed=b"a")
+    b = seed_chunk(conn, sha_seed=b"b")
+    seg = insert_segment(conn, a, 0, "beholdt rad")
+    conn.execute("DELETE FROM chunks WHERE id = ?", (b,))  # the top id, which v5 would hand out again
+    conn.close()
+
+    conn = dbmod.connect(path)
+    assert dbmod.user_version(conn) == dbmod.SCHEMA_VERSION == 6
+    assert conn.execute("SELECT chunk_id FROM segments WHERE id = ?", (seg,)).fetchone()[0] == a
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE tbl_name = 'chunks'")}
+    assert {"chunks_start", "chunks_device_start", "chunks_status", "chunks_session", "chunks_path",
+            "chunks_timeline", "chunks_bd_detach_spans"} <= names
+    c = seed_chunk(conn, sha_seed=b"c")
+    assert c > a  # the counter starts at the max id that survived the migration
+    conn.execute("DELETE FROM chunks WHERE id = ?", (c,))
+    assert seed_chunk(conn, sha_seed=b"d") > c  # and from now on never goes back
+    conn.execute("DELETE FROM chunks WHERE id = ?", (a,))
+    assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 0  # the cascade survives
+    conn.close()

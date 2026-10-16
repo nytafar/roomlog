@@ -4,7 +4,9 @@ Raw segments arrive as independent 30.0 s Ogg Opus files that are sample-contigu
 one `(device_id, run_id, epoch)`. Per epoch, ordered by `n_start`, the contiguous run is
 decoded back into one PCM stream, fed in 512-sample windows to the VAD and the same
 `Chunker` the edge uses, and every closed chunk becomes a `chunks` row with
-`kind='derived'`, no file, and `sha256` = SHA-256 of its int16 LE PCM slice.
+`kind='derived'`, `sha256` = SHA-256 of its int16 LE PCM slice, and `path` = an Ogg Opus
+file of exactly that slice under `archive/derived/`, written before the row commits
+(`derived_audio` has the rules that keep files and rows in step).
 
 Rules that make repeated passes safe:
 
@@ -45,8 +47,9 @@ import numpy as np
 
 from . import sdnotify
 from . import vad as vadmod
-from .audio import SAMPLE_RATE, decode_opus
+from .audio import SAMPLE_RATE, decode_opus, encode_opus
 from .chunker import Chunk as Cut, Chunker
+from .derived_audio import derived_relpath, ensure_file, remove_unreferenced
 from .times import ms_to_iso, now_ms
 
 log = logging.getLogger("roomlog.segmenter")
@@ -275,6 +278,18 @@ class RawAudio:
         self._cache = {k: v for k, v in self._cache.items() if k in keep}
 
 
+@dataclass
+class _Planned:
+    """A chunk a pass is about to commit, with its file's path and how to encode it."""
+    n_start: int
+    n_end: int
+    cut_reason: str
+    sha256: str
+    start_ms: int
+    relpath: str
+    body: Callable[[], bytes]
+
+
 class Segmenter:
     def __init__(self, conn: sqlite3.Connection, archive_dir: Path,
                  vad_factory: Callable[[], vadmod.Vad],
@@ -490,16 +505,30 @@ class Segmenter:
             cuts.extend(chunker.cut(final, n_end=hi))
 
         mark = self._next_mark(chunker, cuts, hi, commit_from, final)
+        # Each chunk's file is encoded and written before the write lock is taken (CPU and
+        # fsync stay out of it), then checked again under the lock right before its row is
+        # inserted, because a sweep may have removed it in between (derived_audio).
+        planned: list[_Planned] = []
+        for n_start, n_end, reason in self._committable(cuts, commit_from, mark, chunker.min_speech):
+            p = self._plan_derived(chain, n_start, n_end, reason, audio[n_start - decode_lo: n_end - decode_lo])
+            ensure_file(self.archive_dir, p.relpath, p.body)
+            planned.append(p)
+        orphans: list[str] = []
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            for n_start, n_end, reason in self._committable(cuts, commit_from, mark, chunker.min_speech):
-                slice_ = audio[n_start - decode_lo: n_end - decode_lo]
-                if self._insert_derived(chain, n_start, n_end, reason, slice_):
+            for p in planned:
+                ensure_file(self.archive_dir, p.relpath, p.body)
+                if self._insert_derived(chain, p):
                     res.chunks += 1
+                elif not self._adopt_file(p):
+                    orphans.append(p.relpath)
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
+        if orphans:
+            # Same PCM as a chunk that already exists elsewhere: the row is kept, the file not.
+            remove_unreferenced(self.conn, self.archive_dir, orphans)
         return mark
 
     @staticmethod
@@ -553,13 +582,33 @@ class Segmenter:
             out.append((n_start, n_end, c.cut_reason))
         return out
 
-    def _insert_derived(self, chain: list[RawSeg], n_start: int, n_end: int, cut_reason: str,
-                        audio: np.ndarray) -> bool:
+    def _plan_derived(self, chain: list[RawSeg], n_start: int, n_end: int, cut_reason: str,
+                      audio: np.ndarray) -> "_Planned":
+        seg = next(s for s in chain if s.n_start <= n_start < s.n_end)
+        pcm = pcm_int16(audio)
+        sha = hashlib.sha256(pcm.tobytes()).hexdigest()
+        start_ms = seg.start_utc_ms + samples_to_ms(n_start - seg.n_start)
+        return _Planned(n_start=n_start, n_end=n_end, cut_reason=cut_reason, sha256=sha,
+                        start_ms=start_ms, relpath=derived_relpath(start_ms, sha),
+                        body=lambda: encode_opus(pcm))
+
+    def _adopt_file(self, p: "_Planned") -> bool:
+        """After a conflict on sha256: give the file to the existing row when it is this very
+        chunk and has none yet (a row from before derived files existed); True when kept."""
+        cur = self.conn.execute(
+            """UPDATE chunks SET path = ? WHERE sha256 = ? AND kind = 'derived' AND path IS NULL
+               AND start_utc_ms = ? AND n_start = ? AND n_samples = ?""",
+            (p.relpath, p.sha256, p.start_ms, p.n_start, p.n_end - p.n_start))
+        if cur.rowcount == 1:
+            return True
+        row = self.conn.execute("SELECT path FROM chunks WHERE sha256 = ?", (p.sha256,)).fetchone()
+        return row is not None and row["path"] == p.relpath
+
+    def _insert_derived(self, chain: list[RawSeg], p: "_Planned") -> bool:
+        n_start, n_end, sha, start_ms = p.n_start, p.n_end, p.sha256, p.start_ms
         seg = next(s for s in chain if s.n_start <= n_start < s.n_end)
         covering = [s for s in chain if s.n_end > n_start and s.n_start < n_end]
-        sha = pcm_sha256(audio)
         n_samples = n_end - n_start
-        start_ms = seg.start_utc_ms + samples_to_ms(n_start - seg.n_start)
         duration_ms = samples_to_ms(n_samples)
         discontinuity = False
         if seg.discontinuity:
@@ -585,7 +634,7 @@ class Segmenter:
             "discontinuity": discontinuity,
             "clock_step": False,
             "clock_synced": seg.clock_synced,
-            "cut_reason": cut_reason,
+            "cut_reason": p.cut_reason,
             "vad": dict(self.vad_info),
             "edge_version": seg.edge_version,
             "derived_from": [s.sha256 for s in covering],
@@ -596,9 +645,9 @@ class Segmenter:
             """INSERT INTO chunks (sha256, kind, device_id, start_utc_ms, end_utc_ms, duration_ms, path,
                                    n_start, n_samples, meta_json, run_id, epoch, discontinuity,
                                    clock_synced, received_utc_ms, status)
-               VALUES (?, 'derived', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+               VALUES (?, 'derived', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
                ON CONFLICT(sha256) DO NOTHING""",
-            (sha, seg.device_id, start_ms, start_ms + duration_ms, duration_ms, n_start, n_samples,
+            (sha, seg.device_id, start_ms, start_ms + duration_ms, duration_ms, p.relpath, n_start, n_samples,
              json.dumps(meta, ensure_ascii=True, separators=(",", ":")), seg.run_id, seg.epoch,
              1 if discontinuity else 0, 1 if seg.clock_synced else 0, self.now()),
         )
@@ -632,7 +681,7 @@ RAW_RETENTION_DAYS = 30  # fixed in v1, config in v2 (plan decision 6)
 
 
 def reset_segmentation(conn: sqlite3.Connection, device_id: str, from_ms: int | None = None,
-                       to_ms: int | None = None) -> dict[str, int]:
+                       to_ms: int | None = None, archive_dir: Path | None = None) -> dict[str, int]:
     """Undo segmentation for a device's raw segments starting in `[from_ms, to_ms)`.
 
     Per affected epoch, the derived chunks that intersect the selected samples are deleted
@@ -643,6 +692,12 @@ def reset_segmentation(conn: sqlite3.Connection, device_id: str, from_ms: int | 
     extent included) is re-derived in order; otherwise chunks outside the extent stay and
     the next pass re-derives the extent in place, between the surviving neighbours, like a
     gap that filled late.
+
+    The deleted chunks' audio files are removed after the commit when `archive_dir` is given
+    (one that a re-derived chunk already points at again stays); without it they are left
+    for `derived_audio.sweep`. Chunk ids are never reused (AUTOINCREMENT, schema v6), so a
+    re-derived chunk never answers under the id of a deleted one, whose immutable audio
+    response a client may have cached.
     """
     where = ["device_id = ?"]
     params: list[Any] = [device_id]
@@ -657,7 +712,8 @@ def reset_segmentation(conn: sqlite3.Connection, device_id: str, from_ms: int | 
             FROM raw_segments WHERE {' AND '.join(where)} GROUP BY run_id, epoch""",
         params,
     ).fetchall()
-    out = {"epochs": 0, "raw_reset": 0, "chunks_deleted": 0}
+    out = {"epochs": 0, "raw_reset": 0, "chunks_deleted": 0, "audio_removed": 0}
+    deleted_paths: list[str] = []
     conn.execute("BEGIN IMMEDIATE")
     try:
         for r in rows:
@@ -688,18 +744,19 @@ def reset_segmentation(conn: sqlite3.Connection, device_id: str, from_ms: int | 
                 # everything from there on is re-derived in order, so every chunk and segment
                 # from n_lo on goes, the ones between n_hi and the old mark included; leaving
                 # them would let the replay derive their span a second time.
-                cur = conn.execute(
+                gone = conn.execute(
                     """DELETE FROM chunks WHERE device_id = ? AND run_id = ? AND epoch = ?
-                       AND kind = 'derived' AND n_start + n_samples > ?""",
+                       AND kind = 'derived' AND n_start + n_samples > ? RETURNING path""",
                     (*key, n_lo),
-                )
+                ).fetchall()
             else:
-                cur = conn.execute(
+                gone = conn.execute(
                     """DELETE FROM chunks WHERE device_id = ? AND run_id = ? AND epoch = ?
-                       AND kind = 'derived' AND n_start < ? AND n_start + n_samples > ?""",
+                       AND kind = 'derived' AND n_start < ? AND n_start + n_samples > ? RETURNING path""",
                     (*key, n_hi, n_lo),
-                )
-            out["chunks_deleted"] += cur.rowcount
+                ).fetchall()
+            out["chunks_deleted"] += len(gone)
+            deleted_paths += [g["path"] for g in gone if g["path"]]
             if tail:
                 cur = conn.execute(
                     """UPDATE raw_segments SET status = 'pending', segmented_utc_ms = NULL
@@ -731,6 +788,8 @@ def reset_segmentation(conn: sqlite3.Connection, device_id: str, from_ms: int | 
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    if archive_dir is not None and deleted_paths:
+        out["audio_removed"] = remove_unreferenced(conn, archive_dir, deleted_paths)["removed"]
     return out
 
 

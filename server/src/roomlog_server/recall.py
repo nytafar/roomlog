@@ -221,7 +221,7 @@ class Reader:
     def audio_file(self,chunk_id,path):
         """The one rule for playable audio, shared by the route and rows' `audio_available`:
         a stored path that resolves to a regular file inside the archive, else None."""
-        # Derived chunks (ADR 0005) are slices of raw captures and have no file of their own.
+        # A derived chunk (ADR 0005) without a path predates derived files; the backfill writes it.
         if not path: return None
         try: target=(self.archive_dir/path).resolve()
         except (ValueError,OSError): return None
