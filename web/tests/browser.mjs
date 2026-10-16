@@ -75,7 +75,7 @@ const server = createServer(async (req, res) => {
       if (route === "audio") {
         const id = p.get("chunk_id");
         audioRequests.push(id);
-        if (id === "1") {
+        if (id === "1" || id === "4") {
           res.setHeader("Content-Type", "audio/ogg");
           res.end(chunkAudio);
         } else {
@@ -379,6 +379,60 @@ try {
     ),
   );
   await evaluate(`document.querySelector('#scrim').click()`);
+  // The playing line's button shows pause, the seek tint walks with the playhead, and
+  // a chunk that ends hands over to the next chunk of the same device.
+  const first = fixture.items.find((row) => row.segment_id === "1");
+  current = [
+    first,
+    { ...first, segment_id: "3", start_utc_ms: base + 2000, end_utc_ms: base + 5000,
+      text: "Later in the chunk", timing: "segment", words: null },
+    { ...first, segment_id: "4", chunk_id: "4", chunk_start_utc_ms: base + 6000,
+      start_utc_ms: base + 6000, end_utc_ms: base + 8000, text: "Next chunk",
+      timing: "segment", words: null },
+  ];
+  await evaluate(`document.querySelector('#refresh').click()`);
+  await waitFor(`document.querySelectorAll('.turn').length===3&&!document.querySelector('#status').textContent.includes('Loading')`);
+  const seekVar = (name) => evaluate(`parseFloat(document.querySelector('#seek').style.getPropertyValue('${name}'))`);
+  const lineLabel = (id) => `document.querySelector('[data-segment="${id}"] .play').getAttribute('aria-label')`;
+  await evaluate(`document.querySelector('[data-segment="1"] .play').click()`);
+  await waitFor(`${lineLabel(1)}==='Pause'`);
+  assert.ok(Math.abs((await seekVar("--b")) - 100 / 3) < 1, "tint covers the first line");
+  await evaluate(`(()=>{const s=document.querySelector('#seek');s.value='4.2';s.dispatchEvent(new Event('input'))})()`);
+  await waitFor(`${lineLabel(3)}==='Pause'&&${lineLabel(1)}!=='Pause'`);
+  assert.ok(Math.abs((await seekVar("--a")) - 100 / 3) < 1, "tint walks to the line under the playhead");
+  await waitFor(`document.querySelector('[data-segment="4"].playing')!==null&&${lineLabel(4)}==='Pause'&&${lineLabel(3)}!=='Pause'`);
+  assert.equal(audioRequests.at(-1), "4", "the next chunk is fetched when the first ends");
+  // The playing line's own button pauses and resumes in place.
+  await waitFor(`Number(document.querySelector('#seek').value)>0.5`);
+  await evaluate(`document.querySelector('[data-segment="4"] .play').click()`);
+  await waitFor(`document.querySelector('#play-toggle').getAttribute('aria-label')==='Play'`);
+  const pausedAt = Number(await evaluate(`document.querySelector('#seek').value`));
+  await evaluate(`document.querySelector('[data-segment="4"] .play').click()`);
+  await waitFor(`${lineLabel(4)}==='Pause'`);
+  assert.ok(Number(await evaluate(`document.querySelector('#seek').value`)) >= pausedAt - 0.05, "resumes, not restarts");
+  // With continue off a line stops at its own end and nothing further is fetched.
+  await evaluate(`document.querySelector('#play-continue').click()`);
+  assert.equal(await evaluate(`document.querySelector('#play-continue').getAttribute('aria-pressed')`), "false");
+  const fetchedBefore = audioRequests.length;
+  await evaluate(`document.querySelector('[data-segment="1"] .play').click()`);
+  await waitFor(`${lineLabel(1)}==='Pause'`);
+  await waitFor(`document.querySelector('#play-toggle').getAttribute('aria-label')==='Play'`);
+  assert.ok(Math.abs(Number(await evaluate(`document.querySelector('#seek').value`)) - 2) < 0.1, "stops at the line end");
+  await sleep(300);
+  assert.equal(audioRequests.length, fetchedBefore, "chunk 1 is cached and nothing follows");
+  assert.equal(
+    await evaluate(`document.querySelector('[data-segment="1"].playing')!==null&&document.querySelector('[data-segment="3"].playing')===null`),
+    true,
+    "the line that ended stays lit though the next one starts at that instant",
+  );
+  // A seek into a later line stops at that line's end, not the chunk's.
+  await evaluate(`(()=>{const s=document.querySelector('#seek');s.value='4.2';s.dispatchEvent(new Event('input'))})()`);
+  await evaluate(`document.querySelector('#play-toggle').click()`);
+  await waitFor(`${lineLabel(3)}==='Pause'`);
+  await waitFor(`document.querySelector('#play-toggle').getAttribute('aria-label')==='Play'`);
+  assert.ok(Math.abs(Number(await evaluate(`document.querySelector('#seek').value`)) - 5) < 0.1, "stops at the sought line's end");
+  await evaluate(`document.querySelector('#play-continue').click()`);
+  await evaluate(`document.querySelector('#play-stop').click()`);
   // Malicious transcript/recipient text must remain inert DOM content.
   current = [
     {
@@ -472,7 +526,7 @@ try {
     "token never enters request URLs",
   );
   console.log(
-    "Browser passed: real modules, shared wire fixtures, mobile layout, tap-to-play audio, timed selection, tray, filters, provenance, safe text, refresh removal, stale state, zoom navigation and logout.",
+    "Browser passed: real modules, shared wire fixtures, mobile layout, tap-to-play audio, continuous playback, timed selection, tray, filters, provenance, safe text, refresh removal, stale state, zoom navigation and logout.",
   );
 } finally {
   ws?.close();

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Player, ChunkCache, playable, unitAt, clock } from "../player.mjs";
+import { Player, ChunkCache, playable, unitAt, clock, nextRow } from "../player.mjs";
 import { HttpRecall, RecallError } from "../adapter.mjs";
 
 class FakeAudio extends EventTarget {
@@ -73,6 +73,24 @@ test("unitAt finds the unit under the playhead", () => {
   assert.equal(clock(65.9), "1:05");
 });
 
+test("nextRow continues with the earliest later chunk of the same device", () => {
+  const at = (id, chunk, chunkStart, start, extra = {}) =>
+    row(id, chunk, start, { chunk_start_utc_ms: chunkStart, ...extra });
+  const rows = [
+    at("1", "7", 1000, 1000),
+    at("2", "7", 1000, 3000),
+    at("3", "8", 9000, 9500, { device_id: "lass22" }),
+    at("5", "9", 20000, 20500),
+    at("4", "9", 20000, 20000),
+    at("6", "10", 30000, 30000),
+  ];
+  assert.equal(nextRow(rows, "nyta", 1000)?.segment_id, "4", "first line of the next chunk");
+  assert.equal(nextRow(rows, "nyta", 20000)?.segment_id, "6");
+  assert.equal(nextRow(rows, "nyta", 30000), null, "nothing after the last chunk");
+  assert.equal(nextRow(rows, "nyta", 1000, new Set(["9"]))?.segment_id, "6", "skips chunks without audio");
+  assert.equal(nextRow(rows, "lass22", 1000)?.segment_id, "3", "never crosses devices");
+});
+
 test("chunk cache keeps recent blobs and revokes evicted URLs", () => {
   const { cache: c, revoked } = cache();
   c.set("a", {});
@@ -108,6 +126,50 @@ test("a clip pauses at its end and replays from its start", async () => {
   player.toggle();
   assert.equal(audio.currentTime, 1, "replay starts the clip again");
   assert.equal(audio.paused, false);
+});
+
+test("bounds say why playback stops early and seeking past one releases it", async () => {
+  const audio = new FakeAudio();
+  const player = new Player(audio, async () => ({}), cache());
+  await player.play(row("1", "7", 2000), 2000);
+  assert.equal(player.current.bound, null, "a line plays to the chunk end");
+  await player.play(row("1", "7", 2000), 2000, 2600);
+  assert.equal(player.current.bound, "clip", "a range defaults to a clip");
+  await player.play(row("1", "7", 2000), 2000, 3000, "", "segment");
+  assert.equal(player.current.bound, "segment");
+  assert.equal(player.current.stopAt, 2);
+  audio.currentTime = 1.99;
+  assert.equal(player.atEnd(), true, "within 50 ms of the bound is its end");
+  audio.currentTime = 1.5;
+  assert.equal(player.atEnd(), false);
+  player.setBound(null);
+  assert.equal(player.current.bound, null);
+  assert.equal(player.current.stopAt, Infinity);
+  player.setBound(1.8);
+  assert.equal(player.current.bound, "segment");
+  player.seek(2.5);
+  assert.equal(player.current.bound, null, "seeking past the bound releases it");
+  audio.ended = true;
+  assert.equal(player.atEnd(), true, "an ended chunk is at its end");
+});
+
+test("seek reports to onseek, and setBound can reach a target still being fetched", async () => {
+  const audio = new FakeAudio();
+  let release;
+  const slow = new Promise((r) => (release = r));
+  const player = new Player(audio, async (id) => (id === "slow" ? slow.then(() => ({})) : {}), cache());
+  let seeks = 0;
+  player.onseek = () => seeks++;
+  await player.play(row("1", "7", 2000), 2000);
+  player.seek(1);
+  assert.equal(seeks, 1);
+  const next = player.play(row("2", "slow", 1000), 1000);
+  const target = player.pending;
+  player.setBound(0.5, "segment", target);
+  release();
+  assert.equal(await next, "playing");
+  assert.equal(player.current, target);
+  assert.equal(player.current.stopAt, 0.5, "the bound set during the fetch holds");
 });
 
 test("pausing before play() settles keeps the chunk loaded", async () => {

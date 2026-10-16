@@ -24,6 +24,24 @@ export function unitAt(list, t) {
   }
   return found;
 }
+// The line to continue with after a chunk ends: the earliest playable row of a later
+// chunk from the same device, or null. Continuing never crosses devices, whose
+// recordings of one conversation overlap.
+export function nextRow(rows, deviceId, afterChunkStart, unavailable = new Set()) {
+  let best = null;
+  for (const row of rows)
+    if (
+      row.device_id === deviceId &&
+      playable(row, unavailable) &&
+      row.chunk_start_utc_ms > afterChunkStart &&
+      (!best ||
+        row.chunk_start_utc_ms < best.chunk_start_utc_ms ||
+        (row.chunk_start_utc_ms === best.chunk_start_utc_ms &&
+          row.start_utc_ms < best.start_utc_ms))
+    )
+      best = row;
+  return best;
+}
 export function clock(seconds) {
   const s = Math.max(0, Math.floor(seconds || 0));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
@@ -79,6 +97,7 @@ export class Player {
     this.current = null;
     this.pending = null;
     this.onchange = () => {};
+    this.onseek = () => {};
     audio.preload = "auto";
     for (const type of ["play", "pause", "ended", "loadedmetadata", "seeked"])
       audio.addEventListener(type, () => this.#position());
@@ -101,11 +120,18 @@ export class Player {
   canPlay(row) {
     return playable(row, this.unavailable);
   }
-  // Plays the row's chunk from fromMs; toMs (optional) pauses there. The newest call
-  // wins. Resolves to "playing", "paused" (paused before playback began), "blocked"
+  // Plays the row's chunk from fromMs; toMs (optional) pauses there. bound names why
+  // playback stops early: "clip" (a selection) or "segment" (one line); it is null
+  // when playback runs to the chunk end. The newest call wins. Resolves to "playing", "paused" (paused before playback began), "blocked"
   // (autoplay refused; the bar can resume),
   // "unavailable" (no file for this chunk), "missing" (unknown chunk) or "aborted".
-  async play(row, fromMs = row.start_utc_ms, toMs = null, label = "") {
+  async play(
+    row,
+    fromMs = row.start_utc_ms,
+    toMs = null,
+    label = "",
+    bound = toMs == null ? null : "clip",
+  ) {
     this.#request?.abort();
     const request = (this.#request = new AbortController());
     this.audio.pause();
@@ -117,6 +143,7 @@ export class Player {
       chunkStart: start,
       from: Math.max(0, (fromMs - start) / 1000),
       stopAt: toMs == null ? Infinity : (toMs - start) / 1000,
+      bound: toMs == null ? null : bound,
       label,
     };
     let url = this.cache.get(id);
@@ -182,16 +209,29 @@ export class Player {
     if (!current) return;
     if (!play) return this.audio.pause();
     // Replaying a clip that stopped at its end starts the clip again.
-    if (this.audio.currentTime >= current.stopAt - 0.05 || this.audio.ended)
-      this.audio.currentTime = current.from;
+    if (this.atEnd()) this.audio.currentTime = current.from;
     this.audio.play().catch(() => {});
   }
   seek(seconds) {
     if (!this.current || !Number.isFinite(seconds)) return;
     const max = Number.isFinite(this.audio.duration) ? this.audio.duration : seconds;
     this.audio.currentTime = Math.min(Math.max(0, seconds), max);
-    // Seeking past a clip's end releases the clip bound.
-    if (this.audio.currentTime >= this.current.stopAt) this.current.stopAt = Infinity;
+    // Seeking past a clip's end releases the clip bound: what follows is ordinary
+    // playback, which onseek may bound again.
+    if (this.audio.currentTime >= this.current.stopAt) this.setBound(null);
+    this.onseek();
+  }
+  // Moves the early stop of the playing target, or of one still being fetched:
+  // seconds into the chunk, or null to play to the chunk end.
+  setBound(seconds, kind = "segment", target = this.current) {
+    if (!target) return;
+    target.stopAt = seconds == null ? Infinity : seconds;
+    target.bound = seconds == null ? null : kind;
+  }
+  // True once playback has reached its early stop or the end of the chunk.
+  atEnd() {
+    const current = this.current;
+    return !!current && (this.audio.ended || this.audio.currentTime >= current.stopAt - 0.05);
   }
   // Called every frame while playing: enforces the clip end and returns the
   // playhead as UTC ms, or null when nothing is loaded.

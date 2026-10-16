@@ -22,7 +22,7 @@ import {
   intersectsSelection,
 } from "./selection.mjs";
 import { historyKey, reuseHistory, overlapsHistory, coveringDetailKey } from "./history-window.mjs";
-import { Player, unitAt, clock } from "./player.mjs";
+import { Player, unitAt, clock, nextRow } from "./player.mjs";
 const $ = (selector) => document.querySelector(selector);
 const el = (tag, text, className) => {
   const node = document.createElement(tag);
@@ -898,20 +898,29 @@ $("#clear-selection").onclick = clearSelection;
 
 // Audio: a tap on a word plays from that word, a tap beside the text plays the
 // line from its start; a hold still selects. Playability is per chunk and only certain
-// after the fetch, so unplayable rows fall back to tap-to-select.
+// after the fetch, so unplayable rows fall back to tap-to-select. With continue on,
+// playback runs on through the following lines of the same device, across chunks;
+// with it off, a line stops at its own end.
 const audioOn = () => !!info?.capabilities?.audio;
 const hint = () =>
   `week ◀ · day · sessions · text ▶ · ${audioOn() ? "tap text to play · " : ""}hold text to select`;
+let continuous = true;
+try {
+  continuous = localStorage.getItem("roomlog.continue") !== "off";
+} catch {}
 function rowOf(unit) {
   return rows.find(
     (r) => r.segment_id === unit.segment_id && r.device_id === unit.device_id,
   );
 }
+const sameRow = (a, b) =>
+  !!a && !!b && a.segment_id === b.segment_id && a.device_id === b.device_id;
 function playButton(row) {
   const button = el("button", "▶", "play");
   button.dataset.chunk = row.chunk_id ?? "";
-  button.setAttribute("aria-label", `Play from ${time(row.start_utc_ms)}`);
-  button.onclick = () => playRow(row, row.start_utc_ms);
+  button.dataset.label = `Play from ${time(row.start_utc_ms)}`;
+  button.setAttribute("aria-label", button.dataset.label);
+  button.onclick = () => lineButton(row);
   if (!player.canPlay(row)) noAudio(button);
   return button;
 }
@@ -921,22 +930,46 @@ function noAudio(button) {
   button.removeAttribute("aria-label");
   button.title = "No audio is stored for this line";
 }
+// The button of the line under the playhead pauses and resumes it; any other
+// button plays its line from the start.
+function lineButton(row) {
+  const here = !player.pending && sameRow(playheadRow, row);
+  if (here && !player.audio.paused) return player.toggle(false);
+  if (here && !player.atEnd()) return player.toggle(true);
+  playLine(row, row.start_utc_ms);
+}
 function tapToPlay(g) {
   const unit = allUnits[g.index],
     row = unit && rowOf(unit);
   if (!audioOn() || !g.onTurn || !row || !player.canPlay(row)) return false;
   const from = g.onWord ? unit.start_utc_ms : row.start_utc_ms;
-  playRow(row, from);
+  playLine(row, from);
   return true;
 }
-async function playRow(row, from, to = null) {
+function playLine(row, from) {
+  return playRow(row, from, continuous ? null : lineStop(row.device_id, row.chunk_id, from), "segment");
+}
+// Where playback from t stops with continue off: at the end of the first line of the
+// chunk that ends after t. A point line or a gap runs on through the next line; past
+// the last line it plays to the chunk end.
+function lineStop(deviceId, chunkId, t) {
+  return chunkRows(deviceId, chunkId).find((r) => r.end_utc_ms > t)?.end_utc_ms ?? null;
+}
+// Applies the continue setting to a target from position t (UTC ms). Selection
+// clips keep their own bound.
+function rebound(target, t) {
+  if (!target || target.bound === "clip") return;
+  const stop = continuous ? null : lineStop(target.row.device_id, target.chunkId, t);
+  player.setBound(stop == null ? null : (stop - target.chunkStart) / 1000, "segment", target);
+}
+async function playRow(row, from, to = null, bound) {
   const label = `${sourceLabel(row.device_id)} · ${time(from)}`;
   let result;
   try {
-    result = await player.play(row, from, to, label);
+    result = await player.play(row, from, to, label, bound);
   } catch (error) {
     toast(error.message || "Could not play this audio.");
-    return;
+    return "error";
   }
   if (result === "unavailable") {
     document
@@ -947,7 +980,23 @@ async function playRow(row, from, to = null) {
     toast("This line changed. Refreshing.");
     load(true);
   }
+  return result;
 }
+// A chunk played to its end continues with the next line of the same device that
+// has audio. A newer play aborts the walk.
+async function advance(deviceId, after) {
+  for (
+    let row;
+    (row = nextRow(rows, deviceId, after, player.unavailable));
+    after = row.chunk_start_utc_ms
+  )
+    if ((await playLine(row, row.start_utc_ms)) !== "unavailable") return;
+}
+player.audio.addEventListener("ended", () => {
+  const current = player.current;
+  if (continuous && current && !current.bound)
+    advance(current.row.device_id, current.chunkStart);
+});
 $("#play-selection").onclick = () => {
   const selection = state.selection;
   const unit = selection && allUnits.find((u) => intersectsSelection(u, selection));
@@ -957,6 +1006,25 @@ $("#play-selection").onclick = () => {
 };
 $("#play-toggle").onclick = () => player.toggle();
 $("#play-stop").onclick = () => player.stop();
+function paintContinue() {
+  const button = $("#play-continue");
+  button.setAttribute("aria-pressed", String(continuous));
+  button.title = continuous ? "Continuing to the next line" : "Stopping at the end of each line";
+}
+paintContinue();
+$("#play-continue").onclick = () => {
+  continuous = !continuous;
+  try {
+    localStorage.setItem("roomlog.continue", continuous ? "on" : "off");
+  } catch {}
+  paintContinue();
+  // The line playing now, and one still being fetched, follow the new setting.
+  const { current, pending } = player;
+  if (current) rebound(current, current.chunkStart + player.audio.currentTime * 1000);
+  if (pending) rebound(pending, pending.chunkStart + pending.from * 1000);
+  renderPlayer();
+  toast(continuous ? "Playback continues to the next line." : "Playback stops at the end of each line.");
+};
 const seek = $("#seek");
 let scrubbing = false;
 seek.addEventListener("pointerdown", () => (scrubbing = true));
@@ -967,6 +1035,11 @@ seek.addEventListener("input", () => {
   followPlayback();
 });
 player.onchange = renderPlayer;
+// With continue off, a seek lands in a line that stops at its own end.
+player.onseek = () => {
+  const current = player.current;
+  if (!continuous && current) rebound(current, current.chunkStart + player.audio.currentTime * 1000);
+};
 for (const type of ["play", "pause", "ended", "seeked", "loadedmetadata"])
   player.audio.addEventListener(type, renderPlayer);
 function renderPlayer() {
@@ -984,21 +1057,17 @@ function renderPlayer() {
   $("#play-toggle").textContent = playing ? "❚❚" : "▶";
   $("#play-toggle").setAttribute("aria-label", playing ? "Pause" : "Play");
   $("#player-label").textContent = current.label;
-  const duration = Number.isFinite(audio.duration)
+  seek.max = Number.isFinite(audio.duration)
     ? audio.duration
     : Math.max(1, (current.row.end_utc_ms - current.chunkStart) / 1000);
-  seek.max = duration;
-  // Tint the part of the chunk that was asked for: the clip, or the tapped segment.
-  const end = Number.isFinite(current.stopAt)
-    ? current.stopAt
-    : (current.row.end_utc_ms - current.chunkStart) / 1000;
-  seek.style.setProperty("--a", `${(100 * current.from) / duration}%`);
-  seek.style.setProperty("--b", `${(100 * Math.min(end, duration)) / duration}%`);
   followPlayback();
 }
 let playFrame,
   playKey = null,
-  playNodes = [];
+  playNodes = [],
+  playheadRow = null,
+  litButton = null,
+  tintKey = "";
 const rowUnits = new WeakMap();
 function followPlayback() {
   cancelAnimationFrame(playFrame);
@@ -1012,31 +1081,35 @@ function turnOf(row) {
     `.turn[data-segment="${CSS.escape(String(row.segment_id))}"][data-device="${CSS.escape(row.device_id)}"]`,
   );
 }
+function chunkRows(deviceId, chunkId) {
+  return rows.filter((r) => r.device_id === deviceId && String(r.chunk_id) === String(chunkId));
+}
 // Light the segment and word under the playhead. The chunk can hold several
 // segments, so the playhead walks across rows of the same chunk.
 function paintPlayback(t) {
   const current = player.current;
   let key = null,
-    row,
+    row = null,
     index = -1;
   if (current && t != null) {
-    const chunkRows = rows.filter(
-      (r) =>
-        r.device_id === current.row.device_id &&
-        String(r.chunk_id) === current.chunkId,
-    );
-    row = chunkRows[Math.max(0, unitAt(chunkRows, t))] || current.row;
+    // A playhead parked on a bound belongs to the line that ended there, not to the
+    // next line starting at that instant.
+    const at = current.bound && t >= current.chunkStart + current.stopAt * 1000 ? t - 1 : t;
+    const lines = chunkRows(current.row.device_id, current.chunkId);
+    row = lines[Math.max(0, unitAt(lines, at))] || current.row;
     if (!rowUnits.has(row)) rowUnits.set(row, units(row));
     const list = rowUnits.get(row);
-    index = list[0]?.kind === "word" ? unitAt(list, t) : -1;
+    index = list[0]?.kind === "word" ? unitAt(list, at) : -1;
     key = `${row.device_id}:${row.segment_id}:${index}`;
   }
+  playheadRow = row;
   // Re-find nodes when the text tree was rebuilt or was detached at another zoom.
   if (
     key !== playKey ||
     (key && !playNodes.length) ||
     playNodes.some((node) => !node.isConnected)
   ) {
+    const previous = playNodes[0];
     playNodes.forEach((node) => node.classList.remove("playing"));
     playNodes = [];
     playKey = key;
@@ -1045,10 +1118,13 @@ function paintPlayback(t) {
       playNodes.push(turn);
       const word = index >= 0 && turn.querySelectorAll("[data-unit]")[index];
       if (word) playNodes.push(word);
+      if (previous && previous !== turn && previous.isConnected) keepInView(previous, turn);
     }
     playNodes.forEach((node) => node.classList.add("playing"));
   }
+  paintLineButton();
   if (!current) return;
+  paintTint(current, row);
   const now = player.audio.currentTime;
   if (!scrubbing) seek.value = now;
   const text = `${clock(now)} / ${clock(Number(seek.max))}`;
@@ -1056,6 +1132,47 @@ function paintPlayback(t) {
     $("#player-time").textContent = text;
     seek.setAttribute("aria-valuetext", `${clock(now)} of ${clock(Number(seek.max))}`);
   }
+}
+// The playing line's own button shows pause; it reverts once playback leaves it.
+function paintLineButton() {
+  const button = playNodes[0]?.querySelector(".play:not(:disabled)") || null;
+  if (litButton && litButton !== button) setLineButton(litButton, false);
+  if (button) setLineButton(button, !player.audio.paused);
+  litButton = button;
+}
+function setLineButton(button, playing) {
+  const text = playing ? "❚❚" : "▶";
+  if (button.textContent === text || button.disabled) return;
+  button.textContent = text;
+  button.setAttribute("aria-label", playing ? "Pause" : button.dataset.label);
+}
+// Tint the stretch the playhead is in: a selection clip as asked for, else the line
+// under the playhead as it walks through the chunk.
+function paintTint(current, row) {
+  const duration = Number(seek.max) || 1,
+    line = row || current.row;
+  const [a, b] = current.bound === "clip"
+    ? [current.from, current.stopAt]
+    : [line.start_utc_ms, line.end_utc_ms].map((ms) => (ms - current.chunkStart) / 1000);
+  const pct = (s) => `${(100 * Math.min(Math.max(s, 0), duration)) / duration}%`;
+  const key = `${pct(a)} ${pct(b)}`;
+  if (key === tintKey) return;
+  tintKey = key;
+  seek.style.setProperty("--a", pct(a));
+  seek.style.setProperty("--b", pct(b));
+}
+// While someone follows along, keep the line being played on screen: only when the
+// previous line was in view, so reading elsewhere is never interrupted. A chunk
+// hands over while paused, so pausing does not prevent it.
+function keepInView(previous, turn) {
+  if (scrubbing || gesture) return;
+  const top = $("#top").getBoundingClientRect().bottom,
+    bottom = $("#player").getBoundingClientRect().top || innerHeight;
+  const before = previous.getBoundingClientRect(),
+    r = turn.getBoundingClientRect();
+  if (before.bottom <= top || before.top >= bottom) return;
+  if (r.bottom > bottom) window.scrollBy({ top: Math.min(r.bottom - bottom + 12, r.top - top - 12), behavior: "smooth" });
+  else if (r.top < top) window.scrollBy({ top: r.top - top - 12, behavior: "smooth" });
 }
 
 // Keep the prototype's horizontal gears and off-text IN/OUT handles. No inferred
