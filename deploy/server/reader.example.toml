@@ -13,8 +13,12 @@ static_root = "/home/lasse/services/apps/roomlog-reader/web"
 # Required with tailscale_logins (startup error otherwise): the tailnet IPs of the owner's own
 # client devices, as tsnet-proxy reports them in X-Forwarded-For. A login alone is not
 # enough: everything running on a user-owned node (oma's containers and local accounts, other
-# servers) is WhoIs'd as the owner, so never list oma or a server. List both families per
-# device; IPv6 is compared in canonical form.
+# servers) is WhoIs'd as the owner, so never list oma or a server. Everything on a listed
+# device is the owner too (its apps, containers, VMs, other accounts), and so is anything it
+# forwards: never make a listed device an exit node or subnet router, run serve or Funnel
+# on it towards roomlog, or let others port-forward through it. Take a retired device off
+# the list, since its IPs can be reassigned. List both families per device; IPv6 is
+# compared in canonical form.
 # tailscale_devices = ["100.64.0.10", "fd7a:115c:a1e0::a"]
 # Host values the identity header is honoured with (DNS-rebinding guard). Default: only
 # "localhost:<bind port>", which is what tsnet-proxy sends; leave it unset. `tailscale
