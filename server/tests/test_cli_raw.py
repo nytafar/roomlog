@@ -139,8 +139,12 @@ def test_cli_backfill_derived_audio_is_idempotent(raw_site, capsys):
     assert rc == 0 and json.loads(out)["derived_without_audio"] == 0
 
 
-def test_cli_purge_raw(raw_site, capsys):
+def test_cli_purge_raw(raw_site, capsys, monkeypatch):
     cfg, fx, base = raw_site
+    # The clock stays a day after the fixture's recording, so its silent segments stay inside
+    # the retention whatever today's date is.
+    import roomlog_server.segmenter as segmod
+    monkeypatch.setattr(segmod, "now_ms", lambda: RAW_T0 + DAY)
     # an old, silent epoch from another device
     conn = dbmod.connect(cfg.db_path)
     old = RawSegments(cfg, conn, device_id="old", start_utc_ms=RAW_T0 - 400 * DAY,
