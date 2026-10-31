@@ -5,7 +5,7 @@ and ADRs 0005 to 0007, not here.
 
 | Module | What |
 |---|---|
-| `:core` | Pure Kotlin/JVM, no Android imports, JVM-tested. Each class mirrors an edge module so the pytest vectors port one to one: `Timeline` (`timeline.py`), `RawSegmenter` (fixed 30 s raw segments, ADR 0005), `OggOpusWriter` (inverse of `ogg.py`, `OpusCsd`, `OggCrc`), `Sidecar` (`sidecar.py`, plus a minimal `Json`), `Spool` (`spool.py`), `UploadPolicy` and `Uploader` (`uploader.py`), `ClockOffset` (`GET /v1/time`, ADR 0006), `Retention` (the edge's `_retain_from_n`), `CaptureClock` (Android-specific: block capture time from `AudioRecord.getTimestamp`, loss from `framePosition` against frames read), and for P3 `UnsyncedHold` (the edge's unsynced hold and re-stamp, driven by the probe), `UploadLoop` (probe schedule, upload passes, backoff) and `Http` (`HttpURLConnection`, fixed-length PUT, `GET /v1/time`). |
+| `:core` | Pure Kotlin/JVM, no Android imports, JVM-tested. Each class mirrors an edge module so the pytest vectors port one to one: `Timeline` (`timeline.py`), `RawSegmenter` (fixed 30 s raw segments, ADR 0005), `OggOpusWriter` (inverse of `ogg.py`, `OpusCsd`, `OggCrc`), `Sidecar` (`sidecar.py`, plus a minimal `Json`), `Spool` (`spool.py`), `UploadPolicy` and `Uploader` (`uploader.py`), `ClockOffset` (`GET /v1/time`, ADR 0006), `Retention` (the edge's `_retain_from_n`), `CaptureClock` (Android-specific: block capture time from `AudioRecord.getTimestamp`, loss from `framePosition` against frames read), and for P3 `UnsyncedHold` (the edge's unsynced hold and re-stamp, driven by the probe), `UploadLoop` (probe schedule, upload passes, backoff), `SerialThreads` (one upload thread at a time, across service instances) and `Http` (`HttpURLConnection`, fixed-length PUT, `GET /v1/time`). |
 | `:app` | The P3 client: one Compose screen (device id, server URL, token, Start/Stop, log) and a microphone foreground service running `AudioRecord` → `CaptureClock` → `Timeline` → `RawSegmenter` → `MediaCodec` Opus → `OggOpusWriter` → `Spool`, plus an upload thread (`UploadLoop`) that probes `/v1/time` and PUTs `pending/` to the server. The package is still `no.nyta.roomlog.spike`, so an install keeps the spike's settings and spool. `minSdk 29`, `targetSdk 35`. |
 
 ## Build
@@ -76,6 +76,11 @@ background start to use the microphone); a "recording stopped" notification appe
 5. Stop: the shutdown segment is cut; held segments that never saw a probe move to
    `pending/` as stamped; the upload thread makes one last pass; the service ends. What is
    still in `pending/` goes on the next Start. Nothing uploads while the app is stopped.
+   From Stop on, the notification reads `Stopping: ...`, then `Stopped: uploading what is
+   left in the spool`, without a Stop action; the screen stays in "recording" until the pass
+   ends, and another Stop meanwhile only logs. There is only ever one upload thread: if the
+   service was torn down while that pass still ran, the next Start records at once and its
+   uploads wait for the old pass (`upload: waiting for the previous run's last upload pass`).
 
 On Start, `unsynced/` segments left by earlier runs (the P2 spike, or a run killed by
 force-stop) move to `pending/` as stamped, `clock_synced: false`: their run's timeline is

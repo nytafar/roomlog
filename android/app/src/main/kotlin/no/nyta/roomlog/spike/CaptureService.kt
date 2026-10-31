@@ -16,6 +16,7 @@ import android.os.Looper
 import android.os.SystemClock
 import no.nyta.roomlog.core.ClockOffset
 import no.nyta.roomlog.core.Http
+import no.nyta.roomlog.core.SerialThreads
 import no.nyta.roomlog.core.Spool
 import no.nyta.roomlog.core.UploadLoop
 import no.nyta.roomlog.core.Uploader
@@ -36,7 +37,14 @@ import no.nyta.roomlog.core.Uploader
  *
  * Stop: the recorder cuts and spools the shutdown segment, then the upload
  * thread makes one last pass, then the service leaves the foreground.
- * Whatever is still in `pending/` uploads on the next Start.
+ * Whatever is still in `pending/` uploads on the next Start. From the Stop
+ * request on, the notification says so and has no Stop action; a further
+ * Stop (the screen's button stays enabled until the pass ends) only logs.
+ *
+ * One upload thread per spool: the thread comes from a process-wide
+ * [SerialThreads], so if this service is destroyed while a last pass is still
+ * running (onDestroy waits only 3 s), the next Start records at once but its
+ * upload thread waits for that pass to end before its first probe or PUT.
  */
 class CaptureService : Service() {
     private var recorder: SpikeRecorder? = null
@@ -59,11 +67,15 @@ class CaptureService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             val r = recorder
-            if (r == null) {
-                stopSelf()
-            } else {
-                SpikeState.log("stop requested: cutting the shutdown segment")
-                r.stop() // onFinished leaves the foreground once the encoder is done
+            when {
+                r != null -> {
+                    SpikeState.log("stop requested: cutting the shutdown segment")
+                    showStatus("Stopping: closing the last segment")
+                    r.stop() // onFinished leaves the foreground once the encoder is done
+                }
+                // already stopped and in the last upload pass: let it finish, onUploadsFinished leaves
+                uploads != null -> SpikeState.log("stop: already stopping, the last upload pass is still running")
+                else -> stopSelf()
             }
             return START_NOT_STICKY
         }
@@ -123,21 +135,24 @@ class CaptureService : Service() {
         )
         SpikeState.log("upload: to $url")
         uploads = loop
-        uploadThread = Thread({
+        uploadThread = uploadThreads.start(
+            onWait = { SpikeState.log("upload: waiting for the previous run's last upload pass to end") },
+        ) {
             loop.run()
             SpikeState.log("upload: stopped")
             main.post { onUploadsFinished(loop) }
-        }, "roomlog-upload").apply { start() }
+        }
         return loop
     }
 
     private fun onRecorderFinished(r: SpikeRecorder) {
         if (recorder !== r) return
         recorder = null
-        // the UI stays in "recording" (Start disabled) until the last upload pass is done,
-        // so a new run never starts a second upload thread on the same spool
+        // the UI stays in "recording" (Start disabled) until the last upload pass is done;
+        // uploadThreads covers the paths around that (a destroy before the pass ends)
         val loop = uploads
         if (loop != null) {
+            showStatus("Stopped: uploading what is left in the spool")
             loop.stop() // one last pass, then onUploadsFinished
         } else {
             leave()
@@ -165,7 +180,11 @@ class CaptureService : Service() {
         }
         recorder = null
         uploads?.stop()
-        uploadThread?.join(3_000)
+        uploadThread?.let {
+            it.join(3_000)
+            // the next Start's upload thread waits for it (uploadThreads), so it is never two at once
+            if (it.isAlive) SpikeState.log("upload: last pass still running after the service ended; it finishes on its own")
+        }
         uploads = null
         uploadThread = null
         SpikeState.setRecording(false)
@@ -177,22 +196,30 @@ class CaptureService : Service() {
         PendingIntent.FLAG_IMMUTABLE,
     )
 
-    private fun notification(text: String): Notification {
-        val stop = PendingIntent.getService(
-            this, 1, Intent(this, CaptureService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE,
-        )
-        return Notification.Builder(this, CHANNEL)
+    /** The ongoing notification; with the Stop action only while recording. */
+    private fun notification(text: String, stopAction: Boolean = true): Notification {
+        val b = Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentTitle("roomlog spike")
             .setContentText(text)
             .setOngoing(true)
             .setContentIntent(openActivity())
-            .addAction(
+        if (stopAction) {
+            val stop = PendingIntent.getService(
+                this, 1, Intent(this, CaptureService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE,
+            )
+            b.addAction(
                 Notification.Action.Builder(
                     Icon.createWithResource(this, android.R.drawable.ic_media_pause), "Stop", stop,
                 ).build(),
             )
-            .build()
+        }
+        return b.build()
+    }
+
+    /** Replaces the ongoing notification's text once capture is stopping (no Stop action). */
+    private fun showStatus(text: String) {
+        getSystemService(NotificationManager::class.java).notify(NOTE_RECORDING, notification(text, stopAction = false))
     }
 
     private fun postResume() {
@@ -213,6 +240,9 @@ class CaptureService : Service() {
         private const val CHANNEL = "capture"
         private const val NOTE_RECORDING = 1
         private const val NOTE_RESUME = 2
+
+        /** Process-wide: at most one upload loop runs on the spool, across service instances. */
+        private val uploadThreads = SerialThreads("roomlog-upload")
 
         fun start(context: Context, deviceId: String) {
             context.startForegroundService(
