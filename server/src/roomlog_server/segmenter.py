@@ -313,6 +313,7 @@ class Segmenter:
         self.audio = RawAudio(archive_dir, decode)
         self._vad: vadmod.Vad | None = None
         self._deadline: float | None = None  # monotonic end of the current run_once budget
+        self._passes = 0  # decode passes in the current run_once call
 
     # -- public
 
@@ -321,14 +322,16 @@ class Segmenter:
 
         `budget_s` caps the wall time of one call: the pass that crosses it is finished, the
         rest of the backlog waits for the next call (`res.more` says so). The budget is checked
-        between epochs and between the decode passes of one epoch, whose backlog can be days
-        long on a phone; each pass saves its mark, so the next call resumes exactly there. At
-        least one pass runs per call. `heartbeat` runs before every decode pass, so a systemd
+        between epochs and, once a pass has run, before every forward decode pass of an epoch
+        (whose backlog can be days long on a phone), the first pass of a later chain included;
+        each pass saves its mark, so the next call resumes exactly there. Gap fills behind the
+        mark are not checked. At least one pass runs per call. `heartbeat` runs before every decode pass, so a systemd
         watchdog sees progress through a long backlog.
         """
         res = SegmentResult()
         started = time.monotonic()
         self._deadline = None if budget_s is None else started + budget_s
+        self._passes = 0
         keys = self.conn.execute(
             """SELECT DISTINCT device_id, run_id, epoch FROM raw_segments WHERE status = 'pending'
                ORDER BY device_id, run_id, epoch"""
@@ -355,6 +358,11 @@ class Segmenter:
                     break  # the model is missing: every epoch would fail the same way
         self.audio.keep_only([])
         return res
+
+    def _out_of_budget(self) -> bool:
+        """The call's budget is spent and it has made progress (at least one pass)."""
+        return (self._deadline is not None and self._passes > 0
+                and time.monotonic() >= self._deadline)
 
     # -- one epoch
 
@@ -431,6 +439,14 @@ class Segmenter:
             stale = final is None and scanned is not None and pos == mark and hi <= scanned
             if hi > pos and not stale:
                 while True:
+                    if self._out_of_budget():
+                        # Before a forward pass, mid-chain or at the start of a later chain:
+                        # the mark and scan point of the last pass are saved, so the next call
+                        # picks up exactly here and transcription runs in between.
+                        res.more = True
+                        if worked:
+                            res.epochs += 1
+                        return
                     sub_hi = min(hi, pos + MAX_SPAN_SAMPLES)
                     sub_final = final if sub_hi == hi else None
                     new_mark = self._pass(chain, pos, sub_hi, pos, sub_final, warmup=True, res=res)
@@ -443,12 +459,6 @@ class Segmenter:
                     if sub_hi == hi or new_mark <= pos:
                         break
                     pos = new_mark
-                    if self._deadline is not None and time.monotonic() >= self._deadline:
-                        # Out of budget mid-epoch: the mark and scan point are saved, so the
-                        # next call picks up at `new_mark` and transcription runs in between.
-                        res.more = True
-                        res.epochs += 1
-                        return
             if final is None:
                 # This chain waits for its successor. The mark is one per epoch, so the chains
                 # after the gap wait too: were they segmented now, the mark would pass this
@@ -488,6 +498,7 @@ class Segmenter:
               warmup: bool, res: SegmentResult) -> int:
         """Chunk `[lo, hi)`, commit the chunks inside `[commit_from, hi)`, return the new mark."""
         self.heartbeat()
+        self._passes += 1
         chain_start = chain[0].n_start
         decode_lo = lo
         if warmup:

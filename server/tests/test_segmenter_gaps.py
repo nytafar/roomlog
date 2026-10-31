@@ -527,3 +527,43 @@ def test_worker_transcribes_between_budgeted_passes_of_one_epoch(tmp_path, monke
             break
     assert not res.segment_more and set(statuses(conn, "s22")) == {"segmented"}
     conn.close()
+
+
+def test_run_once_budget_stops_between_the_chains_of_one_epoch(tmp_path, monkeypatch):
+    # Missing segments (dropped from the spool, or failed) split one epoch into several chains;
+    # the budget holds before the first pass of each later chain too.
+    monkeypatch.setattr(segmod, "MAX_SPAN_SAMPLES", 2 * 60 * RATE)
+    pcm = pcm_for(LONG)
+    out = {}
+    for name, budget in (("once", None), ("budgeted", 0.0)):
+        cfg = make_config(tmp_path / name)
+        conn = dbmod.connect(cfg.db_path)
+        fake = FakeRaw(conn)
+        plan = fake.plan(pcm)
+        for i, (n, piece, reason) in enumerate(plan):
+            if i % 4 != 3:
+                fake.store(n, piece, reason, RAW_T0)
+        beats = []
+        seg = Segmenter(conn, cfg.archive_dir, EnergyVad, vad_info={"model": "energy"},
+                        decode=fake.decode, now=lambda: RAW_T0 + IDLE_MS + 1000,
+                        heartbeat=lambda: beats.append(1))
+        calls = []
+        while True:
+            res = seg.run_once(budget_s=budget)
+            calls.append((res.chunks, res.more, len(beats)))
+            beats.clear()
+            assert not res.errors
+            if not res.more:
+                break
+            assert len(calls) < 50
+        out[name] = (_derived(conn), calls, statuses(conn, "s22"))
+        conn.close()
+
+    once, budgeted = out["once"], out["budgeted"]
+    assert len(once[1]) == 1 and once[1][0][2] >= 5  # five chains, at least a pass each
+    assert budgeted[0] == once[0]
+    assert_disjoint([(a, a + n) for a, n, *_ in budgeted[0]])
+    assert set(budgeted[2]) == {"segmented"} == set(once[2])
+    assert len(budgeted[1]) == once[1][0][2]  # one pass per call
+    assert all(b == 1 for _, _, b in budgeted[1])
+    assert all(more for _, more, _ in budgeted[1][:-1]) and budgeted[1][-1][1] is False
