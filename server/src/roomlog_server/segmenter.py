@@ -312,6 +312,7 @@ class Segmenter:
         self.heartbeat = heartbeat or (lambda: None)
         self.audio = RawAudio(archive_dir, decode)
         self._vad: vadmod.Vad | None = None
+        self._deadline: float | None = None  # monotonic end of the current run_once budget
 
     # -- public
 
@@ -319,11 +320,15 @@ class Segmenter:
         """Segment pending epochs, oldest device/run first.
 
         `budget_s` caps the wall time of one call: the pass that crosses it is finished, the
-        rest of the backlog waits for the next call (`res.more` says so). `heartbeat` runs
-        before every decode pass, so a systemd watchdog sees progress through a long backlog.
+        rest of the backlog waits for the next call (`res.more` says so). The budget is checked
+        between epochs and between the decode passes of one epoch, whose backlog can be days
+        long on a phone; each pass saves its mark, so the next call resumes exactly there. At
+        least one pass runs per call. `heartbeat` runs before every decode pass, so a systemd
+        watchdog sees progress through a long backlog.
         """
         res = SegmentResult()
         started = time.monotonic()
+        self._deadline = None if budget_s is None else started + budget_s
         keys = self.conn.execute(
             """SELECT DISTINCT device_id, run_id, epoch FROM raw_segments WHERE status = 'pending'
                ORDER BY device_id, run_id, epoch"""
@@ -438,6 +443,12 @@ class Segmenter:
                     if sub_hi == hi or new_mark <= pos:
                         break
                     pos = new_mark
+                    if self._deadline is not None and time.monotonic() >= self._deadline:
+                        # Out of budget mid-epoch: the mark and scan point are saved, so the
+                        # next call picks up at `new_mark` and transcription runs in between.
+                        res.more = True
+                        res.epochs += 1
+                        return
             if final is None:
                 # This chain waits for its successor. The mark is one per epoch, so the chains
                 # after the gap wait too: were they segmented now, the mark would pass this
